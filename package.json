@@ -1,0 +1,28 @@
+{
+  "name": "ai_agent",
+  "version": "1.0.0",
+  "description": "즐거운 ai agent 만들기",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+     "dev": "tsx src/demo.ts",
+    "check": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shellnaut-ai/ai_agent.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/shellnaut-ai/ai_agent/issues"
+  },
+  "homepage": "https://github.com/shellnaut-ai/ai_agent#readme",
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2"
+  }
+}
