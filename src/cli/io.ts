@@ -10,6 +10,7 @@ export class CliIO {
   });
 
   private readonly escapeListeners = new Set<() => void>();
+  private readonly interruptListeners = new Set<() => void>();
 
   private readonly handleKeypress = (
     _character: string | undefined,
@@ -20,6 +21,12 @@ export class CliIO {
     }
 
     for (const listener of this.escapeListeners) {
+      listener();
+    }
+  };
+
+  private readonly handleInterrupt = (): void => {
+    for (const listener of this.interruptListeners) {
       listener();
     }
   };
@@ -71,9 +78,25 @@ export class CliIO {
     };
   }
 
+  onInterrupt(listener: () => void): () => void {
+    if (this.interruptListeners.size === 0) {
+      process.on("SIGINT", this.handleInterrupt);
+    }
+    this.interruptListeners.add(listener);
+
+    return () => {
+      this.interruptListeners.delete(listener);
+      if (this.interruptListeners.size === 0) {
+        process.off("SIGINT", this.handleInterrupt);
+      }
+    };
+  }
+
   close(): void {
     stdin.off("keypress", this.handleKeypress);
+    process.off("SIGINT", this.handleInterrupt);
     this.escapeListeners.clear();
+    this.interruptListeners.clear();
     this.readline.close();
   }
 }

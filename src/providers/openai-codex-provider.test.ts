@@ -91,6 +91,7 @@ describe("OpenAICodexProvider", () => {
     const provider = new OpenAICodexProvider({
       model,
       resolver: { resolve: async () => credential },
+      instructions: "Base coding policy.",
       fetch: async (input, init) => {
         captured = new Request(input, init);
         return sseResponse([
@@ -121,7 +122,11 @@ describe("OpenAICodexProvider", () => {
       },
     });
 
-    const events = await collect(provider.stream(request()));
+    const events = await collect(provider.stream({
+      ...request(),
+      systemPrompt: "Summarize only the supplied conversation.",
+      maxOutputTokens: 321,
+    }));
 
     expect(events).toEqual([
       { type: "start" },
@@ -140,6 +145,9 @@ describe("OpenAICodexProvider", () => {
     expect(captured?.headers.get("chatgpt-account-id")).toBe("account-1");
     await expect(captured?.json()).resolves.toMatchObject({
       model: "gpt-5.1-codex-mini",
+      instructions:
+        "Base coding policy.\n\nSummarize only the supplied conversation.",
+      max_output_tokens: 321,
       stream: true,
       store: false,
     });

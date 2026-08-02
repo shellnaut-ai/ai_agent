@@ -73,6 +73,9 @@ export class OpenAICodexProvider implements ModelProvider {
 
       // 인증을 먼저 해결해야 credential이 없을 때 model endpoint에 요청하지 않는다.
       const credential = await this.#resolver.resolve(options?.signal);
+      const instructions = [this.#instructions, request.systemPrompt]
+        .filter((value): value is string => value !== undefined)
+        .join("\n\n");
       const response = await this.#fetch(this.#endpoint, {
       method: "POST",
       headers: {
@@ -86,9 +89,11 @@ export class OpenAICodexProvider implements ModelProvider {
       },
       body: JSON.stringify({
         model: request.model.id,
-        ...(this.#instructions === undefined
+        ...(instructions === ""
           ? {}
-          : { instructions: this.#instructions }),
+          : { instructions }),
+        max_output_tokens:
+          request.maxOutputTokens ?? request.model.maxOutputTokens,
         input: serializeMessages(request.messages, this.#assistantReplay),
         tools: request.tools.map(serializeTool),
         tool_choice: "auto",

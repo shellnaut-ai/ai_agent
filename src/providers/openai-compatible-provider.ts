@@ -85,7 +85,12 @@ export class OpenAICompatibleProvider implements ModelProvider {
         body: JSON.stringify({
           model: request.model.id,
           stream: true,
-          messages: request.messages.map(serializeMessage),
+          messages: [
+            ...(request.systemPrompt === undefined
+              ? []
+              : [{ role: "system", content: request.systemPrompt }]),
+            ...request.messages.map(serializeMessage),
+          ],
           tools: request.tools.map(serializeTool),
           max_tokens:
             request.maxOutputTokens ?? request.model.maxOutputTokens,
@@ -94,10 +99,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
       });
 
       if (!response.ok) {
-        const detail = await response.text();
         throw new Error(
-          `OpenAI-compatible provider request failed: ${response.status}` +
-            `${detail === "" ? "" : `: ${detail}`}`,
+          `OpenAI-compatible provider request failed (${response.status})`,
         );
       }
       if (response.body === null) {

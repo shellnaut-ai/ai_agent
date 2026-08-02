@@ -1,7 +1,25 @@
-import type { ChatSession } from "../session/chat-session.js";
-import type { CliIO } from "./io.js";
+import type { AgentLoopOptions } from "../agent/types.js";
+import type { ChatEvent } from "../session/types.js";
 
-export async function runChat(session: ChatSession, io: CliIO): Promise<void> {
+export interface ChatSessionLike {
+  streamTurn(
+    userContent: string,
+    options?: AgentLoopOptions,
+  ): AsyncIterable<ChatEvent>;
+}
+
+export interface ChatIO {
+  question(prompt: string, signal?: AbortSignal): Promise<string | undefined>;
+  write(content: string): void;
+  writeError(content: string): void;
+  onEscape(listener: () => void): () => void;
+  onInterrupt(listener: () => void): () => void;
+}
+
+export async function runChat(
+  session: ChatSessionLike,
+  io: ChatIO,
+): Promise<void> {
   while (true) {
     const input = await io.question("You>_ ");
     if (input === undefined) {
@@ -20,14 +38,16 @@ export async function runChat(session: ChatSession, io: CliIO): Promise<void> {
     let assistantLineOpen = false;
     const controller = new AbortController();
 
-    const removeEscapeListener = io.onEscape(() => {
+    const cancelTurn = (): void => {
       if (controller.signal.aborted) {
         return;
       }
 
       io.write("\nCancelling current turn...\n");
       controller.abort();
-    });
+    };
+    const removeEscapeListener = io.onEscape(cancelTurn);
+    const removeInterruptListener = io.onInterrupt(cancelTurn);
 
     try {
       for await (const event of session.streamTurn(content, {
@@ -99,6 +119,7 @@ export async function runChat(session: ChatSession, io: CliIO): Promise<void> {
       }
     } finally {
       removeEscapeListener();
+      removeInterruptListener();
     }
   }
 }
