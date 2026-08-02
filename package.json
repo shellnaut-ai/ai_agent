@@ -2,11 +2,16 @@
   "name": "ai_agent",
   "version": "1.0.0",
   "description": "즐거운 ai agent 만들기",
-  "main": "index.js",
+  "type": "module",
+  "main": "dist/index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "tsc -p tsconfig.build.json",
+    "check": "npm run typecheck && npm test && npm run build",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "dev": "tsx src/demo.ts",
-    "check": "tsc --noEmit"
+    "prebuild": "npm run clean",
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "repository": {
     "type": "git",
@@ -15,15 +20,18 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "bugs": {
     "url": "https://github.com/shellnaut-ai/ai_agent/issues"
   },
   "homepage": "https://github.com/shellnaut-ai/ai_agent#readme",
+  "engines": {
+    "node": ">=22"
+  },
   "devDependencies": {
     "@types/node": "^26.1.1",
     "tsx": "^4.23.1",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
   },
   "dependencies": {
     "typebox": "1.1.38"

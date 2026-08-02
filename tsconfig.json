@@ -5,7 +5,9 @@
     "moduleResolution": "NodeNext",
     "strict": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": ["node", "vitest/globals"],
+    "useUnknownInCatchVariables": true,
+    "verbatimModuleSyntax": true
   },
-  "include": ["src"]
+  "include": ["src/**/*.ts", "test/**/*.ts"]
 }

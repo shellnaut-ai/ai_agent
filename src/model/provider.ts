@@ -1,4 +1,4 @@
-import type { Model, ModelRequest, ProviderId, StreamEvent } from "./types";
+import type { Model, ModelRequest, ProviderId, StreamEvent } from "./types.js";
 
 
 export interface StreamOptions {
