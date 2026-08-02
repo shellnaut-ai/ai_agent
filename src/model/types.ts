@@ -2,7 +2,13 @@ import type { ToolCall, ToolDefinition } from "../tools/types.js";
 
 // 모델 요청을 처리할 실행 주체.
 // llama는 llama.cpp 서버를 통해 로컬 GGUF 모델을 실행한다.
-export type ProviderId = "codex" | "claude" | "llama" | "fake";
+export type ProviderId =
+  | "codex"
+  | "claude"
+  | "llama"
+  | "fake"
+  | "openai-compatible"
+  | "openai-codex";
 
 // 외부 혹은 로컬 모델들의 공통된 속성만 추출, 원본의 경우 확장을 위해 더 많은 요소가 있지만 당장의 클론 코딩에선 필요 없기 때문에 제외.
 export interface Model {
