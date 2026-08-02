@@ -1,44 +1,49 @@
-import type {
-  ModelRequest,
-  StreamEvent,
-} from "./types";
+import type { StreamOptions } from "./provider.js";
+import type { ProviderRegistry } from "./registry.js";
+import type { ModelRequest, StreamEvent } from "./types.js";
 
-import type {
-  StreamOptions,
-} from "./provider";
+export interface ModelRetryEvent {
+  readonly type: "retry";
+  readonly attempt: number;
+  readonly maxRetries: number;
+  readonly delayMs: number;
+  readonly error: Error;
+}
 
-import type {
-  ProviderRegistry,
-} from "./registry";
+export type ModelRuntimeEvent = StreamEvent | ModelRetryEvent;
 
-export class ModelRuntime{
-    private readonly registry:ProviderRegistry;
+export interface ModelStreamRunner {
+  stream(
+    request: ModelRequest,
+    options?: StreamOptions,
+  ): AsyncIterable<ModelRuntimeEvent>;
+}
 
-    constructor(registry:ProviderRegistry){
-        this.registry = registry;
+export class ModelRuntime implements ModelStreamRunner {
+  private readonly registry: ProviderRegistry;
+
+  constructor(registry: ProviderRegistry) {
+    this.registry = registry;
+  }
+
+  async *stream(
+    request: ModelRequest,
+    options?: StreamOptions,
+  ): AsyncIterable<ModelRuntimeEvent> {
+    const provider = this.registry.getProvider(request.model.provider);
+
+    if (!provider) {
+      yield {
+        type: "error",
+        reason: "error",
+        error: new Error(
+          `Provider "${request.model.provider}" is not registered.`,
+        ),
+      };
+
+      return;
     }
 
-    async *stream(
-        request:ModelRequest,
-        options?: StreamOptions,
-    ): AsyncIterable<StreamEvent>{
-        const provider = this.registry.getProvider(
-            request.model.provider,
-        );
-
-        if(!provider){
-            yield {
-                type:"error",
-                reason:"error",
-                error:new Error(
-                     `Provider "${request.model.provider}" is not registered.`,
-                )
-            }
-
-            return;
-        }
-
-        yield* provider.stream(request, options);
-    }
-
+    yield* provider.stream(request, options);
+  }
 }
