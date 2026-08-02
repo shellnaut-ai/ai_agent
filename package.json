@@ -1,31 +1,39 @@
 {
-  "name": "ai_agent",
-  "version": "1.0.0",
-  "description": "즐거운 ai agent 만들기",
-  "main": "index.js",
+  "name": "pi-clone",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "An educational TypeScript vertical slice of a streaming tool-using agent.",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "tsx src/demo.ts",
-    "check": "tsc --noEmit"
+    "build": "tsc -p tsconfig.build.json",
+    "check": "npm run typecheck && npm test && npm run build && npm run smoke:cli-eof",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "precli": "npm run build",
+    "prebuild": "npm run clean",
+    "cli": "node --enable-source-maps dist/cli.js",
+    "smoke:cli-eof": "node scripts/smoke-cli-eof.mjs",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/shellnaut-ai/ai_agent.git"
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
-  "bugs": {
-    "url": "https://github.com/shellnaut-ai/ai_agent/issues"
+  "files": [
+    "dist"
+  ],
+  "bin": {
+    "pi-clone": "./dist/cli.js"
   },
-  "homepage": "https://github.com/shellnaut-ai/ai_agent#readme",
   "devDependencies": {
-    "@types/node": "^26.1.1",
-    "tsx": "^4.23.1",
-    "typescript": "^7.0.2"
-  },
-  "dependencies": {
-    "typebox": "1.1.38"
+    "@types/node": "26.1.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
   }
 }

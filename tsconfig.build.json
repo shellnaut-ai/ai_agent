@@ -1,0 +1,14 @@
+{
+  // 개발 중 typecheck 설정을 그대로 물려받고, 배포할 때만 emit 관련 옵션을 뒤집는다.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "declaration": true,
+    "noEmit": false,
+    "outDir": "dist",
+    "sourceMap": true
+  },
+  "exclude": [
+    "src/**/*.test.ts"
+  ]
+}
+

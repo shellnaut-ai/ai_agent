@@ -1,11 +1,25 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
+    // 외부 입력을 다루는 Agent 코드에서 optional/배열 접근 실수를 컴파일 단계에 드러낸다.
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "strict": true,
     "noEmit": true,
-    "types": ["node"]
+    "noUncheckedIndexedAccess": true,
+    "rootDir": "src",
+    "skipLibCheck": true,
+    "strict": true,
+    // Node 22보다 낮은 문법 대상으로도 충분하므로 런타임 API와 출력 문법을 분리한다.
+    "target": "ES2022",
+    // ambient 타입을 Node로 명시해 DOM 전역이나 우연히 설치된 패키지 타입에 기대지 않는다.
+    "types": [
+      "node"
+    ],
+    "useUnknownInCatchVariables": true,
+    "verbatimModuleSyntax": true
   },
-  "include": ["src"]
+  "include": [
+    "src/**/*.ts"
+  ]
 }
