@@ -35,12 +35,28 @@ export class AgentLoop {
     };
 
     const maxSteps = options?.maxSteps ?? 8;
+    const maxToolBatches = options?.maxToolBatches;
 
     if (!Number.isInteger(maxSteps) || maxSteps <= 0) {
       yield {
         type: "error",
         reason: "error",
         error: new Error("AgentLoop maxSteps must be a positive integer."),
+      };
+
+      return;
+    }
+
+    if (
+      maxToolBatches !== undefined &&
+      (!Number.isInteger(maxToolBatches) || maxToolBatches < 0)
+    ) {
+      yield {
+        type: "error",
+        reason: "error",
+        error: new Error(
+          "AgentLoop maxToolBatches must be a non-negative integer.",
+        ),
       };
 
       return;
@@ -59,6 +75,7 @@ export class AgentLoop {
     const workingMessages: Message[] = [...request.messages];
 
     const newMessages: Message[] = [];
+    let completedToolBatches = 0;
 
     const definitions = this.toolRegistry.listDefinitions();
 
@@ -166,6 +183,23 @@ export class AgentLoop {
           return;
         }
 
+        if (
+          terminalReason === "tool-call" &&
+          maxToolBatches !== undefined &&
+          completedToolBatches >= maxToolBatches
+        ) {
+          yield {
+            type: "error",
+            reason: "error",
+            error: new Error(
+              `AgentLoop exceeded the maximum tool batch count of ` +
+                `${maxToolBatches}.`,
+            ),
+          };
+
+          return;
+        }
+
         const assistantMessage: AssistantMessage = {
           role: "assistant",
           content: assistantContent,
@@ -185,6 +219,8 @@ export class AgentLoop {
 
           return;
         }
+
+        completedToolBatches += 1;
 
         for (const toolCall of toolCalls) {
           const preparation = this.toolRegistry.prepare(toolCall);
