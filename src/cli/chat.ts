@@ -4,6 +4,9 @@ import type { CliIO } from "./io.js";
 export async function runChat(session: ChatSession, io: CliIO): Promise<void> {
   while (true) {
     const input = await io.question("You>_ ");
+    if (input === undefined) {
+      return;
+    }
     const content = input.trim();
 
     if (content.length === 0) {

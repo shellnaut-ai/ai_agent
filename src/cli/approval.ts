@@ -32,14 +32,12 @@ export class CliToolApprovalHandler implements ToolApprovalHandler {
     );
 
     while (true) {
-      const answer = (
-        await this.io.question(
+      const answerValue = await this.io.question(
           "Allow? [o]nce / [s]ession / [N]o: ",
           options?.signal,
-        )
-      )
-        .trim()
-        .toLowerCase();
+        );
+      if (answerValue === undefined) return "deny";
+      const answer = answerValue.trim().toLowerCase();
 
       if (answer === "o" || answer === "once") {
         return "allow-once";

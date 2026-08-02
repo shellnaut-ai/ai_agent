@@ -30,14 +30,28 @@ export class CliIO {
     }
   }
 
-  question(prompt: string, signal?: AbortSignal): Promise<string> {
-    if (signal) {
-      return this.readline.question(prompt, {
-        signal,
-      });
-    }
+  async question(
+    prompt: string,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    try {
+      if (signal) {
+        return await this.readline.question(prompt, {
+          signal,
+        });
+      }
 
-    return this.readline.question(prompt);
+      return await this.readline.question(prompt);
+    } catch (error: unknown) {
+      if (
+        error instanceof Error &&
+        (error.message === "readline was closed" ||
+          ("code" in error && error.code === "ERR_USE_AFTER_CLOSE"))
+      ) {
+        return undefined;
+      }
+      throw error;
+    }
   }
 
   write(content: string): void {

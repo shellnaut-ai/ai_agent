@@ -6,10 +6,13 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "check": "npm run typecheck && npm test && npm run build",
+    "check": "npm run typecheck && npm test && npm run build && npm run smoke:cli-eof",
+    "cli": "node --enable-source-maps dist/cli.js",
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "dev": "tsx src/demo.ts",
     "prebuild": "npm run clean",
+    "precli": "npm run build",
+    "smoke:cli-eof": "node scripts/smoke-cli-eof.mjs",
     "test": "vitest run --passWithNoTests",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
@@ -26,6 +29,9 @@
   "homepage": "https://github.com/shellnaut-ai/ai_agent#readme",
   "engines": {
     "node": ">=22"
+  },
+  "bin": {
+    "ai-agent": "./dist/cli.js"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
