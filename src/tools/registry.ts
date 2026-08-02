@@ -131,4 +131,22 @@ export class ToolRegistry {
       };
     }
   }
+
+  async executeBatch(
+    calls: readonly ToolCall[],
+    options?: ToolExecutionOptions,
+  ): Promise<readonly ToolResult[]> {
+    const results: ToolResult[] = [];
+
+    for (const call of calls) {
+      const preparation = this.prepare(call);
+      results.push(
+        preparation.ok
+          ? await this.executePrepared(preparation, options)
+          : preparation.result,
+      );
+    }
+
+    return results;
+  }
 }

@@ -1,5 +1,4 @@
-import { lstat, realpath, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { lstat, writeFile } from "node:fs/promises";
 import { Type } from "typebox";
 
 import type {
@@ -8,6 +7,7 @@ import type {
   ToolExecutionOptions,
   ToolOutput,
 } from "./types.js";
+import { WorkspacePaths } from "./workspace-paths.js";
 
 export interface WriteToolOptions {
   readonly rootDir: string;
@@ -37,11 +37,11 @@ export class WriteTool implements Tool {
     ),
   };
 
-  private readonly rootDir: string;
+  private readonly paths: WorkspacePaths;
   private readonly maxBytes: number;
 
   constructor(options: WriteToolOptions) {
-    this.rootDir = resolve(options.rootDir);
+    this.paths = new WorkspacePaths(options.rootDir);
     this.maxBytes = options.maxBytes ?? 64 * 1024;
 
     if (!Number.isInteger(this.maxBytes) || this.maxBytes <= 0) {
@@ -90,14 +90,11 @@ export class WriteTool implements Tool {
       };
     }
 
-    const requestedPath = resolve(this.rootDir, pathValue);
-
     try {
-      const rootRealPath = await realpath(this.rootDir);
       let targetExists = true;
 
       try {
-        await lstat(requestedPath);
+        await lstat(await this.paths.writableFile(pathValue));
       } catch (error: unknown) {
         const notFound =
           error instanceof Error &&
@@ -111,37 +108,7 @@ export class WriteTool implements Tool {
         targetExists = false;
       }
 
-      let targetRealPath: string;
-
-      if (targetExists) {
-        targetRealPath = await realpath(requestedPath);
-
-        const targetStat = await stat(targetRealPath);
-
-        if (!targetStat.isFile()) {
-          return {
-            content: "Path is not a regular file.",
-            isError: true,
-          };
-        }
-      } else {
-        const parentRealPath = await realpath(dirname(requestedPath));
-        targetRealPath = resolve(parentRealPath, basename(requestedPath));
-      }
-
-      const relativePath = relative(rootRealPath, targetRealPath);
-
-      const outsideRoot =
-        relativePath === ".." ||
-        relativePath.startsWith(`..${sep}`) ||
-        isAbsolute(relativePath);
-
-      if (outsideRoot) {
-        return {
-          content: "Path is outside the allowed workspace.",
-          isError: true,
-        };
-      }
+      const targetRealPath = await this.paths.writableFile(pathValue);
 
       await writeFile(targetRealPath, contentValue, {
         encoding: "utf8",
@@ -155,7 +122,7 @@ export class WriteTool implements Tool {
       return {
         content:
           `${targetExists ? "Overwrote" : "Created"} ` +
-          `"${relativePath}" (${contentBytes} bytes).`,
+          `"${pathValue}" (${contentBytes} bytes).`,
         isError: false,
       };
     } catch (error: unknown) {
