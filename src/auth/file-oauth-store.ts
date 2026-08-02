@@ -141,9 +141,12 @@ export class FileOAuthStore implements OAuthStore {
           pid: process.pid,
           acquiredAt: new Date().toISOString(),
         }), "utf8");
+        let heartbeatWork = Promise.resolve();
         const heartbeat = setInterval(() => {
           const now = new Date();
-          void utimes(lockPath, now, now).catch(() => undefined);
+          heartbeatWork = heartbeatWork
+            .then(() => utimes(lockPath, now, now))
+            .catch(() => undefined);
         }, Math.max(10, Math.floor(this.#lockStaleMs / 3)));
         heartbeat.unref();
         let released = false;
@@ -151,6 +154,9 @@ export class FileOAuthStore implements OAuthStore {
           if (released) return;
           released = true;
           clearInterval(heartbeat);
+          // clearInterval은 이미 시작된 비동기 utimes까지 취소하지 않는다. Windows에서
+          // 그 작업과 unlink가 겹치면 EPERM이 날 수 있으므로 모든 heartbeat를 기다린다.
+          await heartbeatWork;
           try {
             await handle.close();
           } finally {
