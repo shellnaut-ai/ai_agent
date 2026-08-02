@@ -79,4 +79,3 @@ llama.cpp, OpenAI-compatible, Codex OAuth Provider를 선택할 수 있어야 �
 - session replay, branch, compaction, persist 실패 회귀 성공
 - CLI EOF smoke 성공 및 production/docs secret scan 성공
 - 기능 보존표에서 미분류 삭제 파일 0개
-

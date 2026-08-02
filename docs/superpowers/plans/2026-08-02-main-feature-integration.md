@@ -378,4 +378,3 @@ Commit: `docs: document unified agent architecture`
 Run: `git push -u shellnaut codex/main-feature-integration`
 
 Expected: local HEAD, upstream, remote ref가 동일하다.
-
