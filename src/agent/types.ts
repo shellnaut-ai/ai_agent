@@ -11,6 +11,11 @@ export interface AgentRequest {
   readonly messages: readonly Message[];
 }
 
+export interface AgentExecutionPolicy {
+  readonly maxSteps: number;
+  readonly maxToolBatches?: number;
+}
+
 export interface AgentLoopOptions {
   readonly signal?: AbortSignal;
   readonly maxSteps?: number;

@@ -8,7 +8,7 @@
 |---|---|---|
 | `.gitattributes` | 유지 | final `git diff --check`와 checkout 검증 |
 | `README.md` | 유지·확장 | 최종 CLI/Provider 실행 문서 검토 |
-| `agent-write-test.txt` | 비제품 제거 | 제품 import가 없는지 `rg`로 확인 |
+| `agent-write-test.txt` | 비제품 보존 | 제품 import가 없으며 기존 main 파일을 변경하지 않음 |
 | `docs/superpowers/plans/2026-07-26-model-retry.md` | 유지 | 문서 이력 보존 |
 | `docs/superpowers/plans/2026-07-28-compaction-tool-validation-plan.md` | 유지 | 문서 이력 보존 |
 | `docs/superpowers/plans/2026-07-29-session-entry-structure.md` | 유지 | 문서 이력 보존 |
