@@ -59,6 +59,18 @@ export interface ToolResultMessage {
 }
 export type Message = UserMessage | AssistantMessage | ToolResultMessage;
 
+export const CONTINUATION_INSTRUCTION =
+  "Continue the immediately preceding assistant output from its exact " +
+  "endpoint. Return only new continuation text and do not repeat its tail.";
+
+export interface ModelContinuation {
+  readonly kind: "assistant-output";
+  readonly logicalMessageId: string;
+  readonly segmentIndex: number;
+  readonly previousTail: string;
+  readonly previousTailHash: string;
+}
+
 // 선택한 모델과 대화 기록을 묶은 요청
 export interface ModelRequest {
   readonly model: Model;
@@ -66,6 +78,7 @@ export interface ModelRequest {
   readonly messages: Message[];
   readonly tools: readonly ToolDefinition[];
   readonly maxOutputTokens?: number;
+  readonly continuation?: ModelContinuation;
 }
 
 export type StopReason = "stop" | "length" | "tool-call";

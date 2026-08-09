@@ -1,5 +1,8 @@
-import type { Message } from "../model/types.js";
-import type { ToolDefinition } from "../tools/types.js";
+import {
+  CONTINUATION_INSTRUCTION,
+  type Message,
+  type ModelRequest,
+} from "../model/types.js";
 
 export class TokenEstimator {
   private readonly charsPerToken: number;
@@ -25,13 +28,21 @@ export class TokenEstimator {
     return this.estimateValue(messages);
   }
 
-  estimateRequest(
-    messages: readonly Message[],
-    tools: readonly ToolDefinition[],
-  ): number {
+  estimateRequest(request: ModelRequest): number {
     return this.estimateValue({
-      messages,
-      tools,
+      ...(request.systemPrompt === undefined
+        ? {}
+        : { systemPrompt: request.systemPrompt }),
+      messages: request.messages,
+      tools: request.tools,
+      ...(request.continuation === undefined
+        ? {}
+        : {
+            continuation: {
+              instruction: CONTINUATION_INSTRUCTION,
+              ...request.continuation,
+            },
+          }),
     });
   }
 }

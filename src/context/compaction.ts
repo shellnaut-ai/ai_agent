@@ -169,10 +169,11 @@ export class CompactionService {
       ...flattenTurns(activeTurns),
       request.pendingUserMessage,
     ];
-    const tokensBefore = this.estimator.estimateRequest(
-      activeMessages,
-      request.toolDefinitions,
-    );
+    const tokensBefore = this.estimator.estimateRequest({
+      model: request.model,
+      messages: activeMessages,
+      tools: request.toolDefinitions,
+    });
 
     if (tokensBefore <= inputBudget) {
       return undefined;
@@ -326,10 +327,11 @@ export class CompactionService {
       ...flattenTurns(preparation.keptTurns),
       preparation.pendingUserMessage,
     ];
-    const tokensAfter = this.estimator.estimateRequest(
-      compactedMessages,
-      preparation.toolDefinitions,
-    );
+    const tokensAfter = this.estimator.estimateRequest({
+      model: preparation.model,
+      messages: compactedMessages,
+      tools: preparation.toolDefinitions,
+    });
 
     if (tokensAfter > preparation.inputBudget) {
       throw new Error(
