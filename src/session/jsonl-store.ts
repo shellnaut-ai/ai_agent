@@ -92,7 +92,12 @@ function parseJsonValue(value: unknown): JsonValue {
     const result: Record<string, JsonValue> = {};
 
     for (const [key, item] of Object.entries(value)) {
-      result[key] = parseJsonValue(item);
+      Object.defineProperty(result, key, {
+        value: parseJsonValue(item),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
     }
 
     return result;
