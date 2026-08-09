@@ -21,7 +21,8 @@
   `outcome unknown` 오류 결과로 닫는다.
 - Provider 전용 replay 상태를 안정적인 assistant message와 함께 영속화한다.
 - Codex 세션이 CLI 재시작과 compaction 이후에도 필요한 replay item을 전송한다.
-- timeout, 출력 한도 초과, AbortSignal에서 Bash 프로세스 트리를 종료한다.
+- timeout, 출력 한도 초과, AbortSignal에서 Windows Bash child tree 또는 POSIX Bash
+  process group을 종료한다.
 - 기존 llama.cpp, OpenAI-compatible, approval, session branching, compaction 계약을 보존한다.
 
 ## 비목표
@@ -217,12 +218,12 @@ provider serialization 오류로 종료한다.
 
 ## 테스트 전략
 
-1. 후속 모델 실패 전에 도구 intent가 저장되고 결과가 없으면 재개 시 unknown 결과가
-   추가되는 integration test.
-2. checkpoint 저장 실패 시 mutating tool 실행 횟수가 0인 test.
-3. 정상 tool turn이 user, assistant, tool result, final assistant 순서로 한 번씩 저장되는 test.
-4. Codex provider를 새 인스턴스로 교체하고 JSONL replay 후 reasoning item이 request에
-   포함되는 test.
+1. 도구 실행은 성공하고 후속 Provider만 실패하면 실제 tool result가 남고 unknown
+   recovery가 추가되지 않는 integration test.
+2. 도구 실행 뒤 tool-result append가 실패하면 재개 시 unknown recovery가 추가되고
+   도구가 자동 재실행되지 않는 integration test.
+3. checkpoint 저장 실패 시 mutating tool 실행 횟수가 0인 test.
+4. 정상 tool turn이 user, assistant, tool result, final assistant 순서로 한 번씩 저장되는 test.
 5. 새 Provider 인스턴스와 JSONL replay에서 reasoning item과 function-call item `id`가 모두
    request에 포함되는 test.
 6. compaction으로 message index가 바뀐 뒤에도 kept assistant의 reasoning과 function-call
