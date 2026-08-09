@@ -37,7 +37,7 @@
   },
   "homepage": "https://github.com/shellnaut-ai/ai_agent#readme",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12.0"
   },
   "bin": {
     "ai-agent": "./dist/cli.js"
