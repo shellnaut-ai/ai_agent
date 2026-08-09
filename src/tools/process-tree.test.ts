@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -127,7 +127,11 @@ const child = spawn(process.execPath, ["-e", ${JSON.stringify(CHILD_PROGRAM)}], 
   stdio: "ignore",
   windowsHide: true,
 });
-writeFileSync(process.argv[1], String(child.pid), "utf8");
+try {
+  writeFileSync(process.argv[1], String(child.pid), "utf8");
+} catch {
+  // Keep the known parent PID alive so test cleanup retains a valid tree root.
+}
 setInterval(() => {}, 1_000);
 `;
     const parent = spawn(process.execPath, ["-e", parentProgram, childPidPath], {
@@ -159,3 +163,15 @@ setInterval(() => {}, 1_000);
   },
   15_000,
 );
+
+test("terminateProcessTree rejects a non-positive child PID", async () => {
+  const child = {
+    pid: 0,
+    exitCode: null,
+    signalCode: null,
+  } as ChildProcess;
+
+  await expect(terminateProcessTree(child, process.platform)).rejects.toThrow(
+    "positive integer child PID",
+  );
+});

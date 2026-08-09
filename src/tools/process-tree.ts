@@ -107,6 +107,10 @@ export async function terminateProcessTree(
 ): Promise<void> {
   const pid = child.pid;
 
+  if (pid !== undefined && (!Number.isInteger(pid) || pid <= 0)) {
+    throw new Error("Cannot terminate a process tree without a positive integer child PID.");
+  }
+
   if (pid === undefined) {
     if (child.exitCode !== null || child.signalCode !== null) {
       return;

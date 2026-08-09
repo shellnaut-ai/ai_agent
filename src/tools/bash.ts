@@ -24,6 +24,19 @@ interface CapturedOutput {
   truncated: boolean;
 }
 
+const WINDOWS_MANAGED_COMMAND = `
+__pi_clone_managed_command_7f2c=$1
+shift
+__pi_clone_wait_for_jobs_7f2c() {
+  __pi_clone_exit_status_7f2c=$?
+  trap - EXIT
+  wait
+  exit "$__pi_clone_exit_status_7f2c"
+}
+trap '__pi_clone_wait_for_jobs_7f2c' EXIT
+eval "$__pi_clone_managed_command_7f2c"
+`;
+
 function captureChunk(
   output: CapturedOutput,
   chunk: unknown,
@@ -131,8 +144,12 @@ export class BashTool implements Tool {
 
     try {
       const rootRealPath = await realpath(this.rootDir);
+      const shellArgs =
+        process.platform === "win32"
+          ? ["-lc", WINDOWS_MANAGED_COMMAND, "bash", commandValue]
+          : ["-lc", commandValue];
 
-      const child = spawn(this.shellPath, ["-lc", commandValue], {
+      const child = spawn(this.shellPath, shellArgs, {
         cwd: rootRealPath,
         detached: process.platform !== "win32",
         env: process.env,

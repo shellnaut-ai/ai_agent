@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,11 +22,24 @@ interface RecordedProcessTree {
 const BASH_TREE_FIXTURE = `
 const { spawn } = require("node:child_process");
 const { writeFileSync } = require("node:fs");
+const treePath = process.argv[2];
+const mode = process.argv[3];
+const fixtureToken = process.argv[4];
+try {
+  writeFileSync(
+    treePath,
+    JSON.stringify({ parentPid: process.pid }),
+    "utf8",
+  );
+} catch {
+  process.exit(1);
+}
 const child = spawn(
   process.execPath,
   [
     "-e",
     'process.on("SIGTERM", () => {}); setInterval(() => {}, 1_000);',
+    fixtureToken,
   ],
   {
     detached: process.platform === "win32",
@@ -33,12 +47,16 @@ const child = spawn(
     windowsHide: true,
   },
 );
-writeFileSync(
-  process.argv[2],
-  JSON.stringify({ parentPid: process.pid, descendantPid: child.pid }),
-  "utf8",
-);
-if (process.argv[3] === "flood") {
+try {
+  writeFileSync(
+    treePath,
+    JSON.stringify({ parentPid: process.pid, descendantPid: child.pid }),
+    "utf8",
+  );
+} catch {
+  // The token remains an independent cleanup handle for both live processes.
+}
+if (mode === "flood") {
   process.stdout.write("x".repeat(8_192));
 }
 setInterval(() => {}, 1_000);
@@ -177,8 +195,130 @@ async function forceCleanupTree(
   await forceKillProcess(tree.descendantPid);
 }
 
+async function captureCommandOutput(
+  command: string,
+  args: readonly string[],
+  env?: NodeJS.ProcessEnv,
+): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const child = spawn(command, args, {
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.once("error", reject);
+    child.once("close", (exitCode) => {
+      if (exitCode === 0) {
+        resolve(Buffer.concat(stdout).toString("utf8"));
+        return;
+      }
+
+      reject(
+        new Error(
+          `${command} fixture scan failed (exit ${String(exitCode)}): ${Buffer.concat(stderr).toString("utf8")}`,
+        ),
+      );
+    });
+  });
+}
+
+async function findFixturePids(token: string): Promise<number[]> {
+  let output: string;
+
+  if (process.platform === "win32") {
+    output = await captureCommandOutput(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$value = $env:PI_CLONE_FIXTURE_TOKEN; " +
+          "Get-CimInstance Win32_Process | " +
+          "Where-Object { ($_.Name -eq 'node.exe' -or $_.Name -eq 'bash.exe') " +
+          "-and $_.CommandLine -like ('*' + $value + '*') } | " +
+          "ForEach-Object { $_.ProcessId }",
+      ],
+      {
+        ...process.env,
+        PI_CLONE_FIXTURE_TOKEN: token,
+      },
+    );
+  } else {
+    output = await captureCommandOutput("ps", ["-eo", "pid=,args="]);
+  }
+
+  return output
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => {
+      if (line.length === 0) {
+        return false;
+      }
+
+      return process.platform === "win32"
+        ? true
+        : line.includes(token) && /\b(?:node|bash)\b/u.test(line);
+    })
+    .map((line) => Number.parseInt(line, 10))
+    .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
+}
+
+async function forceCleanupToken(token: string): Promise<void> {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const pids = await findFixturePids(token);
+
+    if (pids.length === 0) {
+      return;
+    }
+
+    for (const pid of pids) {
+      await forceKillProcess(pid);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  const remainingPids = await findFixturePids(token);
+
+  if (remainingPids.length > 0) {
+    throw new Error(
+      `Fixture token ${token} still owns PIDs: ${remainingPids.join(", ")}`,
+    );
+  }
+}
+
+async function cleanupBashFixture(
+  token: string,
+  tree: RecordedProcessTree | undefined,
+  execution: Promise<unknown> | undefined,
+): Promise<void> {
+  const errors: unknown[] = [];
+
+  for (const cleanupAction of [
+    async () => forceCleanupToken(token),
+    async () => forceCleanupTree(tree),
+    async () => execution?.catch(() => undefined),
+  ]) {
+    try {
+      await cleanupAction();
+    } catch (error: unknown) {
+      errors.push(error);
+    }
+  }
+
+  if (errors.length > 0) {
+    throw errors[0];
+  }
+}
+
 async function createBashTreeFixture(
   rootDir: string,
+  token: string,
   mode?: "flood",
 ): Promise<{ readonly command: string; readonly treePath: string }> {
   const fixturePath = join(rootDir, "bash-process-tree-fixture.cjs");
@@ -186,9 +326,9 @@ async function createBashTreeFixture(
   await writeFile(fixturePath, BASH_TREE_FIXTURE, "utf8");
 
   return {
-    command: `node bash-process-tree-fixture.cjs bash-process-tree.json${
-      mode === undefined ? "" : ` ${mode}`
-    }`,
+    command:
+      "node bash-process-tree-fixture.cjs bash-process-tree.json " +
+      `${mode ?? "hold"} ${token}`,
     treePath,
   };
 }
@@ -252,7 +392,8 @@ describe("tool integration", () => {
     async () => {
       const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-bash-timeout-"));
       cleanup.push(rootDir);
-      const fixture = await createBashTreeFixture(rootDir);
+      const token = `pi-clone-${randomUUID()}`;
+      const fixture = await createBashTreeFixture(rootDir, token);
       const tool = new BashTool({
         rootDir,
         shellPath: bashPath(),
@@ -276,8 +417,7 @@ describe("tool integration", () => {
         });
         await waitForProcessExit(tree.descendantPid);
       } finally {
-        await forceCleanupTree(tree);
-        await execution?.catch(() => undefined);
+        await cleanupBashFixture(token, tree, execution);
       }
     },
     20_000,
@@ -288,7 +428,8 @@ describe("tool integration", () => {
     async () => {
       const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-bash-abort-"));
       cleanup.push(rootDir);
-      const fixture = await createBashTreeFixture(rootDir);
+      const token = `pi-clone-${randomUUID()}`;
+      const fixture = await createBashTreeFixture(rootDir, token);
       const tool = new BashTool({
         rootDir,
         shellPath: bashPath(),
@@ -312,8 +453,7 @@ describe("tool integration", () => {
         });
         await waitForProcessExit(tree.descendantPid);
       } finally {
-        await forceCleanupTree(tree);
-        await execution?.catch(() => undefined);
+        await cleanupBashFixture(token, tree, execution);
       }
     },
     15_000,
@@ -324,7 +464,8 @@ describe("tool integration", () => {
     async () => {
       const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-bash-output-"));
       cleanup.push(rootDir);
-      const fixture = await createBashTreeFixture(rootDir, "flood");
+      const token = `pi-clone-${randomUUID()}`;
+      const fixture = await createBashTreeFixture(rootDir, token, "flood");
       const tool = new BashTool({
         rootDir,
         shellPath: bashPath(),
@@ -349,8 +490,50 @@ describe("tool integration", () => {
         });
         await waitForProcessExit(tree.descendantPid);
       } finally {
-        await forceCleanupTree(tree);
-        await execution?.catch(() => undefined);
+        await cleanupBashFixture(token, tree, execution);
+      }
+    },
+    20_000,
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "bash timeout settles and kills a pipe-inheriting background tree after the user shell exits",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-bash-exited-root-"),
+      );
+      cleanup.push(rootDir);
+      const token = `pi-clone-${randomUUID()}`;
+      const fixture = await createBashTreeFixture(rootDir, token);
+      const tool = new BashTool({
+        rootDir,
+        shellPath: bashPath(),
+        timeoutMs: 1_000,
+      });
+      let tree: RecordedProcessTree | undefined;
+      let execution: Promise<Awaited<ReturnType<BashTool["execute"]>>> | undefined;
+
+      try {
+        execution = tool.execute({
+          command: `${fixture.command} & exit 7`,
+        });
+        tree = await waitForRecordedTree(fixture.treePath);
+        const result = await withDeadline(
+          execution,
+          "Bash exited-root termination did not settle.",
+        );
+
+        expect(result.isError).toBe(true);
+        expect(JSON.parse(result.content)).toMatchObject({
+          timedOut: true,
+          outputTruncated: false,
+        });
+        await Promise.all([
+          waitForProcessExit(tree.parentPid),
+          waitForProcessExit(tree.descendantPid),
+        ]);
+      } finally {
+        await cleanupBashFixture(token, tree, execution);
       }
     },
     20_000,
