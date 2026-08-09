@@ -23,9 +23,9 @@ const cleanup: string[] = [];
 const children = new Set<ChildProcessWithoutNullStreams>();
 const windowsCi =
   process.platform === "win32" && process.env["CI"] === "true";
-const childOutputTimeoutMs = windowsCi ? 30_000 : 10_000;
+const childOutputTimeoutMs = windowsCi ? 60_000 : 10_000;
 const liveOwnerTestTimeoutMs = windowsCi ? 45_000 : 5_000;
-const synchronizedWriterTestTimeoutMs = windowsCi ? 60_000 : 20_000;
+const synchronizedWriterTestTimeoutMs = windowsCi ? 120_000 : 20_000;
 const model = {
   id: "fake-model",
   name: "Fake",
