@@ -10,6 +10,7 @@ export class CliIO {
   });
 
   private readonly escapeListeners = new Set<() => void>();
+  private readonly interruptListeners = new Set<() => void>();
 
   private readonly handleKeypress = (
     _character: string | undefined,
@@ -24,20 +25,40 @@ export class CliIO {
     }
   };
 
+  private readonly handleInterrupt = (): void => {
+    for (const listener of this.interruptListeners) {
+      listener();
+    }
+  };
+
   constructor() {
     if (stdin.isTTY) {
       stdin.on("keypress", this.handleKeypress);
     }
   }
 
-  question(prompt: string, signal?: AbortSignal): Promise<string> {
-    if (signal) {
-      return this.readline.question(prompt, {
-        signal,
-      });
-    }
+  async question(
+    prompt: string,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    try {
+      if (signal) {
+        return await this.readline.question(prompt, {
+          signal,
+        });
+      }
 
-    return this.readline.question(prompt);
+      return await this.readline.question(prompt);
+    } catch (error: unknown) {
+      if (
+        error instanceof Error &&
+        (error.message === "readline was closed" ||
+          ("code" in error && error.code === "ERR_USE_AFTER_CLOSE"))
+      ) {
+        return undefined;
+      }
+      throw error;
+    }
   }
 
   write(content: string): void {
@@ -57,9 +78,25 @@ export class CliIO {
     };
   }
 
+  onInterrupt(listener: () => void): () => void {
+    if (this.interruptListeners.size === 0) {
+      process.on("SIGINT", this.handleInterrupt);
+    }
+    this.interruptListeners.add(listener);
+
+    return () => {
+      this.interruptListeners.delete(listener);
+      if (this.interruptListeners.size === 0) {
+        process.off("SIGINT", this.handleInterrupt);
+      }
+    };
+  }
+
   close(): void {
     stdin.off("keypress", this.handleKeypress);
+    process.off("SIGINT", this.handleInterrupt);
     this.escapeListeners.clear();
+    this.interruptListeners.clear();
     this.readline.close();
   }
 }

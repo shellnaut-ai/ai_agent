@@ -1,5 +1,5 @@
-import type { ModelProvider } from "./provider";
-import type { Model, ProviderId } from "./types";
+import type { ModelProvider } from "./provider.js";
+import type { Model, ProviderId } from "./types.js";
 
 export interface RegistryOptions {
     signal?: AbortSignal;

@@ -11,9 +11,15 @@ export interface AgentRequest {
   readonly messages: readonly Message[];
 }
 
+export interface AgentExecutionPolicy {
+  readonly maxSteps: number;
+  readonly maxToolBatches?: number;
+}
+
 export interface AgentLoopOptions {
   readonly signal?: AbortSignal;
   readonly maxSteps?: number;
+  readonly maxToolBatches?: number;
 }
 
 export type AgentStopReason = Exclude<StopReason, "tool-call">;
