@@ -1,5 +1,14 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -75,26 +84,177 @@ describe("cross-process session writer lock", () => {
     },
   );
 
-  test.skipIf(process.platform === "win32")(
-    "migrates an unlocked legacy artifact after a quiescent upgrade",
+  test(
+    "fails closed on an unlocked legacy artifact until an operator removes it",
     async () => {
       const rootDir = await mkdtemp(
         join(tmpdir(), "ai-agent-writer-stale-"),
       );
       cleanup.push(rootDir);
       const lockPath = join(rootDir, "session.writer.lock");
+      const callbackMarker = join(rootDir, "callback-entered");
       await writeFile(lockPath, "abandoned-owner-metadata\n", "utf8");
       const old = new Date(Date.now() - 86_400_000);
       await utimes(lockPath, old, old);
+      const identityBefore = await lstat(lockPath, { bigint: true });
+      const writerLockUrl = pathToFileURL(
+        resolve("src/session/writer-lock.ts"),
+      ).href;
+      const script = `
+        Object.defineProperty(process, "platform", {
+          configurable: true,
+          value: "linux",
+        });
+        const { withSessionWriterLock } = await import(
+          ${JSON.stringify(writerLockUrl)});
+        try {
+          await withSessionWriterLock(process.argv[1], async () => {
+            const { writeFile } = await import("node:fs/promises");
+            await writeFile(process.argv[2], "entered\\n", "utf8");
+            }, { timeoutMs: 5_000 });
+          process.stdout.write("unexpected-success\\n");
+        } catch (error) {
+          process.stdout.write("error:" + error.message + "\\n");
+        }
+      `;
+      const contender = spawnNode(script, [lockPath, callbackMarker]);
 
-      await expect(
-        withSessionWriterLock(lockPath, async () => "recovered", {
-          timeoutMs: 5_000,
-        }),
-      ).resolves.toBe("recovered");
-      expect(await readdir(rootDir)).toEqual([
-        expect.stringMatching(/^session\.writer\.lock\.reaped-legacy-/u),
+      await expect(waitForLine(contender, /^error:/u)).resolves.toMatch(
+        /legacy.*quiescent.*remove/i,
+      );
+      await waitForClose(contender);
+      children.delete(contender);
+      expect(await readdir(rootDir)).toEqual(["session.writer.lock"]);
+      const identityAfter = await lstat(lockPath, { bigint: true });
+      expect([identityAfter.dev, identityAfter.ino]).toEqual([
+        identityBefore.dev,
+        identityBefore.ino,
       ]);
+      expect(await readFile(lockPath, "utf8")).toBe(
+        "abandoned-owner-metadata\n",
+      );
+      await expect(access(callbackMarker)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    },
+  );
+
+  test(
+    "fails closed when a regular legacy artifact races the initial precheck",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-writer-raced-legacy-"),
+      );
+      cleanup.push(rootDir);
+      const lockPath = join(rootDir, "session.writer.lock");
+      const callbackMarker = join(rootDir, "callback-entered");
+      const writerLockUrl = pathToFileURL(
+        resolve("src/session/writer-lock.ts"),
+      ).href;
+      const script = `
+        import { lstat, writeFile } from "node:fs/promises";
+        Object.defineProperty(process, "platform", {
+          configurable: true,
+          value: "linux",
+        });
+        const {
+          sessionWriterLockRuntime,
+          withSessionWriterLock,
+        } = await import(${JSON.stringify(writerLockUrl)});
+        sessionWriterLockRuntime.publishPosixCandidate = async (
+          _candidatePath,
+          lockPath,
+        ) => {
+          await writeFile(lockPath, "raced-legacy-owner\\n", "utf8");
+          const identity = await lstat(lockPath, { bigint: true });
+          process.stdout.write(
+            "published:" + identity.dev + ":" + identity.ino + "\\n");
+          throw Object.assign(new Error("simulated publication contention"), {
+            code: "EEXIST",
+          });
+        };
+        try {
+          await withSessionWriterLock(process.argv[1], async () => {
+            await writeFile(process.argv[2], "entered\\n", "utf8");
+          }, { timeoutMs: 5_000 });
+          process.stdout.write("unexpected-success\\n");
+        } catch (error) {
+          process.stdout.write("error:" + error.message + "\\n");
+        }
+      `;
+      const contender = spawnNode(script, [lockPath, callbackMarker]);
+      const publishedLine = waitForLine(contender, /^published:/u);
+      const errorLine = waitForLine(contender, /^error:/u);
+      const published = await publishedLine;
+      await expect(errorLine).resolves.toMatch(
+        /legacy.*quiescent.*remove/i,
+      );
+      await waitForClose(contender);
+      children.delete(contender);
+      const [, expectedDev, expectedIno] = published.split(":");
+      const identity = await lstat(lockPath, { bigint: true });
+
+      expect([String(identity.dev), String(identity.ino)]).toEqual([
+        expectedDev,
+        expectedIno,
+      ]);
+      expect(await readFile(lockPath, "utf8")).toBe(
+        "raced-legacy-owner\n",
+      );
+      await expect(access(callbackMarker)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    },
+  );
+
+  test.skipIf(process.platform !== "linux")(
+    "fails closed while an old process holds a live kernel flock",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-writer-live-flock-"),
+      );
+      cleanup.push(rootDir);
+      const lockPath = join(rootDir, "session.writer.lock");
+      const owner = spawn(
+        "flock",
+        [
+          "--no-fork",
+          "--exclusive",
+          lockPath,
+          process.execPath,
+          "--input-type=module",
+          "--eval",
+          'process.stdout.write("acquired\\n"); await new Promise(() => undefined);',
+        ],
+        {
+          env: process.env,
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      ) as ChildProcessWithoutNullStreams;
+      children.add(owner);
+      try {
+        await waitForLine(owner, "acquired");
+        const identityBefore = await lstat(lockPath, { bigint: true });
+        let callbackEntered = false;
+
+        await expect(
+          withSessionWriterLock(lockPath, async () => {
+            callbackEntered = true;
+            return "must not enter";
+          }, { timeoutMs: 5_000 }),
+        ).rejects.toThrow(/legacy.*quiescent.*remove/i);
+        expect(callbackEntered).toBe(false);
+        expect(await readdir(rootDir)).toEqual(["session.writer.lock"]);
+        const identityAfter = await lstat(lockPath, { bigint: true });
+        expect([identityAfter.dev, identityAfter.ino]).toEqual([
+          identityBefore.dev,
+          identityBefore.ino,
+        ]);
+      } finally {
+        owner.kill();
+        await waitForClose(owner);
+        children.delete(owner);
+      }
     },
   );
 

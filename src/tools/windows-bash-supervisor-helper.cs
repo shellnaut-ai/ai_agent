@@ -1,4 +1,4 @@
-// Runtime-compiled from this reviewed source; no precompiled helper is shipped.
+// Source of the checked-in helper payload; CI verifies its normalized provenance.
 using System;
 using System.ComponentModel;
 using System.Globalization;
@@ -21,6 +21,7 @@ public static class PiCloneWindowsJobSupervisor
     private const uint WAIT_OBJECT_0 = 0x00000000;
     private const uint INFINITE = 0xffffffff;
     private const int ERROR_BROKEN_PIPE = 109;
+    private const int BACKGROUND_SHUTDOWN_GRACE_MS = 250;
     private const int STD_OUTPUT_HANDLE = -11;
     private const int STD_ERROR_HANDLE = -12;
 
@@ -194,6 +195,11 @@ public static class PiCloneWindowsJobSupervisor
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool TerminateProcess(
         IntPtr process,
+        uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateJobObject(
+        IntPtr job,
         uint exitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -763,9 +769,28 @@ public static class PiCloneWindowsJobSupervisor
             {
                 throw stderrRelay.Error;
             }
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
+            if (!QueryInformationJobObject(
+                job,
+                1,
+                out accounting,
+                (uint)Marshal.SizeOf(
+                    typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)),
+                IntPtr.Zero))
+            {
+                ThrowLastError("QueryInformationJobObject after root exit");
+            }
+            if (accounting.ActiveProcesses > 0)
+            {
+                Thread.Sleep(BACKGROUND_SHUTDOWN_GRACE_MS);
+                if (!TerminateJobObject(job, 1))
+                {
+                    ThrowLastError("TerminateJobObject after root exit");
+                }
+            }
+            WaitForJobEmpty(job);
             PublishControl(parentOutput, controlCapability, "stdout-end");
             PublishControl(parentError, controlCapability, "stderr-end");
-            WaitForJobEmpty(job);
             return unchecked((int)exitCode);
         }
         finally

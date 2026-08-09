@@ -21,8 +21,10 @@ npm ci
 npm run check
 ```
 
-`check`는 TypeScript 검사, Vitest, build와 실제 CLI EOF 자식 프로세스 스모크를
-순서대로 실행한다. Node.js 22 이상이 필요하다.
+`check`는 TypeScript 검사, Vitest, build, 실제 CLI EOF 자식 프로세스 스모크와
+설치된 패키지의 기본 Bash 실행/프로세스 정리 스모크를 순서대로 실행한다. Windows
+Vitest는 helper source와 실행 payload의 normalized semantic manifest도 재검증한다.
+Node.js 22 이상이 필요하다.
 
 ## CLI
 
@@ -71,8 +73,11 @@ item ID를 다음 Codex 요청에 replay한다. compaction summary 자체에는 
 이 버전은 Linux/macOS의 외부 `flock` 실행 파일 대신 로컬 파일시스템의 atomic directory
 lease를 사용한다. 이전 버전과 새 버전의 lock 방식은 서로의 활성 lease를 확인할 수 없으므로
 rolling upgrade를 지원하지 않는다. 업그레이드 전에 해당 세션 저장소를 사용하는 이전 버전
-프로세스를 모두 종료한 뒤 새 버전을 시작해야 한다. 그러면 첫 접근에서 이전 버전이 남긴
-regular `.writer.lock` artifact를 원자적으로 보존 이름으로 옮기고 새 lease로 전환한다.
+프로세스를 모두 종료하고 실제로 quiescent 상태인지 확인해야 한다. 새 버전은 이전 버전이
+남긴 regular `.writer.lock` artifact를 활성 `flock` 여부와 관계없이 절대 자동 이동하거나
+삭제하지 않고 fail closed한다. 운영자가 quiescent 상태를 확인한 뒤 해당 regular file을
+명시적으로 보존 이름으로 옮기거나 삭제하고 다시 시작해야 하며, 그 전에는 writer callback이
+실행되지 않는다.
 
 새 lease의 PID liveness 판정은 같은 host/PID namespace의 로컬 저장소를 전제로 한다. 네트워크
 공유 또는 서로 다른 PID namespace에서 같은 세션 디렉터리를 동시에 쓰는 구성은 지원하지
@@ -83,7 +88,13 @@ Bash는 timeout, 출력 한도 초과, `AbortSignal`에서 종료를 조정한�
 
 - Windows에서는 supervisor가 Bash를 suspended 상태로 만들고 `KILL_ON_JOB_CLOSE` Job Object에
   배정한 뒤 실행한다. supervisor가 종료되면 Job Object가 닫히며 그 Job Object가 관리하는
-  프로세스를 종료한다.
+  프로세스를 종료한다. 실행 payload는 저장소의 검토된 C# source에서 Windows PowerShell 5.1로
+  생성한다. Windows CI는 source를 다시 컴파일하고 MVID/timestamp만 제외한 PE/COFF/CLR header,
+  type/layout, field/RVA, signature, P/Invoke, managed IL, attribute, resource manifest 전체가
+  payload와 같은지 검사한다. 런타임은 payload SHA-256을 확인한 뒤 메모리에서 로드하며 command, cwd, environment는
+  공유 파일이나 compiler workspace가 아니라 상속된 익명 stdin으로만 전달한다. Windows
+  PowerShell 5.1/.NET Framework가 필요하고 WDAC 또는 AppLocker가 PowerShell이나 검증된 helper
+  로드를 차단하면 Bash를 시작하지 않고 fail closed한다.
 - POSIX에서는 Bash가 생성한 process group에 `SIGTERM`을 보내고 짧은 grace period 뒤에도
   실행 가능한 멤버가 남아 있으면 `SIGKILL`을 보낸다. reaping 전 zombie는 실행 가능한
   멤버로 보지 않으며, `setsid`처럼 그 process group을 이탈한 descendant까지 종료한다고

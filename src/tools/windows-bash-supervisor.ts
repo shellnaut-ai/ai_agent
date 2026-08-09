@@ -1,9 +1,12 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { rm } from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
-import { Transform, type Readable } from "node:stream";
+import { createHash, randomBytes } from "node:crypto";
+import { join } from "node:path";
+import { Transform, type Readable, type Writable } from "node:stream";
+
+import {
+  WINDOWS_BASH_SUPERVISOR_REVIEWED_ASSEMBLY_BASE64,
+  WINDOWS_BASH_SUPERVISOR_REVIEWED_ASSEMBLY_SHA256,
+} from "./windows-bash-supervisor-reviewed-assembly.js";
 
 interface SupervisorTerminal {
   readonly exitCode: number | null;
@@ -54,115 +57,41 @@ function Decode-Utf8([string]$value) {
   return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($value))
 }
 
-function New-PrivateCompilerDirectory([string]$requestedPath) {
-  $leaf = [IO.Path]::GetFileName($requestedPath)
-  if ($leaf -notmatch '^pi-clone-bash-compiler-[0-9a-f]{32}$') {
-    throw 'Invalid compiler directory leaf.'
-  }
-
-  $base = [Environment]::GetFolderPath(
-    [Environment+SpecialFolder]::LocalApplicationData)
-  if ([string]::IsNullOrWhiteSpace($base)) {
-    throw 'LocalApplicationData is unavailable.'
-  }
-
-  $path = [IO.Path]::GetFullPath($requestedPath)
-  $expected = [IO.Path]::GetFullPath([IO.Path]::Combine($base, $leaf))
-  if (![string]::Equals(
-    $path,
-    $expected,
-    [StringComparison]::OrdinalIgnoreCase)) {
-    throw 'Compiler directory is outside LocalApplicationData.'
-  }
-  if ([IO.Directory]::Exists($path) -or [IO.File]::Exists($path)) {
-    throw 'Compiler directory already exists.'
-  }
-
-  $current = [Security.Principal.WindowsIdentity]::GetCurrent().User
-  $system = [Security.Principal.SecurityIdentifier]::new(
-    [Security.Principal.WellKnownSidType]::LocalSystemSid,
-    $null)
-  $security = [Security.AccessControl.DirectorySecurity]::new()
-  $security.SetOwner($current)
-  $security.SetAccessRuleProtection($true, $false)
-  $inherit =
-    [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
-    [Security.AccessControl.InheritanceFlags]::ObjectInherit
-  foreach ($sid in @($current, $system)) {
-    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
-      $sid,
-      [Security.AccessControl.FileSystemRights]::FullControl,
-      $inherit,
-      [Security.AccessControl.PropagationFlags]::None,
-      [Security.AccessControl.AccessControlType]::Allow)
-    [void]$security.AddAccessRule($rule)
-  }
-
-  [void][IO.Directory]::CreateDirectory($path, $security)
-  # LocalApplicationData may grant another principal DELETE_CHILD on the
-  # parent. Holding a child without FILE_SHARE_DELETE prevents that principal
-  # from renaming/replacing this directory after its ACL is validated.
-  $guard = [IO.File]::Open(
-    [IO.Path]::Combine($path, '.compile-guard'),
-    [IO.FileMode]::CreateNew,
-    [IO.FileAccess]::ReadWrite,
-    [IO.FileShare]::None)
-  $sections =
-    [Security.AccessControl.AccessControlSections]::Owner -bor
-    [Security.AccessControl.AccessControlSections]::Access
-  $actual = [IO.Directory]::GetAccessControl($path, $sections)
-  $rules = @($actual.GetAccessRules(
-    $true,
-    $true,
-    [Security.Principal.SecurityIdentifier]))
-  $allowedSids = @($current.Value, $system.Value)
-  $bad = @($rules | Where-Object {
-    $_.AccessControlType -ne
-      [Security.AccessControl.AccessControlType]::Allow -or
-    $_.IdentityReference.Value -notin $allowedSids -or
-    ($_.FileSystemRights -band
-      [Security.AccessControl.FileSystemRights]::FullControl) -ne
-      [Security.AccessControl.FileSystemRights]::FullControl
-  })
-  $actualAllowed = @($rules |
-    ForEach-Object { $_.IdentityReference.Value } |
-    Sort-Object -Unique)
-  $missing = @($allowedSids | Where-Object { $_ -notin $actualAllowed })
-  if (
-    !$actual.AreAccessRulesProtected -or
-    $actual.GetOwner(
-      [Security.Principal.SecurityIdentifier]).Value -ne $current.Value -or
-    $bad.Count -ne 0 -or
-    $missing.Count -ne 0
-  ) {
-    throw 'Compiler directory ACL validation failed.'
-  }
-
-  return [pscustomobject]@{
-    Path = $path
-    Guard = $guard
-  }
-}
-
 function Resolve-ShellPath(
   [string]$shellPath,
   [string]$workingDirectory,
   [string]$searchPath,
   [string]$pathExtensions
 ) {
+  $extension = [IO.Path]::GetExtension($shellPath)
+  if (![string]::IsNullOrEmpty($extension)) {
+    $names = @($shellPath)
+  } else {
+    $executableExtensions = @($pathExtensions.Split(';') |
+      ForEach-Object { $_.Trim().ToLowerInvariant() } |
+      Where-Object { $_ -eq '.exe' -or $_ -eq '.com' })
+    if ($executableExtensions.Count -eq 0) {
+      $executableExtensions = @('.exe', '.com')
+    }
+    $names = @($executableExtensions |
+      ForEach-Object { [string]::Concat($shellPath, $_) })
+  }
+
   $containsDirectory =
     [IO.Path]::IsPathRooted($shellPath) -or
     $shellPath.Contains('\\') -or
     $shellPath.Contains('/')
   if ($containsDirectory) {
-    $candidate = if ([IO.Path]::IsPathRooted($shellPath)) {
-      [IO.Path]::GetFullPath($shellPath)
-    } else {
-      [IO.Path]::GetFullPath(
-        [IO.Path]::Combine($workingDirectory, $shellPath))
-    }
-    if ([IO.File]::Exists($candidate)) {
-      return $candidate
+    foreach ($name in $names) {
+      $candidate = if ([IO.Path]::IsPathRooted($name)) {
+        [IO.Path]::GetFullPath($name)
+      } else {
+        [IO.Path]::GetFullPath(
+          [IO.Path]::Combine($workingDirectory, $name))
+      }
+      if ([IO.File]::Exists($candidate)) {
+        return $candidate
+      }
     }
     throw 'Windows Bash executable was not found.'
   }
@@ -193,20 +122,6 @@ function Resolve-ShellPath(
     ForEach-Object { $_.Trim().Trim('"') } |
     Where-Object { $_.Length -gt 0 })
 
-  $extension = [IO.Path]::GetExtension($shellPath)
-  if (![string]::IsNullOrEmpty($extension)) {
-    $names = @($shellPath)
-  } else {
-    $executableExtensions = @($pathExtensions.Split(';') |
-      ForEach-Object { $_.Trim().ToLowerInvariant() } |
-      Where-Object { $_ -eq '.exe' -or $_ -eq '.com' })
-    if ($executableExtensions.Count -eq 0) {
-      $executableExtensions = @('.exe', '.com')
-    }
-    $names = @($executableExtensions |
-      ForEach-Object { [string]::Concat($shellPath, $_) })
-  }
-
   foreach ($directory in @($directories | Select-Object -Unique)) {
     foreach ($name in $names) {
       try {
@@ -230,88 +145,40 @@ function Resolve-ShellPath(
 }
 
 try {
-  $source = Decode-Utf8 (Read-RequiredLine 'source')
-  $requestedCompilerPath = Decode-Utf8 (
-    Read-RequiredLine 'compilerPath')
-  $startupDelay = [int](Read-RequiredLine 'startupDelay')
-
-  $compilerPath = $null
-  $compilerGuard = $null
-  $previousTemp = [Environment]::GetEnvironmentVariable(
-    'TEMP',
-    [EnvironmentVariableTarget]::Process)
-  $previousTmp = [Environment]::GetEnvironmentVariable(
-    'TMP',
-    [EnvironmentVariableTarget]::Process)
-  try {
-    $compilerWorkspace = New-PrivateCompilerDirectory $requestedCompilerPath
-    $compilerPath = $compilerWorkspace.Path
-    $compilerGuard = $compilerWorkspace.Guard
-
-    if ($startupDelay -gt 0) {
-      Start-Sleep -Milliseconds $startupDelay
-    }
-
-    [Environment]::SetEnvironmentVariable(
-      'TEMP',
-      $compilerPath,
-      [EnvironmentVariableTarget]::Process)
-    [Environment]::SetEnvironmentVariable(
-      'TMP',
-      $compilerPath,
-      [EnvironmentVariableTarget]::Process)
-    $compiledTypes = @(Add-Type -TypeDefinition $source -Language CSharp -PassThru -ErrorAction Stop)
-  } finally {
-    $source = $null
-    [Environment]::SetEnvironmentVariable(
-      'TEMP',
-      $previousTemp,
-      [EnvironmentVariableTarget]::Process)
-    [Environment]::SetEnvironmentVariable(
-      'TMP',
-      $previousTmp,
-      [EnvironmentVariableTarget]::Process)
-    if ($null -ne $compilerGuard) {
-      $compilerGuard.Dispose()
-    }
-    if (
-      $null -ne $compilerPath -and
-      [IO.Directory]::Exists($compilerPath)
-    ) {
-      [IO.Directory]::Delete($compilerPath, $true)
-    }
-    if ($null -ne $compilerPath) {
-      $compilerPathAbsent = $false
-      try {
-        [void][IO.File]::GetAttributes($compilerPath)
-      } catch [IO.FileNotFoundException] {
-        $compilerPathAbsent = $true
-      } catch [IO.DirectoryNotFoundException] {
-        $compilerPathAbsent = $true
-      }
-      if (!$compilerPathAbsent) {
-        throw 'Compiler directory cleanup failed.'
-      }
-    }
-  }
-
-  # Sensitive configuration is not read until reviewed-source compilation and
-  # compiler-workspace cleanup both succeed.
+  $assemblyBase64 = Read-RequiredLine 'assembly'
   $shellPath = Decode-Utf8 (Read-RequiredLine 'shell')
   $searchPath = Decode-Utf8 (Read-RequiredLine 'searchPath')
   $pathExtensions = Decode-Utf8 (Read-RequiredLine 'pathExtensions')
   $command = Decode-Utf8 (Read-RequiredLine 'command')
   $workingDirectory = Decode-Utf8 (Read-RequiredLine 'cwd')
   $environmentBase64 = Read-RequiredLine 'environment'
+  $startupDelay = [int](Read-RequiredLine 'startupDelay')
   $controlCapability = Read-RequiredLine 'controlCapability'
+
+  $assemblyBytes = [Convert]::FromBase64String($assemblyBase64)
+  $hash = [Security.Cryptography.SHA256]::Create()
+  try {
+    $actualHash = [BitConverter]::ToString(
+      $hash.ComputeHash($assemblyBytes)).Replace('-', '').ToLowerInvariant()
+  } finally {
+    $hash.Dispose()
+  }
+  if ($actualHash -ne '${WINDOWS_BASH_SUPERVISOR_REVIEWED_ASSEMBLY_SHA256}') {
+    throw 'Supervisor assembly integrity check failed.'
+  }
+
+  $assembly = [Reflection.Assembly]::Load($assemblyBytes)
+  [Array]::Clear($assemblyBytes, 0, $assemblyBytes.Length)
+
+  if ($startupDelay -gt 0) {
+    Start-Sleep -Milliseconds $startupDelay
+  }
+
   $shellPath = Resolve-ShellPath $shellPath $workingDirectory $searchPath $pathExtensions
 
-  $supervisorType = $compiledTypes |
-    Where-Object { $_.FullName -eq 'PiCloneWindowsJobSupervisor' } |
-    Select-Object -First 1
-  if ($null -eq $supervisorType) {
-    throw 'Compiled supervisor type was not found.'
-  }
+  $supervisorType = $assembly.GetType(
+    'PiCloneWindowsJobSupervisor',
+    $true)
   $runMethod = $supervisorType.GetMethod('Run')
   $code = $runMethod.Invoke(
     $null,
@@ -348,25 +215,6 @@ function createPowerShellEnvironment(): NodeJS.ProcessEnv {
   };
 }
 
-function compilerWorkspacePath(): string {
-  const localApplicationData = process.env["LOCALAPPDATA"];
-
-  if (
-    localApplicationData === undefined ||
-    localApplicationData.length === 0 ||
-    !isAbsolute(localApplicationData)
-  ) {
-    throw new Error(
-      "Windows Bash supervisor requires an absolute LOCALAPPDATA path.",
-    );
-  }
-
-  return join(
-    localApplicationData,
-    `pi-clone-bash-compiler-${randomBytes(16).toString("hex")}`,
-  );
-}
-
 function createWindowsEnvironmentBlock(environment: NodeJS.ProcessEnv): Buffer {
   const entries = Object.entries(environment)
     .filter(
@@ -391,17 +239,23 @@ function encodeUtf8Line(value: string): string {
   return Buffer.from(value, "utf8").toString("base64");
 }
 
-function readSupervisorSource(): string {
-  return readFileSync(
-    new URL("./windows-bash-supervisor-helper.cs", import.meta.url),
-    "utf8",
+function reviewedAssemblyBase64(): string {
+  const bytes = Buffer.from(
+    WINDOWS_BASH_SUPERVISOR_REVIEWED_ASSEMBLY_BASE64,
+    "base64",
   );
+  const digest = createHash("sha256").update(bytes).digest("hex");
+
+  if (digest !== WINDOWS_BASH_SUPERVISOR_REVIEWED_ASSEMBLY_SHA256) {
+    throw new Error("Windows Bash supervisor assembly integrity check failed.");
+  }
+
+  return WINDOWS_BASH_SUPERVISOR_REVIEWED_ASSEMBLY_BASE64;
 }
 
 function createConfigurationPayload(
   options: SpawnWindowsBashSupervisorOptions,
   controlCapability: string,
-  compilerPath: string,
 ): string {
   if (
     options.shellPath.includes("\0") ||
@@ -420,15 +274,14 @@ function createConfigurationPayload(
   }
 
   return [
-    encodeUtf8Line(readSupervisorSource()),
-    encodeUtf8Line(compilerPath),
-    String(startupDelayMs),
+    reviewedAssemblyBase64(),
     encodeUtf8Line(options.shellPath),
     encodeUtf8Line(process.env["PATH"] ?? ""),
     encodeUtf8Line(process.env["PATHEXT"] ?? ".COM;.EXE"),
     encodeUtf8Line(options.command),
     encodeUtf8Line(options.cwd),
     createWindowsEnvironmentBlock(process.env).toString("base64"),
+    String(startupDelayMs),
     controlCapability,
     "",
   ].join("\n");
@@ -460,21 +313,49 @@ function sendConfiguration(
   child: ChildProcess,
   payload: string,
 ): Promise<void> {
+  const input = child.stdin;
+
+  if (input === null) {
+    return Promise.reject(
+      new Error("Windows Bash supervisor stdin is unavailable."),
+    );
+  }
+
+  return writeSupervisorConfiguration(input, payload);
+}
+
+/** Internal transport seam used to prove callback-error handling. */
+export function writeSupervisorConfiguration(
+  input: Writable,
+  payload: string,
+): Promise<void> {
   return observePromise(new Promise<void>((resolve, reject) => {
-    const input = child.stdin;
 
-    if (input === null) {
-      reject(new Error("Windows Bash supervisor stdin is unavailable."));
-      return;
-    }
-
-    const onError = (): void => {
-      reject(new Error("Windows Bash supervisor rejected its configuration."));
+    let settled = false;
+    const finish = (
+      error: Error | null | undefined,
+      removeErrorListener: boolean,
+    ): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (removeErrorListener) {
+        input.off("error", onError);
+      }
+      if (error === null || error === undefined) {
+        resolve();
+      } else {
+        reject(new Error(
+          "Windows Bash supervisor rejected its configuration.",
+          { cause: error },
+        ));
+      }
     };
+    const onError = (error: Error): void => finish(error, false);
     input.once("error", onError);
-    input.end(payload, "utf8", () => {
-      input.off("error", onError);
-      resolve();
+    input.end(payload, "utf8", (error?: Error | null) => {
+      finish(error, error === null || error === undefined);
     });
   }));
 }
@@ -567,6 +448,15 @@ export function createAuthenticatedOutputStreams(
               callback(new Error(
                 "Windows Bash supervisor sent data after output completion.",
               ));
+              return;
+            }
+
+            if (channel === "stderr" && !rootExitSeen) {
+              const error = new Error(
+                "Windows Bash supervisor ended stderr before an authenticated root status.",
+              );
+              rejectRootExit(error);
+              callback(error);
               return;
             }
 
@@ -669,12 +559,7 @@ export async function spawnWindowsBashSupervisor(
   options: SpawnWindowsBashSupervisorOptions,
 ): Promise<WindowsBashSupervisor> {
   const controlCapability = randomBytes(32).toString("hex");
-  const compilerPath = compilerWorkspacePath();
-  const payload = createConfigurationPayload(
-    options,
-    controlCapability,
-    compilerPath,
-  );
+  const payload = createConfigurationPayload(options, controlCapability);
   const child = spawn(
     powershellPath(),
     [
@@ -701,16 +586,11 @@ export async function spawnWindowsBashSupervisor(
         resolve({ exitCode, signal }));
     }),
   );
-  const cleanupCompilerWorkspace = observePromise(close.then(
-    async () => rm(compilerPath, { recursive: true, force: true }),
-    async () => rm(compilerPath, { recursive: true, force: true }),
-  ));
   const rawStdout = child.stdout;
   const rawStderr = child.stderr;
 
   if (rawStdout === null || rawStderr === null) {
     child.kill();
-    await cleanupCompilerWorkspace;
     throw new Error("Windows Bash supervisor output pipes are unavailable.");
   }
 
@@ -736,12 +616,24 @@ export async function spawnWindowsBashSupervisor(
     close,
     async dispose(detach: boolean): Promise<void> {
       child.stdin?.destroy();
-
+      let timeout: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          close,
+          new Promise<never>((_resolve, reject) => {
+            timeout = setTimeout(() => reject(new Error(
+              "Windows Bash supervisor did not close after termination.",
+            )), 2_000);
+            timeout.unref();
+          }),
+        ]);
+      } finally {
+        if (timeout !== undefined) {
+          clearTimeout(timeout);
+        }
+      }
       if (detach) {
         child.unref();
-        await rm(compilerPath, { recursive: true, force: true });
-      } else {
-        await cleanupCompilerWorkspace;
       }
     },
   };

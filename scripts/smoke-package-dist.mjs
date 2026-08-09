@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   readdir,
+  readFile,
   rm,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -23,8 +24,9 @@ try {
   const archiveRoot = join(smokeRoot, "archive");
   const consumerRoot = join(smokeRoot, "consumer");
   const workspaceRoot = join(smokeRoot, "workspace");
+  const runtimeTemp = join(smokeRoot, "runtime-temp");
   await Promise.all(
-    [archiveRoot, consumerRoot, workspaceRoot].map((path) =>
+    [archiveRoot, consumerRoot, workspaceRoot, runtimeTemp].map((path) =>
       mkdir(path, { recursive: true }),
     ),
   );
@@ -59,8 +61,34 @@ try {
 
   const installedPackage = join(consumerRoot, "node_modules", "ai_agent");
   const installedTools = join(installedPackage, "dist", "tools");
-  await access(join(installedTools, "windows-bash-supervisor-helper.cs"));
-  const prohibitedArtifacts = (await listFiles(join(installedPackage, "dist")))
+  const installedHelper = join(
+    installedTools,
+    "windows-bash-supervisor-helper.cs",
+  );
+  const installedReviewedPayload = join(
+    installedTools,
+    "windows-bash-supervisor-reviewed-assembly.js",
+  );
+  await Promise.all([
+    access(installedHelper),
+    access(installedReviewedPayload),
+  ]);
+  const canonicalHelper = new URL(
+    "../src/tools/windows-bash-supervisor-helper.cs",
+    import.meta.url,
+  );
+  const [canonicalHelperBytes, installedHelperBytes] = await Promise.all([
+    readFile(canonicalHelper),
+    readFile(installedHelper),
+  ]);
+
+  if (!canonicalHelperBytes.equals(installedHelperBytes)) {
+    throw new Error("Packed helper source differs from reviewed source.");
+  }
+
+  const installedDist = join(installedPackage, "dist");
+  const installedDistFiles = await listFiles(installedDist);
+  const prohibitedArtifacts = installedDistFiles
     .filter((path) =>
       /windows-bash-supervisor-assembly|\.(?:b64|dll|exe)$/iu.test(path),
     );
@@ -71,7 +99,35 @@ try {
     );
   }
 
-  let supervisorPid;
+  const prohibitedPayloadMarkers = [
+    "WINDOWS_BASH_SUPERVISOR_ASSEMBLY_BASE64",
+    "WINDOWS_BASH_SUPERVISOR_ASSEMBLY_SHA256",
+    "verifiedAssemblyBase64",
+    "55e8591fdc74e14d9e81159697ea6be35e4e174a467daaff3ddb9dadbd0d4a00",
+  ];
+  const markerHits = [];
+
+  for (const path of installedDistFiles) {
+    const bytes = await readFile(path);
+
+    for (const marker of prohibitedPayloadMarkers) {
+      if (bytes.includes(Buffer.from(marker, "ascii"))) {
+        markerHits.push(`${path}:${marker}`);
+      }
+    }
+
+    if (bytes.length >= 2 && bytes[0] === 0x4d && bytes[1] === 0x5a) {
+      markerHits.push(`${path}:PE-MZ`);
+    }
+  }
+
+  if (markerHits.length > 0) {
+    throw new Error(
+      `Packed dist contains an obsolete assembly payload: ${markerHits.join(", ")}`,
+    );
+  }
+
+  const supervisors = [];
   let restoreSupervisorSpawn = () => undefined;
 
   if (process.platform === "win32") {
@@ -83,7 +139,7 @@ try {
     const originalSpawn = supervisorModule.windowsBashSupervisorRuntime.spawn;
     supervisorModule.windowsBashSupervisorRuntime.spawn = async (options) => {
       const supervisor = await originalSpawn(options);
-      supervisorPid = supervisor.child.pid;
+      supervisors.push(supervisor);
       return supervisor;
     };
     restoreSupervisorSpawn = () => {
@@ -91,16 +147,42 @@ try {
     };
   }
 
-  const { BashTool } = await import(
-    pathToFileURL(join(installedPackage, "dist", "index.js")).href
+  const temporaryEnvironment = ["TEMP", "TMP", "TMPDIR"];
+  const previousTemporaryEnvironment = new Map(
+    temporaryEnvironment.map((name) => [name, process.env[name]]),
   );
-  const tool = new BashTool({
-    rootDir: workspaceRoot,
-    timeoutMs: 30_000,
-  });
-  const result = await tool
-    .execute({ command: "printf package-dist-ok" })
-    .finally(restoreSupervisorSpawn);
+  for (const name of temporaryEnvironment) {
+    process.env[name] = runtimeTemp;
+  }
+
+  let execution;
+  let result;
+
+  try {
+    const { BashTool } = await import(
+      pathToFileURL(join(installedPackage, "dist", "index.js")).href
+    );
+    const tool = new BashTool({ rootDir: workspaceRoot });
+    execution = tool.execute({ command: "printf package-dist-ok" });
+    if (process.platform === "win32") {
+      await waitFor(() => supervisors.length === 1, 5_000,
+        "Packed Bash execution did not expose its supervisor.");
+    }
+    result = await execution;
+  } finally {
+    restoreSupervisorSpawn();
+    if (execution !== undefined) {
+      await execution.catch(() => undefined);
+    }
+    for (const name of temporaryEnvironment) {
+      const previous = previousTemporaryEnvironment.get(name);
+      if (previous === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = previous;
+      }
+    }
+  }
   const parsed = JSON.parse(result.content);
 
   if (
@@ -112,7 +194,7 @@ try {
     throw new Error(`Packed Bash execution failed: ${result.content}`);
   }
 
-  const leakedScratch = (await readdir(workspaceRoot)).filter((name) =>
+  const leakedScratch = (await readdir(runtimeTemp)).filter((name) =>
     name.startsWith("pi-clone-bash-supervisor-"),
   );
 
@@ -123,15 +205,22 @@ try {
   }
 
   if (process.platform === "win32") {
-    if (!Number.isInteger(supervisorPid) || supervisorPid <= 0) {
+    if (supervisors.length !== 1) {
+      throw new Error("Packed Bash execution used an unexpected supervisor count.");
+    }
+    const supervisor = supervisors[0];
+
+    if (
+      !Number.isInteger(supervisor.child.pid) ||
+      supervisor.child.pid <= 0
+    ) {
       throw new Error("Packed Bash execution did not expose its supervisor PID.");
     }
-
-    await waitForProcessExit(supervisorPid, 5_000);
+    await waitForProcessExit(supervisor.child.pid, 5_000);
   }
 
   process.stdout.write(
-    "Packed dist includes reviewed helper source and executes Bash without leaks.\n",
+    "Packed dist includes the source-verified helper payload and executes Bash without leaks.\n",
   );
 } finally {
   await rm(smokeRoot, { recursive: true, force: true });
@@ -151,6 +240,18 @@ async function listFiles(root) {
   }
 
   return files;
+}
+
+async function waitFor(predicate, timeoutMs, message) {
+  const deadline = performance.now() + timeoutMs;
+
+  while (!predicate()) {
+    if (performance.now() >= deadline) {
+      throw new Error(message);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 async function waitForProcessExit(pid, timeoutMs) {
@@ -192,7 +293,7 @@ function run(command, args, options) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
-      env: process.env,
+      env: options.env ?? process.env,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });

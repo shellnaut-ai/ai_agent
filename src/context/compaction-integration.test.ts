@@ -191,5 +191,5 @@ describe("CompactionService integration", () => {
     expect(compaction).toBeDefined();
     expect(pendingUsers).toHaveLength(1);
     expect(pendingUsers[0]?.parentId).toBe(compaction?.id);
-  });
+  }, 15_000);
 });

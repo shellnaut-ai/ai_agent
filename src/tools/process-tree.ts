@@ -1,5 +1,6 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
+import { win32 } from "node:path";
 
 const POSIX_TERMINATION_GRACE_MS = 500;
 const POSIX_POLL_INTERVAL_MS = 25;
@@ -195,9 +196,15 @@ async function waitForProcessGroupExit(
 }
 
 async function terminateWindowsProcessTree(pid: number): Promise<void> {
+  const systemRoot = process.env["SystemRoot"] ?? "C:\\Windows";
+
+  if (!win32.isAbsolute(systemRoot)) {
+    throw new Error("Windows process-tree termination requires an absolute SystemRoot.");
+  }
+
   const exitCode = await new Promise<number | null>((resolve, reject) => {
     const taskkill = spawn(
-      "taskkill.exe",
+      win32.join(systemRoot, "System32", "taskkill.exe"),
       ["/PID", String(pid), "/T", "/F"],
       {
         stdio: "ignore",

@@ -29,6 +29,18 @@ interface LockLease {
 
 const inProcessTails = new Map<string, Promise<void>>();
 
+/** Internal deterministic filesystem seam; not exported from the package root. */
+export const sessionWriterLockRuntime: {
+  publishPosixCandidate(candidatePath: string, lockPath: string): Promise<void>;
+} = {
+  async publishPosixCandidate(
+    candidatePath: string,
+    lockPath: string,
+  ): Promise<void> {
+    await rename(candidatePath, lockPath);
+  },
+};
+
 interface PosixLeaseRecord {
   readonly version: 1;
   readonly token: string;
@@ -193,6 +205,7 @@ async function acquirePosixDirectoryLease(
   lockPath: string,
   timeoutMs: number,
 ): Promise<LockLease> {
+  await rejectLegacyRegularLockFile(lockPath);
   const candidate = await createPosixLeaseCandidate(lockPath);
   const deadline = performance.now() + timeoutMs;
   let firstAttempt = true;
@@ -204,7 +217,10 @@ async function acquirePosixDirectoryLease(
       }
 
       try {
-        await rename(candidate.path, lockPath);
+        await sessionWriterLockRuntime.publishPosixCandidate(
+          candidate.path,
+          lockPath,
+        );
         break;
       } catch (error: unknown) {
         if (!isLeaseContentionError(error)) {
@@ -277,9 +293,8 @@ async function recoverAbandonedPosixLease(lockPath: string): Promise<void> {
   let details: BigIntStats;
 
   try {
-    // Capture the legacy inode in the same observation that classifies its
-    // type. A second stat here would create an ABA window in which a newly
-    // published live directory could be mistaken for the old regular file.
+    // Classify the contended pathname in one observation. A regular legacy
+    // artifact always fails closed; only a same-version directory is reaped.
     details = await lstat(lockPath, { bigint: true });
   } catch (error: unknown) {
     if (isErrorCode(error, "ENOENT")) {
@@ -304,16 +319,35 @@ async function recoverAbandonedPosixLease(lockPath: string): Promise<void> {
   }
 
   if (details.isFile()) {
-    // Old releases leave a regular file after releasing util-linux flock.
-    // This migration is safe only after the documented quiescent upgrade;
-    // flock ownership cannot be queried from dependency-free Node.js.
-    const legacyIdentity =
-      `${details.dev.toString(16)}-${details.ino.toString(16)}`;
-    await moveLeaseToTombstone(
-      lockPath,
-      `${lockPath}.reaped-legacy-${legacyIdentity}`,
-    );
+    throw legacyRegularLockError(lockPath);
   }
+}
+
+async function rejectLegacyRegularLockFile(lockPath: string): Promise<void> {
+  try {
+    const details = await lstat(lockPath);
+
+    if (details.isFile()) {
+      throw legacyRegularLockError(lockPath);
+    }
+  } catch (error: unknown) {
+    if (isErrorCode(error, "ENOENT")) {
+      return;
+    }
+
+    throw error;
+  }
+}
+
+function legacyRegularLockError(
+  lockPath: string,
+): SessionWriterLockCompromisedError {
+  return new SessionWriterLockCompromisedError(
+    "A legacy regular session writer lock file was found. " +
+      "Quiescent upgrade required: stop every older process using this " +
+      "session, verify that no old writer remains, then explicitly remove " +
+      `${lockPath} before retrying. The file is never migrated automatically.`,
+  );
 }
 
 async function moveLeaseToTombstone(

@@ -255,7 +255,28 @@ export class BashTool implements Tool {
       void terminalPromise.catch(() => undefined);
 
       const requestTermination = (): Promise<void> => {
-        terminationPromise ??= terminateProcessTree(child, process.platform);
+        terminationPromise ??= (async () => {
+          try {
+            await terminateProcessTree(child, process.platform);
+          } catch (terminationError: unknown) {
+            if (
+              process.platform === "win32" &&
+              child.exitCode === null &&
+              child.signalCode === null
+            ) {
+              try {
+                child.kill();
+              } catch (fallbackError: unknown) {
+                throw new AggregateError(
+                  [terminationError, fallbackError],
+                  "Windows Bash supervisor termination failed.",
+                );
+              }
+            }
+
+            throw terminationError;
+          }
+        })();
         void terminationPromise.catch((error: unknown) => {
           rejectTerminal(
             error instanceof Error ? error : new Error(String(error)),
@@ -328,14 +349,21 @@ export class BashTool implements Tool {
           terminal =
             supervisor === undefined
               ? await terminalPromise
-              : await Promise.all([
-                  supervisor.rootExit,
-                  stdoutEnd.promise,
-                  stderrEnd.promise,
-                ]).then(([exitCode]) => ({
-                  exitCode,
-                  signal: null,
-                }));
+              : await Promise.race([
+                  Promise.all([
+                    supervisor.rootExit,
+                    stdoutEnd.promise,
+                    stderrEnd.promise,
+                    supervisor.close,
+                  ]).then(([exitCode]) => ({
+                    exitCode,
+                    signal: null,
+                  })),
+                  terminalPromise.then(
+                    () => new Promise<never>(() => undefined),
+                    (error: unknown) => Promise.reject(error),
+                  ),
+                ]);
         } catch (error: unknown) {
           if (terminationPromise === undefined) {
             throw error;
