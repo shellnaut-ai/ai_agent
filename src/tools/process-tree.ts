@@ -19,13 +19,19 @@ function processExists(pid: number): boolean {
   }
 }
 
-function processGroupExists(pid: number): boolean {
+function processGroupExists(pid: number, platform: NodeJS.Platform): boolean {
   try {
     process.kill(-pid, 0);
     return true;
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+    const code = (error as NodeJS.ErrnoException).code;
+
+    if (code === "ESRCH") {
       return false;
+    }
+
+    if (code === "EPERM" && platform !== "linux") {
+      return true;
     }
 
     throw error;
@@ -90,7 +96,7 @@ function executePosixProcessTable(stateSelector: string): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     execFile(
       "/bin/ps",
-      ["-A", "-o", "pgid=", "-o", `${stateSelector}=`],
+      ["-A", "-o", "pid=", "-o", "pgid=", "-o", `${stateSelector}=`],
       {
         encoding: "utf8",
         env: { LANG: "C", LC_ALL: "C" },
@@ -120,7 +126,7 @@ function validatePosixProcessTable(table: string): string {
   }
 
   for (const line of lines) {
-    if (!/^\s*\d+\s+[A-Za-z]\S*\s*$/u.test(line)) {
+    if (!/^\s*\d+\s+\d+\s+[A-Za-z]\S*\s*$/u.test(line)) {
       throw new Error("POSIX process table contained a malformed row.");
     }
   }
@@ -180,7 +186,7 @@ async function genericPosixGroupHasRunnableMembers(
   const table = await readPosixProcessTable();
 
   for (const line of table.split(/\r?\n/u)) {
-    const match = /^\s*(\d+)\s+([A-Za-z])\S*\s*$/u.exec(line);
+    const match = /^\s*\d+\s+(\d+)\s+([A-Za-z])\S*\s*$/u.exec(line);
 
     if (
       match !== null &&
@@ -198,7 +204,7 @@ async function processGroupHasRunnableMembers(
   pid: number,
   platform: NodeJS.Platform,
 ): Promise<boolean> {
-  if (!processGroupExists(pid)) {
+  if (!processGroupExists(pid, platform)) {
     return false;
   }
 
@@ -209,20 +215,71 @@ async function processGroupHasRunnableMembers(
   } catch {
     // Enumeration is an optimization over the conservative kernel existence
     // check. If it fails, never claim that a potentially live group is gone.
-    return processGroupExists(pid);
+    return processGroupExists(pid, platform);
   }
 }
 
-function signalProcessGroup(pid: number, signal: NodeJS.Signals): boolean {
+async function signalProcessGroup(
+  pid: number,
+  signal: NodeJS.Signals,
+  platform: NodeJS.Platform,
+): Promise<boolean> {
   try {
     process.kill(-pid, signal);
     return true;
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+    const code = (error as NodeJS.ErrnoException).code;
+
+    if (code === "ESRCH") {
       return false;
     }
 
-    throw error;
+    if (code !== "EPERM" || platform === "linux") {
+      throw error;
+    }
+
+    let table: string;
+    try {
+      table = await readPosixProcessTable();
+    } catch (tableError: unknown) {
+      throw new AggregateError(
+        [error, tableError],
+        "POSIX process-group signal returned EPERM and member enumeration failed.",
+      );
+    }
+
+    const failures: unknown[] = [];
+    let delivered = false;
+
+    for (const line of table.split(/\r?\n/u)) {
+      const match = /^\s*(\d+)\s+(\d+)\s+([A-Za-z])\S*\s*$/u.exec(line);
+
+      if (
+        match === null ||
+        Number(match[2]) !== pid ||
+        isNonRunnableProcessState(match[3]!)
+      ) {
+        continue;
+      }
+
+      try {
+        process.kill(Number(match[1]), signal);
+        delivered = true;
+      } catch (memberError: unknown) {
+        if ((memberError as NodeJS.ErrnoException).code !== "ESRCH") {
+          failures.push(memberError);
+        }
+      }
+    }
+
+    if (failures.length > 0) {
+      throw new AggregateError(
+        [error, ...failures],
+        "POSIX process-group signal returned EPERM and a member fallback failed.",
+      );
+    }
+
+    return delivered;
   }
 }
 
@@ -278,7 +335,7 @@ async function terminatePosixProcessGroup(
   pid: number,
   platform: NodeJS.Platform,
 ): Promise<void> {
-  if (!signalProcessGroup(pid, "SIGTERM")) {
+  if (!(await signalProcessGroup(pid, "SIGTERM", platform))) {
     return;
   }
 
@@ -290,7 +347,7 @@ async function terminatePosixProcessGroup(
     return;
   }
 
-  if (!signalProcessGroup(pid, "SIGKILL")) {
+  if (!(await signalProcessGroup(pid, "SIGKILL", platform))) {
     return;
   }
 

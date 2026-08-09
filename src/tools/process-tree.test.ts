@@ -277,14 +277,14 @@ test("POSIX process-table lookup falls back across portable state selectors", as
       throw new Error(`Unsupported selector: ${selector}`);
     }
 
-    return " 42 Z\n";
+    return " 42 42 Z\n";
   };
 
-  await expect(readPosixProcessTable()).resolves.toBe(" 42 Z\n");
+  await expect(readPosixProcessTable()).resolves.toBe(" 42 42 Z\n");
   expect(selectors).toEqual(["state", "stat", "s"]);
 });
 
-test.each(["", "not-a-process-row\n", "42\n", "42 ?\n"])(
+test.each(["", "not-a-process-row\n", "42\n", "42 42 ?\n"])(
   "POSIX process-table lookup rejects malformed output %j",
   async (output) => {
     posixProcessTableRuntime.execute = async () => output;
@@ -345,7 +345,7 @@ test("POSIX process-table lookup bounds a hung ps execution", async () => {
 
 test("POSIX process-table parses zombie and runnable states", async () => {
   vi.useFakeTimers();
-  let output = " 42 Z+\n";
+  let output = " 42 42 Z+\n";
   posixProcessTableRuntime.execute = async () => output;
   let alive = true;
   const signals: Array<NodeJS.Signals | 0 | undefined> = [];
@@ -366,13 +366,142 @@ test("POSIX process-table parses zombie and runnable states", async () => {
   await expect(terminateProcessTree(child, "darwin")).resolves.toBeUndefined();
   expect(signals).not.toContain("SIGKILL");
 
-  output = " 42 S+\n";
+  output = " 42 42 S+\n";
   signals.length = 0;
   alive = true;
   const runnableTermination = terminateProcessTree(child, "darwin");
   await vi.advanceTimersByTimeAsync(1_000);
   await expect(runnableTermination).resolves.toBeUndefined();
   expect(signals).toContain("SIGKILL");
+});
+
+test("Darwin treats EPERM from a process-group probe as existing and verifies its state", async () => {
+  posixProcessTableRuntime.execute = async () => " 42 42 Z+\n";
+  vi.spyOn(process, "kill").mockImplementation(((pid, signal) => {
+    if (pid === -42 && signal === 0) {
+      throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+    }
+    return true;
+  }) as typeof process.kill);
+  const child = {
+    pid: 42,
+    exitCode: null,
+    signalCode: null,
+  } as ChildProcess;
+
+  await expect(terminateProcessTree(child, "darwin")).resolves.toBeUndefined();
+});
+
+test("Linux fails closed when a process-group probe returns EPERM", async () => {
+  vi.spyOn(process, "kill").mockImplementation(((pid, signal) => {
+    if (pid === -42 && signal === 0) {
+      throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+    }
+    return true;
+  }) as typeof process.kill);
+  const child = {
+    pid: 42,
+    exitCode: null,
+    signalCode: null,
+  } as ChildProcess;
+
+  await expect(terminateProcessTree(child, "linux")).rejects.toThrow(/EPERM/u);
+});
+
+test("Darwin signals each visible group member when a group signal returns EPERM", async () => {
+  const runnable = new Set([42, 43]);
+  posixProcessTableRuntime.execute = async () =>
+    [...runnable].map((pid) => ` ${pid} 42 S+`).join("\n") + "\n";
+  const signals: Array<readonly [number, NodeJS.Signals | 0 | undefined]> = [];
+  vi.spyOn(process, "kill").mockImplementation(((pid, signal) => {
+    signals.push([pid, signal as NodeJS.Signals | 0 | undefined]);
+    if (pid === -42 && signal === 0 && runnable.size === 0) {
+      throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+    }
+    if (pid === -42 && signal !== 0) {
+      throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+    }
+    if (pid > 0 && signal === "SIGKILL") {
+      runnable.delete(pid);
+    }
+    return true;
+  }) as typeof process.kill);
+  const child = {
+    pid: 42,
+    exitCode: null,
+    signalCode: null,
+  } as ChildProcess;
+
+  await expect(terminateProcessTree(child, "darwin")).resolves.toBeUndefined();
+  expect(signals).toContainEqual([42, "SIGTERM"]);
+  expect(signals).toContainEqual([43, "SIGTERM"]);
+  expect(signals).toContainEqual([42, "SIGKILL"]);
+  expect(signals).toContainEqual([43, "SIGKILL"]);
+});
+
+test("Darwin accepts a validated zombie-only snapshot after group EPERM", async () => {
+  let snapshots = 0;
+  posixProcessTableRuntime.execute = async () => {
+    snapshots += 1;
+    return " 42 42 Z+\n";
+  };
+  vi.spyOn(process, "kill").mockImplementation(((pid, signal) => {
+    if (pid === -42 && signal !== 0) {
+      throw Object.assign(new Error("group EPERM"), { code: "EPERM" });
+    }
+    return true;
+  }) as typeof process.kill);
+  const child = {
+    pid: 42,
+    exitCode: null,
+    signalCode: null,
+  } as ChildProcess;
+
+  await expect(terminateProcessTree(child, "darwin")).resolves.toBeUndefined();
+  expect(snapshots).toBe(1);
+});
+
+test("Darwin fails closed when an EPERM member snapshot is malformed", async () => {
+  posixProcessTableRuntime.execute = async () => "not-a-process-row\n";
+  vi.spyOn(process, "kill").mockImplementation(((pid, signal) => {
+    if (pid === -42 && signal !== 0) {
+      throw Object.assign(new Error("group EPERM"), { code: "EPERM" });
+    }
+    return true;
+  }) as typeof process.kill);
+  const child = {
+    pid: 42,
+    exitCode: null,
+    signalCode: null,
+  } as ChildProcess;
+
+  await expect(terminateProcessTree(child, "darwin")).rejects.toThrow(
+    /member enumeration failed/u,
+  );
+});
+
+test("Darwin fails closed when an enumerated group member cannot be signaled", async () => {
+  posixProcessTableRuntime.execute = async () => " 42 42 S+\n 43 42 S+\n";
+  const signals: Array<readonly [number, NodeJS.Signals | 0 | undefined]> = [];
+  vi.spyOn(process, "kill").mockImplementation(((pid, signal) => {
+    signals.push([pid, signal as NodeJS.Signals | 0 | undefined]);
+    if (pid === -42 && signal !== 0) {
+      throw Object.assign(new Error("group EPERM"), { code: "EPERM" });
+    }
+    if (pid === 43 && signal !== 0) {
+      throw Object.assign(new Error("member EPERM"), { code: "EPERM" });
+    }
+    return true;
+  }) as typeof process.kill);
+  const child = {
+    pid: 42,
+    exitCode: null,
+    signalCode: null,
+  } as ChildProcess;
+
+  await expect(terminateProcessTree(child, "darwin")).rejects.toThrow(/EPERM/u);
+  expect(signals).toContainEqual([42, "SIGTERM"]);
+  expect(signals).toContainEqual([43, "SIGTERM"]);
 });
 
 test.skipIf(process.platform === "win32")(
