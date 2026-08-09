@@ -4,10 +4,14 @@ import { CompactionService } from "../context/compaction.js";
 import type { Message, Model, UserMessage } from "../model/types.js";
 import type { ToolDefinition } from "../tools/types.js";
 import { Session } from "./session.js";
+import { SessionRepository } from "./repository.js";
+import type { SessionTreeNode } from "./tree.js";
 import type { ChatEvent } from "./types.js";
 
 export interface ChatSessionOptions {
   readonly session: Session;
+  readonly sessionRepository?: SessionRepository;
+  readonly onSessionChanged?: (session: Session) => void;
   readonly compactionService?: CompactionService;
   readonly toolDefinitions?: readonly ToolDefinition[];
 }
@@ -15,7 +19,11 @@ export interface ChatSessionOptions {
 export class ChatSession {
   private readonly model: Model;
   private readonly agentLoop: AgentLoop;
-  private readonly session: Session;
+  private session: Session;
+  private readonly sessionRepository: SessionRepository | undefined;
+  private readonly onSessionChanged:
+    | ((session: Session) => void)
+    | undefined;
   private readonly compactionService: CompactionService | undefined;
   private readonly toolDefinitions: readonly ToolDefinition[];
 
@@ -27,12 +35,76 @@ export class ChatSession {
     this.agentLoop = agentLoop;
     this.model = model;
     this.session = options.session;
+    this.sessionRepository = options.sessionRepository;
+    this.onSessionChanged = options.onSessionChanged;
     this.compactionService = options.compactionService;
     this.toolDefinitions = [...(options.toolDefinitions ?? [])];
   }
 
   public getMessages(): readonly Message[] {
     return this.session.getMessages();
+  }
+
+  public getTree(): readonly SessionTreeNode[] {
+    return this.session.getTree();
+  }
+
+  public getLeafId(): string | null {
+    return this.session.getLeafId();
+  }
+
+  public moveTo(entryId: string): Promise<void> {
+    return this.session.moveTo(entryId);
+  }
+
+  public async fork(
+    entryId: string,
+  ): Promise<{ sessionId: string; filePath: string }> {
+    if (!this.sessionRepository) {
+      throw new Error("Session forking is not configured.");
+    }
+
+    if (!this.onSessionChanged) {
+      throw new Error(
+        "Session replacement handling is not configured.",
+      );
+    }
+
+    const result = await this.sessionRepository.fork(
+      this.session,
+      entryId,
+    );
+    this.onSessionChanged(result.session);
+    this.session = result.session;
+
+    return {
+      sessionId: result.store.sessionId,
+      filePath: result.store.filePath,
+    };
+  }
+
+  public async clone(): Promise<{
+    sessionId: string;
+    filePath: string;
+  }> {
+    if (!this.sessionRepository) {
+      throw new Error("Session cloning is not configured.");
+    }
+
+    if (!this.onSessionChanged) {
+      throw new Error(
+        "Session replacement handling is not configured.",
+      );
+    }
+
+    const result = await this.sessionRepository.clone(this.session);
+    this.onSessionChanged(result.session);
+    this.session = result.session;
+
+    return {
+      sessionId: result.store.sessionId,
+      filePath: result.store.filePath,
+    };
   }
 
   public async *streamTurn(

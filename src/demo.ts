@@ -13,6 +13,7 @@ import { ModelRuntime } from "./model/runtime.js";
 import { LlamaProvider } from "./providers/llama/provider.js";
 import { ChatSession } from "./session/chat-session.js";
 import { JsonlSessionStore } from "./session/jsonl-store.js";
+import { SessionRepository } from "./session/repository.js";
 import { Session } from "./session/session.js";
 import { BashTool } from "./tools/bash.js";
 import { EditTool } from "./tools/edit.js";
@@ -51,6 +52,10 @@ async function main(): Promise<void> {
 
     const loadedSession = await sessionStore.load();
     const session = new Session(sessionStore);
+    const sessionRepository = new SessionRepository(
+      process.cwd(),
+      resolved.model,
+    );
 
     cli.write(`Session: ${sessionId}\n`);
     cli.write(`Session file: ${sessionStore.filePath}\n`);
@@ -108,6 +113,10 @@ async function main(): Promise<void> {
     );
     const chatSession = new ChatSession(agentLoop, resolved.model, {
       session,
+      sessionRepository,
+      onSessionChanged: (nextSession) => {
+        approvalHandler.replaceSession(nextSession.getStore());
+      },
       compactionService,
       toolDefinitions: toolRegistry.listDefinitions(),
     });

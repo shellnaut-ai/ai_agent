@@ -58,6 +58,7 @@ export interface SessionHeaderRecord {
   readonly version: 2;
   readonly sessionId: string;
   readonly createdAt: string;
+  readonly parentSessionPath?: string;
   readonly model: Pick<Model, "provider" | "id">;
 }
 

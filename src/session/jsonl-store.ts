@@ -30,6 +30,7 @@ export interface JsonlSessionStoreOptions {
   readonly rootDir: string;
   readonly sessionId: string;
   readonly model: Model;
+  readonly parentSessionPath?: string;
 }
 
 interface EntryBaseFields {
@@ -368,6 +369,7 @@ export class JsonlSessionStore implements SessionStore {
 
   private readonly model: Model;
   private readonly sessionDirectory: string;
+  private readonly parentSessionPath: string | undefined;
   private entries: SessionEntry[] = [];
   private entriesById = new Map<string, SessionEntry>();
   private currentLeafId: string | null = null;
@@ -384,6 +386,7 @@ export class JsonlSessionStore implements SessionStore {
 
     this.sessionId = options.sessionId;
     this.model = options.model;
+    this.parentSessionPath = options.parentSessionPath;
     this.sessionDirectory = resolve(options.rootDir, "sessions");
     this.filePath = resolve(
       this.sessionDirectory,
@@ -410,6 +413,7 @@ export class JsonlSessionStore implements SessionStore {
         version: 2,
         sessionId: this.sessionId,
         createdAt: new Date().toISOString(),
+        parentSessionPath: this.parentSessionPath,
         model: {
           provider: this.model.provider,
           id: this.model.id,

@@ -13,6 +13,10 @@ import type {
   SessionEntry,
   SessionStore,
 } from "./types.js";
+import {
+  buildSessionTree,
+  type SessionTreeNode,
+} from "./tree.js";
 
 function cloneMessage(message: Message): Message {
   return structuredClone(message);
@@ -33,6 +37,28 @@ export class Session {
 
   constructor(store: SessionStore) {
     this.store = store;
+  }
+
+  getStore(): SessionStore {
+    return this.store;
+  }
+
+  getLeafId(): string | null {
+    return this.store.getLeafId();
+  }
+
+  getTree(): readonly SessionTreeNode[] {
+    return buildSessionTree(this.store.getEntries());
+  }
+
+  async moveTo(entryId: string): Promise<void> {
+    const entry = this.store.getEntry(entryId);
+
+    if (!entry || entry.type === "leaf") {
+      throw new Error(`Session entry "${entryId}" was not found.`);
+    }
+
+    await this.store.setLeafId(entryId);
   }
 
   getMessages(): readonly Message[] {

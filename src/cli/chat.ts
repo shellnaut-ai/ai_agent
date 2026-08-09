@@ -1,4 +1,5 @@
 import type { ChatSession } from "../session/chat-session.js";
+import { formatSessionTree } from "../session/tree.js";
 import type { CliIO } from "./io.js";
 
 export async function runChat(session: ChatSession, io: CliIO): Promise<void> {
@@ -12,6 +13,72 @@ export async function runChat(session: ChatSession, io: CliIO): Promise<void> {
 
     if (content === "/exit") {
       return;
+    }
+
+    if (content === "/tree") {
+      io.write(
+        `${formatSessionTree(session.getTree(), session.getLeafId())}\n`,
+      );
+      continue;
+    }
+
+    if (content === "/clone") {
+      try {
+        const result = await session.clone();
+        io.write(
+          `Cloned to session ${result.sessionId}.\n` +
+            `Session file: ${result.filePath}\n`,
+        );
+      } catch (error: unknown) {
+        io.writeError(
+          `Error: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
+
+      continue;
+    }
+
+    if (content === "/goto" || content.startsWith("/goto ")) {
+      const entryId = content.slice("/goto".length).trim();
+
+      if (entryId.length === 0) {
+        io.writeError("Usage: /goto <entryId>\n");
+        continue;
+      }
+
+      try {
+        await session.moveTo(entryId);
+        io.write(`Moved to session entry ${entryId}.\n`);
+      } catch (error: unknown) {
+        io.writeError(
+          `Error: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
+
+      continue;
+    }
+
+    if (content === "/fork" || content.startsWith("/fork ")) {
+      const entryId = content.slice("/fork".length).trim();
+
+      if (entryId.length === 0) {
+        io.writeError("Usage: /fork <userMessageEntryId>\n");
+        continue;
+      }
+
+      try {
+        const result = await session.fork(entryId);
+        io.write(
+          `Forked to session ${result.sessionId}.\n` +
+            `Session file: ${result.filePath}\n`,
+        );
+      } catch (error: unknown) {
+        io.writeError(
+          `Error: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
+
+      continue;
     }
 
     let assistantLineOpen = false;
