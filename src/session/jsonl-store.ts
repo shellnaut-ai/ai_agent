@@ -3,6 +3,7 @@ import {
   appendFile,
   mkdir,
   readFile,
+  stat,
   truncate,
   writeFile,
 } from "node:fs/promises";
@@ -29,11 +30,16 @@ import type {
   SessionHeaderRecord,
   SessionStore,
 } from "./types.js";
+import {
+  SessionWriterLockCompromisedError,
+  withSessionWriterLock,
+} from "./writer-lock.js";
 
 export interface JsonlSessionStoreOptions {
   readonly rootDir: string;
   readonly sessionId: string;
   readonly model: Model;
+  readonly writerLockTimeoutMs?: number;
 }
 
 interface EntryBaseFields {
@@ -121,6 +127,12 @@ function parseJsonValue(value: unknown): JsonValue {
   }
 
   if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index)) {
+        throw new Error("Provider state must not contain sparse arrays.");
+      }
+    }
+
     return value.map(parseJsonValue);
   }
 
@@ -488,11 +500,14 @@ export class JsonlSessionStore implements SessionStore {
 
   private readonly model: Model;
   private readonly sessionDirectory: string;
+  private readonly writerLockPath: string;
+  private readonly writerLockTimeoutMs: number;
   private entries: SessionEntry[] = [];
   private entriesById = new Map<string, SessionEntry>();
   private currentLeafId: string | null = null;
   private writeQueue: Promise<void> = Promise.resolve();
   private initialized = false;
+  private poisonError: Error | undefined;
 
   constructor(options: JsonlSessionStoreOptions) {
     if (!/^[A-Za-z0-9_-]{1,100}$/.test(options.sessionId)) {
@@ -509,13 +524,20 @@ export class JsonlSessionStore implements SessionStore {
       this.sessionDirectory,
       `${options.sessionId}.jsonl`,
     );
+    this.writerLockPath = `${this.filePath}.writer.lock`;
+    this.writerLockTimeoutMs = options.writerLockTimeoutMs ?? 30_000;
   }
 
   async load(): Promise<LoadedSession> {
+    this.assertNotPoisoned();
     await mkdir(this.sessionDirectory, {
       recursive: true,
     });
 
+    return this.runWithWriterLock(async () => this.loadFromDisk());
+  }
+
+  private async loadFromDisk(): Promise<LoadedSession> {
     let content: string;
 
     try {
@@ -613,10 +635,14 @@ export class JsonlSessionStore implements SessionStore {
         value = JSON.parse(line);
       } catch {
         if (index === lines.length - 1 && !terminated) {
-          await truncate(
-            this.filePath,
-            Buffer.byteLength(content.slice(0, startOffset), "utf8"),
-          );
+          try {
+            await truncate(
+              this.filePath,
+              Buffer.byteLength(content.slice(0, startOffset), "utf8"),
+            );
+          } catch (error: unknown) {
+            throw this.poison(error);
+          }
           repairedIncompleteTail = true;
           break;
         }
@@ -673,7 +699,7 @@ export class JsonlSessionStore implements SessionStore {
     }
 
     if (!repairedIncompleteTail && !content.endsWith("\n")) {
-      await appendFile(this.filePath, "\n", { encoding: "utf8" });
+      await this.appendContentSafely("\n");
     }
 
     this.entries = nextEntries;
@@ -716,7 +742,10 @@ export class JsonlSessionStore implements SessionStore {
     const parsedEntries = entries.map(parseSessionEntry);
 
     await this.enqueueWrite(async () => {
-      await this.appendEntriesNow(parsedEntries);
+      await this.runWithWriterLock(async () => {
+        await this.loadFromDisk();
+        await this.appendEntriesNow(parsedEntries);
+      });
     });
   }
 
@@ -739,9 +768,7 @@ export class JsonlSessionStore implements SessionStore {
       .map((entry) => JSON.stringify(entry))
       .join("\n");
 
-    await appendFile(this.filePath, `${content}\n`, {
-      encoding: "utf8",
-    });
+    await this.appendContentSafely(`${content}\n`);
 
     this.entries.push(...storedEntries);
 
@@ -812,23 +839,26 @@ export class JsonlSessionStore implements SessionStore {
     this.assertInitialized();
 
     await this.enqueueWrite(async () => {
-      const target = this.entriesById.get(leafId);
+      await this.runWithWriterLock(async () => {
+        await this.loadFromDisk();
+        const target = this.entriesById.get(leafId);
 
-      if (!target || target.type === "leaf") {
-        throw new Error(
-          `Session leaf target "${leafId}" was not found.`,
-        );
-      }
+        if (!target || target.type === "leaf") {
+          throw new Error(
+            `Session leaf target "${leafId}" was not found.`,
+          );
+        }
 
-      const entry: LeafEntry = {
-        type: "leaf",
-        id: this.createEntryId(),
-        parentId: this.currentLeafId,
-        timestamp: new Date().toISOString(),
-        targetId: leafId,
-      };
+        const entry: LeafEntry = {
+          type: "leaf",
+          id: this.createEntryId(),
+          parentId: this.currentLeafId,
+          timestamp: new Date().toISOString(),
+          targetId: leafId,
+        };
 
-      await this.appendEntriesNow([entry]);
+        await this.appendEntriesNow([entry]);
+      });
     });
   }
 
@@ -846,14 +876,18 @@ export class JsonlSessionStore implements SessionStore {
     };
 
     await this.enqueueWrite(async () => {
-      await appendFile(this.filePath, `${JSON.stringify(record)}\n`, {
-        encoding: "utf8",
+      await this.runWithWriterLock(async () => {
+        await this.loadFromDisk();
+        await this.appendContentSafely(`${JSON.stringify(record)}\n`);
       });
     });
   }
 
   private async enqueueWrite(operation: () => Promise<void>): Promise<void> {
-    const result = this.writeQueue.then(operation);
+    const result = this.writeQueue.then(() => {
+      this.assertNotPoisoned();
+      return operation();
+    });
 
     this.writeQueue = result.catch(() => {
       return;
@@ -867,6 +901,66 @@ export class JsonlSessionStore implements SessionStore {
       throw new Error(
         "Session store must be loaded before it can be used.",
       );
+    }
+  }
+
+  private async appendContentSafely(content: string): Promise<void> {
+    this.assertNotPoisoned();
+    const committedEof = (await stat(this.filePath)).size;
+
+    try {
+      await appendFile(this.filePath, content, { encoding: "utf8" });
+    } catch (appendError: unknown) {
+      try {
+        await truncate(this.filePath, committedEof);
+      } catch (rollbackError: unknown) {
+        throw this.poison(
+          new AggregateError(
+            [appendError, rollbackError],
+            "Session append failed and rollback to the committed EOF failed.",
+          ),
+        );
+      }
+
+      throw appendError;
+    }
+  }
+
+  private async runWithWriterLock<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    this.assertNotPoisoned();
+
+    try {
+      return await withSessionWriterLock(
+        this.writerLockPath,
+        operation,
+        { timeoutMs: this.writerLockTimeoutMs },
+      );
+    } catch (error: unknown) {
+      if (error instanceof SessionWriterLockCompromisedError) {
+        throw this.poison(error);
+      }
+
+      throw error;
+    }
+  }
+
+  private poison(cause: unknown): Error {
+    if (this.poisonError === undefined) {
+      this.poisonError = new Error(
+        "Session store is poisoned because durable writer recovery failed. " +
+          "Create a new store instance and reload the journal before continuing.",
+        { cause },
+      );
+    }
+
+    return this.poisonError;
+  }
+
+  private assertNotPoisoned(): void {
+    if (this.poisonError !== undefined) {
+      throw this.poisonError;
     }
   }
 }
