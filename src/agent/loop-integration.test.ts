@@ -2,7 +2,11 @@ import { Type } from "typebox";
 import { describe, expect, test } from "vitest";
 
 import type { ModelStreamRunner } from "../model/runtime.js";
-import type { ModelRequest, StreamEvent } from "../model/types.js";
+import type {
+  ModelRequest,
+  ProviderMessageState,
+  StreamEvent,
+} from "../model/types.js";
 import { ToolRegistry } from "../tools/registry.js";
 import type { Tool } from "../tools/types.js";
 import { AgentLoop } from "./loop.js";
@@ -22,6 +26,46 @@ const model = {
 };
 
 describe("AgentLoop integration policies", () => {
+  test("copies terminal provider state onto the completed assistant message", async () => {
+    const providerState: ProviderMessageState = {
+      provider: "openai-codex",
+      value: {
+        reasoningItems: [{
+          type: "reasoning",
+          id: "rs_1",
+          summary: [],
+          encrypted_content: "encrypted",
+        }],
+        functionItemIds: {},
+      },
+    };
+    const runner: ModelStreamRunner = {
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: "start" };
+        yield { type: "text-delta", delta: "answer" };
+        yield { type: "done", reason: "stop", providerState };
+      },
+    };
+
+    const events = await collect(
+      new AgentLoop(runner, new ToolRegistry()).stream({
+        model,
+        messages: [{ role: "user", content: "question" }],
+      }),
+    );
+
+    expect(events.at(-1)).toEqual({
+      type: "done",
+      reason: "stop",
+      newMessages: [{
+        role: "assistant",
+        content: "answer",
+        toolCalls: [],
+        providerState,
+      }],
+    });
+  });
+
   test("maxToolBatches rejects a second model-requested batch", async () => {
     let providerCalls = 0;
     let toolExecutions = 0;

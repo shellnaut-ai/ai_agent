@@ -4,6 +4,7 @@ import type {
   AssistantMessage,
   Message,
   ModelRequest,
+  ProviderMessageState,
   StopReason,
   ToolResultMessage,
 } from "../model/types.js";
@@ -90,6 +91,7 @@ export class AgentLoop {
         let assistantContent = "";
         const toolCalls: ToolCall[] = [];
         let terminalReason: StopReason | undefined;
+        let terminalProviderState: ProviderMessageState | undefined;
 
         for await (const event of this.runtime.stream(modelRequest, {
           signal: options?.signal,
@@ -144,6 +146,7 @@ export class AgentLoop {
 
           if (event.type === "done") {
             terminalReason = event.reason;
+            terminalProviderState = event.providerState;
 
             break;
           }
@@ -204,6 +207,9 @@ export class AgentLoop {
           role: "assistant",
           content: assistantContent,
           toolCalls: [...toolCalls],
+          ...(terminalProviderState === undefined
+            ? {}
+            : { providerState: terminalProviderState }),
         };
 
         workingMessages.push(assistantMessage);

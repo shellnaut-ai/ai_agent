@@ -1,6 +1,13 @@
 import type { OAuthCredential } from "../auth/oauth-contracts.js";
 import type { ModelProvider, StreamOptions } from "../model/provider.js";
-import type { Message, Model, ModelRequest, StreamEvent } from "../model/types.js";
+import type {
+  JsonValue,
+  Message,
+  Model,
+  ModelRequest,
+  ProviderMessageState,
+  StreamEvent,
+} from "../model/types.js";
 import type { ToolDefinition } from "../tools/types.js";
 import { readSseData } from "./sse.js";
 
@@ -33,7 +40,6 @@ export class OpenAICodexProvider implements ModelProvider {
   readonly #endpoint: string;
   readonly #instructions: string | undefined;
   readonly #originator: string;
-  readonly #assistantReplay: AssistantReplay[] = [];
 
   constructor(options: OpenAICodexProviderOptions) {
     if (options.model.provider !== this.id) {
@@ -94,7 +100,7 @@ export class OpenAICodexProvider implements ModelProvider {
           : { instructions }),
         max_output_tokens:
           request.maxOutputTokens ?? request.model.maxOutputTokens,
-        input: serializeMessages(request.messages, this.#assistantReplay),
+        input: serializeMessages(request.messages),
         tools: request.tools.map(serializeTool),
         tool_choice: "auto",
         parallel_tool_calls: true,
@@ -118,9 +124,8 @@ export class OpenAICodexProvider implements ModelProvider {
     }
 
       let sawToolCall = false;
-      let assistantText = "";
-      const reasoningItems = new Map<string, Record<string, unknown>>();
-      const toolItems = new Map<string, string | undefined>();
+      const reasoningItems = new Map<string, Record<string, JsonValue>>();
+      const toolItems = new Map<string, string>();
       const pendingCalls = new Map<number, PendingToolCall>();
       for await (const data of readSseData(response.body)) {
       if (data === "[DONE]") break;
@@ -129,7 +134,6 @@ export class OpenAICodexProvider implements ModelProvider {
 
       if (type === "response.output_text.delta") {
         const delta = requireString(event.delta, "delta");
-        assistantText += delta;
         yield { type: "text-delta", delta };
         continue;
       }
@@ -140,7 +144,8 @@ export class OpenAICodexProvider implements ModelProvider {
         const index = requireIndex(event.output_index, "output_index");
         const argumentsValue = optionalString(item.arguments, "item.arguments");
         const callId = requireString(item.call_id, "item.call_id");
-        toolItems.set(callId, optionalString(item.id, "item.id"));
+        const functionItemId = optionalString(item.id, "item.id");
+        if (functionItemId !== undefined) toolItems.set(callId, functionItemId);
         sawToolCall = true;
         pendingCalls.set(index, {
           id: callId,
@@ -178,18 +183,19 @@ export class OpenAICodexProvider implements ModelProvider {
         collectTerminalReasoning(event, reasoningItems);
         const replayItems = [...reasoningItems.values()];
         // store:false에서는 다음 요청이 이전 output item을 다시 보내야 한다.
-        // reasoning이 없는 turn도 순서 표식으로 남겨야 같은 텍스트가 반복될 때 엇갈리지 않는다.
-        this.#assistantReplay.push({
-          messageIndex: request.messages.length,
-          content: assistantText,
-          toolCallIds: [...toolItems.keys()],
-          reasoningItems: replayItems,
-          functionItemIds: new Map(toolItems),
-        });
+        // provider wire metadata를 assistant message와 함께 영속화할 수 있게 전달한다.
+        const providerState: ProviderMessageState = {
+          provider: "openai-codex",
+          value: {
+            reasoningItems: replayItems,
+            functionItemIds: Object.fromEntries(toolItems),
+          },
+        };
         if (sawToolCall) yield* completeToolCalls(pendingCalls);
         yield {
           type: "done",
           reason: finishReason(type, event, sawToolCall),
+          providerState,
         };
         return;
       }
@@ -268,20 +274,11 @@ function codexResponsesEndpoint(baseUrl: string): string {
   return `${normalized}/codex/responses`;
 }
 
-interface AssistantReplay {
-  readonly messageIndex: number;
-  readonly content: string;
-  readonly toolCallIds: readonly string[];
-  readonly reasoningItems: readonly Record<string, unknown>[];
-  readonly functionItemIds: ReadonlyMap<string, string | undefined>;
-}
-
 function serializeMessages(
   messages: readonly Message[],
-  assistantReplay: readonly AssistantReplay[],
 ): Record<string, unknown>[] {
   const input: Record<string, unknown>[] = [];
-  for (const [messageIndex, message] of messages.entries()) {
+  for (const message of messages) {
     if (message.role === "user") {
       input.push({
         type: "message",
@@ -299,7 +296,7 @@ function serializeMessages(
       continue;
     }
 
-    const replay = findReplay(message, messageIndex, assistantReplay);
+    const replay = readCodexReplay(message);
     // Responses output 순서와 마찬가지로 reasoning을 가시적인 assistant output보다 먼저 둔다.
     input.push(...(replay?.reasoningItems ?? []));
     if (message.content !== "") {
@@ -314,7 +311,10 @@ function serializeMessages(
       });
     }
     for (const call of message.toolCalls) {
-      const functionItemId = replay?.functionItemIds.get(call.id);
+      const functionItemId = replay !== undefined
+        && Object.prototype.hasOwnProperty.call(replay.functionItemIds, call.id)
+        ? replay.functionItemIds[call.id]
+        : undefined;
       input.push({
         type: "function_call",
         ...(functionItemId === undefined
@@ -329,34 +329,91 @@ function serializeMessages(
   return input;
 }
 
-function findReplay(
+interface CodexReplay {
+  readonly reasoningItems: readonly Record<string, JsonValue>[];
+  readonly functionItemIds: Readonly<Record<string, string>>;
+}
+
+function readCodexReplay(
   message: Extract<Message, { role: "assistant" }>,
-  messageIndex: number,
-  replayEntries: readonly AssistantReplay[],
-): AssistantReplay | undefined {
-  const callIds = message.toolCalls.map((call) => call.id);
-  // 같은 Provider 인스턴스를 새 Agent가 재사용했다면 같은 index가 다시 생길 수 있다.
-  // 최신 항목부터 찾되 현재 메시지 모양까지 같을 때만 wire metadata를 붙인다.
-  for (let index = replayEntries.length - 1; index >= 0; index -= 1) {
-    const replay = replayEntries[index];
-    if (
-      replay !== undefined
-      && replay.messageIndex === messageIndex
-      && replay.content === message.content
-      && sameStrings(replay.toolCallIds, callIds)
-    ) {
-      return replay;
-    }
+): CodexReplay | undefined {
+  const state = message.providerState;
+  if (state?.provider !== "openai-codex" || !isPlainRecord(state.value)) {
+    return undefined;
   }
-  return undefined;
+
+  const reasoningItems = state.value.reasoningItems;
+  const functionItemIds = state.value.functionItemIds;
+  if (!Array.isArray(reasoningItems) || !isStringRecord(functionItemIds)) {
+    return undefined;
+  }
+
+  const parsedReasoning: Record<string, JsonValue>[] = [];
+  for (const value of reasoningItems) {
+    const reasoning = readReasoningItem(value);
+    if (reasoning === undefined) return undefined;
+    parsedReasoning.push(reasoning);
+  }
+
+  return { reasoningItems: parsedReasoning, functionItemIds };
 }
 
-function sameStrings(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length
-    && left.every((value, index) => value === right[index]);
+function readReasoningItem(
+  value: unknown,
+): Record<string, JsonValue> | undefined {
+  if (
+    !isPlainRecord(value)
+    || value.type !== "reasoning"
+    || typeof value.id !== "string"
+    || typeof value.encrypted_content !== "string"
+    || !Array.isArray(value.summary)
+    || !value.summary.every(isJsonValue)
+  ) {
+    return undefined;
+  }
+
+  return {
+    type: "reasoning",
+    id: value.id,
+    summary: value.summary,
+    encrypted_content: value.encrypted_content,
+  };
 }
 
-function parseReasoningItem(item: Record<string, unknown>): Record<string, unknown> {
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return isPlainRecord(value)
+    && Object.values(value).every((item) => typeof item === "string");
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isJsonValue(value: unknown): value is JsonValue {
+  if (
+    value === null
+    || typeof value === "boolean"
+    || typeof value === "string"
+  ) {
+    return true;
+  }
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  return isPlainRecord(value) && Object.values(value).every(isJsonValue);
+}
+
+function requireJsonValue(value: unknown, field: string): JsonValue {
+  if (!isJsonValue(value)) {
+    throw malformed(`${field} must contain only JSON-compatible values`);
+  }
+  return value;
+}
+
+function parseReasoningItem(item: Record<string, unknown>): Record<string, JsonValue> {
   const id = requireString(item.id, "item.id");
   const encryptedContent = requireString(
     item.encrypted_content,
@@ -365,18 +422,20 @@ function parseReasoningItem(item: Record<string, unknown>): Record<string, unkno
   if (!Array.isArray(item.summary)) {
     throw malformed("item.summary must be an array");
   }
+  const summary = item.summary.map((value, index) =>
+    requireJsonValue(value, `item.summary[${index}]`));
   // raw event 전체가 아니라 store:false 후속 요청에 필요한 opaque item만 보존한다.
   return {
     type: "reasoning",
     id,
-    summary: item.summary,
+    summary,
     encrypted_content: encryptedContent,
   };
 }
 
 function collectTerminalReasoning(
   event: Record<string, unknown>,
-  target: Map<string, Record<string, unknown>>,
+  target: Map<string, Record<string, JsonValue>>,
 ): void {
   const response = optionalRecord(event.response, "response");
   const output = response?.output;

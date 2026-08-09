@@ -2,7 +2,12 @@ import { describe, expect, test, vi } from "vitest";
 
 import { AuthRequiredError } from "../auth/oauth-resolver.js";
 import type { OAuthCredential } from "../auth/oauth-contracts.js";
-import type { ModelRequest } from "../model/types.js";
+import type {
+  AssistantMessage,
+  ModelRequest,
+  StreamEvent,
+} from "../model/types.js";
+import type { ToolCall } from "../tools/types.js";
 import { OpenAICodexProvider } from "./openai-codex-provider.js";
 
 const credential: OAuthCredential = {
@@ -64,6 +69,74 @@ async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
   const events: T[] = [];
   for await (const event of stream) events.push(event);
   return events;
+}
+
+function replayResponse(): Response {
+  return sseResponse([
+    JSON.stringify({
+      type: "response.output_item.added",
+      output_index: 1,
+      item: {
+        type: "function_call",
+        id: "fc_1",
+        call_id: "call-1",
+        name: "read",
+        arguments: '{"path":"a.txt"}',
+      },
+    }),
+    JSON.stringify({
+      type: "response.output_item.done",
+      output_index: 0,
+      item: {
+        type: "reasoning",
+        id: "rs_1",
+        summary: [],
+        encrypted_content: "encrypted",
+      },
+    }),
+    JSON.stringify({
+      type: "response.completed",
+      response: { status: "completed" },
+    }),
+  ]);
+}
+
+function terminalResponse(): Response {
+  return sseResponse([
+    JSON.stringify({
+      type: "response.completed",
+      response: { status: "completed" },
+    }),
+  ]);
+}
+
+function assistantFrom(events: readonly StreamEvent[]): AssistantMessage {
+  let content = "";
+  const toolCalls: ToolCall[] = [];
+  let terminal: Extract<StreamEvent, { type: "done" }> | undefined;
+
+  for (const event of events) {
+    if (event.type === "text-delta") content += event.delta;
+    if (event.type === "tool-call") toolCalls.push(event.toolCall);
+    if (event.type === "done") terminal = event;
+  }
+  if (terminal === undefined) throw new Error("Expected a terminal event");
+
+  return {
+    role: "assistant",
+    content,
+    toolCalls,
+    ...(terminal.providerState === undefined
+      ? {}
+      : { providerState: terminal.providerState }),
+  };
+}
+
+async function requestInput(captured: Request | undefined): Promise<unknown[]> {
+  if (captured === undefined) throw new Error("Expected a captured request");
+  const body = await captured.json() as { input?: unknown };
+  if (!Array.isArray(body.input)) throw new Error("Expected request input");
+  return body.input;
 }
 
 describe("OpenAICodexProvider", () => {
@@ -139,7 +212,17 @@ describe("OpenAICodexProvider", () => {
           arguments: { path: "b.txt" },
         },
       },
-      { type: "done", reason: "tool-call" },
+      {
+        type: "done",
+        reason: "tool-call",
+        providerState: {
+          provider: "openai-codex",
+          value: {
+            reasoningItems: [],
+            functionItemIds: {},
+          },
+        },
+      },
     ]);
     expect(captured?.headers.get("authorization")).toBe("Bearer test-access");
     expect(captured?.headers.get("chatgpt-account-id")).toBe("account-1");
@@ -151,5 +234,201 @@ describe("OpenAICodexProvider", () => {
       stream: true,
       store: false,
     });
+  });
+
+  test("replays encrypted reasoning and function item IDs after a fresh provider instance", async () => {
+    const firstProvider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async () => replayResponse(),
+    });
+    const firstEvents = await collect(firstProvider.stream({
+      model,
+      messages: [{ role: "user", content: "read a.txt" }],
+      tools: [],
+    }));
+    const assistant = assistantFrom(firstEvents);
+
+    let captured: Request | undefined;
+    const restoredProvider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async (input, init) => {
+        captured = new Request(input, init);
+        return terminalResponse();
+      },
+    });
+    await collect(restoredProvider.stream({
+      model,
+      messages: [
+        { role: "user", content: "read a.txt" },
+        assistant,
+      ],
+      tools: [],
+    }));
+
+    const input = await requestInput(captured);
+    expect(input).toContainEqual({
+      type: "reasoning",
+      id: "rs_1",
+      summary: [],
+      encrypted_content: "encrypted",
+    });
+    expect(input).toContainEqual(expect.objectContaining({
+      type: "function_call",
+      id: "fc_1",
+      call_id: "call-1",
+    }));
+  });
+
+  test("replays Codex metadata when compaction shifts the assistant message index", async () => {
+    let requestCount = 0;
+    let captured: Request | undefined;
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async (input, init) => {
+        requestCount += 1;
+        if (requestCount === 1) return replayResponse();
+        captured = new Request(input, init);
+        return terminalResponse();
+      },
+    });
+    const firstEvents = await collect(provider.stream({
+      model,
+      messages: [{ role: "user", content: "read a.txt" }],
+      tools: [],
+    }));
+    const assistant = assistantFrom(firstEvents);
+
+    await collect(provider.stream({
+      model,
+      messages: [
+        { role: "user", content: "read a.txt" },
+        { role: "user", content: "Summary of the compacted prefix." },
+        assistant,
+      ],
+      tools: [],
+    }));
+
+    const input = await requestInput(captured);
+    expect(input).toContainEqual({
+      type: "reasoning",
+      id: "rs_1",
+      summary: [],
+      encrypted_content: "encrypted",
+    });
+    expect(input).toContainEqual(expect.objectContaining({
+      type: "function_call",
+      id: "fc_1",
+      call_id: "call-1",
+    }));
+  });
+
+  test("does not consume replay state owned by another provider", async () => {
+    let requestCount = 0;
+    let captured: Request | undefined;
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async (input, init) => {
+        requestCount += 1;
+        if (requestCount === 1) return replayResponse();
+        captured = new Request(input, init);
+        return terminalResponse();
+      },
+    });
+    const firstEvents = await collect(provider.stream({
+      model,
+      messages: [{ role: "user", content: "read a.txt" }],
+      tools: [],
+    }));
+    const assistant: AssistantMessage = {
+      ...assistantFrom(firstEvents),
+      providerState: {
+        provider: "fake",
+        value: {
+          reasoningItems: [{
+            type: "reasoning",
+            id: "foreign-rs",
+            summary: [],
+            encrypted_content: "foreign-encrypted",
+          }],
+          functionItemIds: { "call-1": "foreign-fc" },
+        },
+      },
+    };
+
+    await collect(provider.stream({
+      model,
+      messages: [
+        { role: "user", content: "read a.txt" },
+        assistant,
+      ],
+      tools: [],
+    }));
+
+    const input = await requestInput(captured);
+    expect(input).not.toContainEqual(expect.objectContaining({
+      type: "reasoning",
+    }));
+    expect(input).toContainEqual(expect.objectContaining({
+      type: "function_call",
+      call_id: "call-1",
+    }));
+    expect(input).not.toContainEqual(expect.objectContaining({
+      type: "function_call",
+      id: expect.any(String),
+      call_id: "call-1",
+    }));
+  });
+
+  test("ignores malformed Codex replay state as one invalid value", async () => {
+    let requestCount = 0;
+    let captured: Request | undefined;
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async (input, init) => {
+        requestCount += 1;
+        if (requestCount === 1) return replayResponse();
+        captured = new Request(input, init);
+        return terminalResponse();
+      },
+    });
+    const firstEvents = await collect(provider.stream({
+      model,
+      messages: [{ role: "user", content: "read a.txt" }],
+      tools: [],
+    }));
+    const assistant: AssistantMessage = {
+      ...assistantFrom(firstEvents),
+      providerState: {
+        provider: "openai-codex",
+        value: {
+          reasoningItems: "not-an-array",
+          functionItemIds: { "call-1": "untrusted-fc" },
+        },
+      },
+    };
+
+    await collect(provider.stream({
+      model,
+      messages: [
+        { role: "user", content: "read a.txt" },
+        assistant,
+      ],
+      tools: [],
+    }));
+
+    const input = await requestInput(captured);
+    expect(input).not.toContainEqual(expect.objectContaining({
+      type: "reasoning",
+    }));
+    expect(input).not.toContainEqual(expect.objectContaining({
+      type: "function_call",
+      id: expect.any(String),
+      call_id: "call-1",
+    }));
   });
 });
