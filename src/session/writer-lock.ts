@@ -10,9 +10,12 @@ import {
   rm,
 } from "node:fs/promises";
 import { hostname } from "node:os";
+import {
+  createConnection,
+  createServer,
+  type Server,
+} from "node:net";
 import { join } from "node:path";
-
-import { posixProcessIsRunnable } from "../tools/process-tree.js";
 
 export interface SessionWriterLockOptions {
   readonly timeoutMs?: number;
@@ -31,15 +34,19 @@ interface LockLease {
 
 const inProcessTails = new Map<string, Promise<void>>();
 
-/** Internal deterministic filesystem seam; not exported from the package root. */
+/** Internal deterministic lease seam; not exported from the package root. */
 export const sessionWriterLockRuntime: {
   publishPosixCandidate(candidatePath: string, lockPath: string): Promise<void>;
+  probePosixLivenessPort(port: number): Promise<boolean>;
 } = {
   async publishPosixCandidate(
     candidatePath: string,
     lockPath: string,
   ): Promise<void> {
     await rename(candidatePath, lockPath);
+  },
+  probePosixLivenessPort(port: number): Promise<boolean> {
+    return probePosixLivenessPort(port);
   },
 };
 
@@ -48,11 +55,13 @@ interface PosixLeaseRecord {
   readonly token: string;
   readonly pid: number;
   readonly host: string;
+  readonly livenessPort?: number;
 }
 
 interface PosixLeaseCandidate {
   readonly path: string;
   readonly record: PosixLeaseRecord;
+  readonly livenessServer: Server;
 }
 
 const POSIX_OWNER_FILE = "owner.json";
@@ -241,7 +250,7 @@ async function acquirePosixDirectoryLease(
       await delay(Math.min(10, remainingMs));
     }
   } catch (error: unknown) {
-    await removeCandidateAfterFailure(candidate.path, error);
+    await removeCandidateAfterFailure(candidate, error);
   }
 
   let released = false;
@@ -253,7 +262,11 @@ async function acquirePosixDirectoryLease(
       }
 
       released = true;
-      await releasePosixDirectoryLease(lockPath, candidate.record);
+      await releasePosixDirectoryLease(
+        lockPath,
+        candidate.record,
+        candidate.livenessServer,
+      );
     },
   };
 }
@@ -263,15 +276,22 @@ async function createPosixLeaseCandidate(
 ): Promise<PosixLeaseCandidate> {
   const token = randomUUID();
   const candidatePath = `${lockPath}.candidate-${token}`;
+  const liveness = await createPosixLivenessServer();
   const record: PosixLeaseRecord = {
     version: 1,
     token,
     pid: process.pid,
     host: hostname(),
+    livenessPort: liveness.port,
   };
-  await mkdir(candidatePath, { mode: 0o700 });
+  const candidate = {
+    path: candidatePath,
+    record,
+    livenessServer: liveness.server,
+  };
 
   try {
+    await mkdir(candidatePath, { mode: 0o700 });
     const ownerFile = await open(
       join(candidatePath, POSIX_OWNER_FILE),
       "wx",
@@ -285,10 +305,10 @@ async function createPosixLeaseCandidate(
       await ownerFile.close();
     }
   } catch (error: unknown) {
-    await removeCandidateAfterFailure(candidatePath, error);
+    await removeCandidateAfterFailure(candidate, error);
   }
 
-  return { path: candidatePath, record };
+  return candidate;
 }
 
 async function recoverAbandonedPosixLease(lockPath: string): Promise<void> {
@@ -412,7 +432,11 @@ async function readPosixLeaseRecord(
     !Number.isInteger(Reflect.get(value, "pid")) ||
     Number(Reflect.get(value, "pid")) <= 0 ||
     typeof Reflect.get(value, "host") !== "string" ||
-    (Reflect.get(value, "host") as string).length === 0
+    (Reflect.get(value, "host") as string).length === 0 ||
+    (Reflect.has(value, "livenessPort") &&
+      (!Number.isInteger(Reflect.get(value, "livenessPort")) ||
+        Number(Reflect.get(value, "livenessPort")) <= 0 ||
+        Number(Reflect.get(value, "livenessPort")) > 65_535))
   ) {
     return undefined;
   }
@@ -422,6 +446,9 @@ async function readPosixLeaseRecord(
     token: Reflect.get(value, "token") as string,
     pid: Number(Reflect.get(value, "pid")),
     host: Reflect.get(value, "host") as string,
+    ...(Reflect.has(value, "livenessPort")
+      ? { livenessPort: Number(Reflect.get(value, "livenessPort")) }
+      : {}),
   };
 }
 
@@ -432,56 +459,184 @@ async function posixOwnerMayBeAlive(
     return true;
   }
 
-  try {
-    process.kill(record.pid, 0);
-  } catch (error: unknown) {
-    return !isErrorCode(error, "ESRCH");
+  if (record.livenessPort !== undefined) {
+    try {
+      return await sessionWriterLockRuntime.probePosixLivenessPort(
+        record.livenessPort,
+      );
+    } catch {
+      // Only a definitive loopback ECONNREFUSED is dead. Timeouts, resource
+      // exhaustion, and all other errors fail closed as a possibly live owner.
+      return true;
+    }
   }
 
   try {
-    return await posixProcessIsRunnable(record.pid, process.platform);
-  } catch {
-    // State inspection is advisory. Unsupported ps selectors, permission
-    // errors, timeouts, and malformed output must never reap a possibly live
-    // owner; a later retry can observe an unambiguous ESRCH/dead state.
+    process.kill(record.pid, 0);
+    // Same-version records created before the liveness socket was introduced
+    // cannot distinguish a live process from a zombie without a helper. Keep
+    // them until the PID definitively disappears.
     return true;
+  } catch (error: unknown) {
+    return !isErrorCode(error, "ESRCH");
   }
 }
 
 async function releasePosixDirectoryLease(
   lockPath: string,
   expected: PosixLeaseRecord,
+  livenessServer: Server,
 ): Promise<void> {
-  const current = await readPosixLeaseRecord(lockPath);
+  let releaseError: unknown;
 
-  if (
-    current === undefined ||
-    current.token !== expected.token ||
-    current.pid !== expected.pid ||
-    current.host !== expected.host
-  ) {
-    throw new Error("Session writer lock ownership changed before release.");
+  try {
+    const current = await readPosixLeaseRecord(lockPath);
+
+    if (
+      current === undefined ||
+      current.token !== expected.token ||
+      current.pid !== expected.pid ||
+      current.host !== expected.host ||
+      current.livenessPort !== expected.livenessPort
+    ) {
+      throw new Error("Session writer lock ownership changed before release.");
+    }
+
+    // Normal release and stale recovery must reserve the same permanent,
+    // token-specific destination. A delayed observer of this owner can then
+    // never rename a newer live lease: its rename fails because this retained
+    // non-empty tombstone already exists.
+    const tombstonePath = `${lockPath}.reaped-${expected.token}`;
+    await rename(lockPath, tombstonePath);
+  } catch (error: unknown) {
+    releaseError = error;
   }
 
-  const releasedPath = `${lockPath}.released-${expected.token}`;
-  await rename(lockPath, releasedPath);
-  await rm(releasedPath, { recursive: true, force: false });
+  try {
+    await closePosixLivenessServer(livenessServer);
+  } catch (closeError: unknown) {
+    if (releaseError !== undefined) {
+      throw new AggregateError(
+        [releaseError, closeError],
+        "Session writer lock release and liveness cleanup both failed.",
+      );
+    }
+    throw closeError;
+  }
+
+  if (releaseError !== undefined) {
+    throw releaseError;
+  }
 }
 
 async function removeCandidateAfterFailure(
-  candidatePath: string,
+  candidate: PosixLeaseCandidate,
   originalError: unknown,
 ): Promise<never> {
+  const cleanupErrors: unknown[] = [];
+
   try {
-    await rm(candidatePath, { recursive: true, force: true });
+    await rm(candidate.path, { recursive: true, force: true });
   } catch (cleanupError: unknown) {
+    cleanupErrors.push(cleanupError);
+  }
+
+  try {
+    await closePosixLivenessServer(candidate.livenessServer);
+  } catch (cleanupError: unknown) {
+    cleanupErrors.push(cleanupError);
+  }
+
+  if (cleanupErrors.length !== 0) {
     throw new AggregateError(
-      [originalError, cleanupError],
+      [originalError, ...cleanupErrors],
       "Session writer lock acquisition and cleanup both failed.",
     );
   }
 
   throw originalError;
+}
+
+async function createPosixLivenessServer(): Promise<{
+  readonly server: Server;
+  readonly port: number;
+}> {
+  const server = createServer((socket) => socket.destroy());
+
+  await new Promise<void>((resolveListen, reject) => {
+    const onError = (error: Error): void => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = (): void => {
+      server.off("error", onError);
+      resolveListen();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen({ host: "127.0.0.1", port: 0, exclusive: true });
+  });
+
+  const address = server.address();
+  if (typeof address !== "object" || address === null) {
+    await closePosixLivenessServer(server);
+    throw new Error("POSIX writer-lock liveness listener has no TCP address.");
+  }
+
+  return { server, port: address.port };
+}
+
+function probePosixLivenessPort(port: number): Promise<boolean> {
+  return new Promise<boolean>((resolveProbe, reject) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    const timer = setTimeout(() => {
+      cleanup();
+      socket.destroy();
+      reject(Object.assign(new Error("POSIX liveness probe timed out."), {
+        code: "ETIMEDOUT",
+      }));
+    }, 250);
+    timer.unref();
+
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      socket.off("connect", onConnect);
+      socket.off("error", onError);
+    };
+    const onConnect = (): void => {
+      cleanup();
+      socket.destroy();
+      resolveProbe(true);
+    };
+    const onError = (error: NodeJS.ErrnoException): void => {
+      cleanup();
+      socket.destroy();
+      if (error.code === "ECONNREFUSED") {
+        resolveProbe(false);
+        return;
+      }
+      reject(error);
+    };
+
+    socket.once("connect", onConnect);
+    socket.once("error", onError);
+  });
+}
+
+function closePosixLivenessServer(server: Server): Promise<void> {
+  if (!server.listening) {
+    return Promise.resolve();
+  }
+
+  return new Promise<void>((resolveClose, reject) => {
+    server.close((error) => {
+      if (error !== undefined) {
+        reject(error);
+        return;
+      }
+      resolveClose();
+    });
+  });
 }
 
 function isLeaseContentionError(error: unknown): boolean {

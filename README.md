@@ -83,10 +83,24 @@ rolling upgrade를 지원하지 않는다. 업그레이드 전에 해당 세션 
 명시적으로 보존 이름으로 옮기거나 삭제하고 다시 시작해야 하며, 그 전에는 writer callback이
 실행되지 않는다.
 
-새 lease의 PID liveness 판정은 같은 host/PID namespace의 로컬 저장소를 전제로 한다. 네트워크
-공유 또는 서로 다른 PID namespace에서 같은 세션 디렉터리를 동시에 쓰는 구성은 지원하지
-않는다. 같은 배포 버전에서는 활성 lease를 시간 경과로 빼앗지 않으며, 소유 프로세스가
-종료되면 다음 writer가 남은 lease를 복구한다.
+새 lease는 각 owner가 `127.0.0.1`의 임시 TCP listener를 열어 둔 뒤 그 port를 owner record에
+기록한다. contender는 외부 `ps`/`flock` helper 없이 Node의 loopback connect만 사용한다.
+connect 성공은 owner가 live인 것으로 처리하며, port 재사용도 안전한 false positive라서 복구를
+늦출 뿐 lease를 잘못 빼앗지 않는다. 오직 `ECONNREFUSED`만 종료된 owner로 판정하고 timeout이나
+다른 오류는 fail closed한다. listener FD는 owner가 paused 상태여도 커널에 남고 프로세스가
+종료되어 zombie가 되면 닫히므로 두 상태를 구분할 수 있다. listener 도입 전 record는 PID가
+명확히 사라질 때까지 보수적으로 유지한다.
+
+이 liveness 판정은 같은 host/PID namespace의 로컬 저장소를 전제로 한다. 네트워크 공유 또는
+서로 다른 PID namespace에서 같은 세션 디렉터리를 동시에 쓰는 구성은 지원하지 않는다. 같은
+배포 버전에서는 활성 lease를 시간 경과로 빼앗지 않으며, 소유 프로세스가 종료되면 다음
+writer가 남은 lease를 복구한다.
+
+정상 release와 stale recovery는 모두 동일한 token-specific `.reaped-<token>` 비어 있지 않은
+tombstone을 남긴다. 이는 이전 owner를 본 뒤 지연된 contender가 새 live owner의 directory를
+이동시키는 ABA를 원자적으로 막기 위한 것이므로 자동 삭제하지 않는다. tombstone은 write마다
+누적된다. 전체 세션 writer가 quiescent이고 stale observer도 없음을 운영자가 확인한 유지보수
+구간에서만 수동으로 정리할 수 있다.
 
 Bash는 timeout, 출력 한도 초과, `AbortSignal`에서 종료를 조정한다.
 

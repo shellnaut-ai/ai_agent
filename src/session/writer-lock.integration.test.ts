@@ -272,6 +272,9 @@ import json, os, signal, socket, sys, time
 lock_path, token = sys.argv[1], sys.argv[2]
 zombie = os.fork()
 if zombie == 0:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
     os.mkdir(lock_path)
     with open(os.path.join(lock_path, "owner.json"), "w", encoding="utf-8") as output:
         json.dump({
@@ -279,6 +282,7 @@ if zombie == 0:
             "token": token,
             "pid": os.getpid(),
             "host": socket.gethostname(),
+            "livenessPort": listener.getsockname()[1],
         }, output)
         output.write("\n")
         output.flush()
@@ -325,9 +329,14 @@ while True:
           }, { timeoutMs: 1_000 }),
         ).resolves.toBe("recovered-zombie");
         expect(callbackEntered).toBe(true);
-        expect(await readdir(rootDir)).toEqual([
-          `session.writer.lock.reaped-${token}`,
-        ]);
+        const retained = await readdir(rootDir);
+        expect(retained).toContain(`session.writer.lock.reaped-${token}`);
+        expect(retained).toHaveLength(2);
+        expect(
+          retained.every((entry) =>
+            entry.startsWith("session.writer.lock.reaped-"),
+          ),
+        ).toBe(true);
       } finally {
         holder.kill("SIGUSR1");
         await waitForClose(holder);
@@ -338,31 +347,51 @@ while True:
   );
 
   test(
-    "fails closed when portable owner-state inspection is uncertain",
+    "recovers a socket-backed lease when its owner port is closed",
     async () => {
       const rootDir = await mkdtemp(
-        join(tmpdir(), "ai-agent-writer-state-uncertain-"),
+        join(tmpdir(), "ai-agent-writer-closed-port-"),
       );
       cleanup.push(rootDir);
       const lockPath = join(rootDir, "session.writer.lock");
-      const callbackMarker = join(rootDir, "callback-entered");
       const writerLockUrl = pathToFileURL(
         resolve("src/session/writer-lock.ts"),
       ).href;
-      const processTreeUrl = pathToFileURL(
-        resolve("src/tools/process-tree.ts"),
-      ).href;
       const script = `
+        import { createServer } from "node:net";
         import { mkdir, writeFile } from "node:fs/promises";
         import { hostname } from "node:os";
         Object.defineProperty(process, "platform", {
           configurable: true,
           value: "darwin",
         });
-        const { posixProcessStateRuntime } = await import(
-          ${JSON.stringify(processTreeUrl)});
-        const { withSessionWriterLock } = await import(
-          ${JSON.stringify(writerLockUrl)});
+        const {
+          sessionWriterLockRuntime,
+          withSessionWriterLock,
+        } = await import(${JSON.stringify(writerLockUrl)});
+        const publish = sessionWriterLockRuntime.publishPosixCandidate;
+        sessionWriterLockRuntime.publishPosixCandidate = async (...args) => {
+          try {
+            await publish(...args);
+          } catch (error) {
+            if (error?.code !== "EPERM") throw error;
+            throw Object.assign(new Error("simulated POSIX contention"), {
+              code: "EEXIST",
+            });
+          }
+        };
+        const listener = createServer();
+        await new Promise((resolve, reject) => {
+          listener.once("error", reject);
+          listener.listen({ host: "127.0.0.1", port: 0 }, resolve);
+        });
+        const address = listener.address();
+        if (typeof address !== "object" || address === null) {
+          throw new Error("fixture did not bind a TCP port");
+        }
+        await new Promise((resolve, reject) => listener.close((error) => {
+          if (error) reject(error); else resolve();
+        }));
         await mkdir(process.argv[1]);
         await writeFile(
           process.argv[1] + "/owner.json",
@@ -371,12 +400,86 @@ while True:
             token: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
             pid: process.pid,
             host: hostname(),
+            livenessPort: address.port,
           }) + "\\n",
           "utf8",
         );
-        posixProcessStateRuntime.execute = async () => {
-          throw Object.assign(new Error("simulated ps permission failure"), {
-            code: "EACCES",
+        const result = await withSessionWriterLock(
+          process.argv[1],
+          async () => "recovered-closed-port",
+          { timeoutMs: 250 },
+        );
+        process.stdout.write(result + "\\n");
+      `;
+      const contender = spawnNode(script, [lockPath], { PATH: "" });
+
+      await expect(
+        waitForLine(contender, "recovered-closed-port"),
+      ).resolves.toBe("recovered-closed-port");
+      await waitForClose(contender);
+      children.delete(contender);
+      const retained = await readdir(rootDir);
+      expect(retained).toContain(
+        "session.writer.lock.reaped-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      );
+      expect(retained).toHaveLength(2);
+      expect(
+        retained.every((entry) =>
+          entry.startsWith("session.writer.lock.reaped-"),
+        ),
+      ).toBe(true);
+    },
+  );
+
+  test(
+    "fails closed when the dependency-free liveness probe is ambiguous",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-writer-probe-uncertain-"),
+      );
+      cleanup.push(rootDir);
+      const lockPath = join(rootDir, "session.writer.lock");
+      const callbackMarker = join(rootDir, "callback-entered");
+      const writerLockUrl = pathToFileURL(
+        resolve("src/session/writer-lock.ts"),
+      ).href;
+      const script = `
+        import { mkdir, writeFile } from "node:fs/promises";
+        import { hostname } from "node:os";
+        Object.defineProperty(process, "platform", {
+          configurable: true,
+          value: "darwin",
+        });
+        const {
+          sessionWriterLockRuntime,
+          withSessionWriterLock,
+        } = await import(${JSON.stringify(writerLockUrl)});
+        const publish = sessionWriterLockRuntime.publishPosixCandidate;
+        sessionWriterLockRuntime.publishPosixCandidate = async (...args) => {
+          try {
+            await publish(...args);
+          } catch (error) {
+            if (error?.code !== "EPERM") throw error;
+            throw Object.assign(new Error("simulated POSIX contention"), {
+              code: "EEXIST",
+            });
+          }
+        };
+        await mkdir(process.argv[1]);
+        await writeFile(
+          process.argv[1] + "/owner.json",
+          JSON.stringify({
+            version: 1,
+            token: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            pid: process.pid,
+            host: hostname(),
+            livenessPort: 49152,
+          }) + "\\n",
+          "utf8",
+        );
+        sessionWriterLockRuntime.probePosixLivenessPort = async () => {
+          throw Object.assign(new Error("simulated loopback timeout"), {
+            code: "ETIMEDOUT",
           });
         };
         try {
@@ -399,6 +502,361 @@ while True:
         code: "ENOENT",
       });
       expect(await readdir(lockPath)).toEqual(["owner.json"]);
+    },
+  );
+
+  test(
+    "a stale recovery observer cannot move a live replacement lease",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-writer-release-aba-"),
+      );
+      cleanup.push(rootDir);
+      const lockPath = join(rootDir, "session.writer.lock");
+      const callbackMarker = join(rootDir, "stale-callback-entered");
+      const writerLockUrl = pathToFileURL(
+        resolve("src/session/writer-lock.ts"),
+      ).href;
+      const ownerScript = `
+        Object.defineProperty(process, "platform", {
+          configurable: true,
+          value: "darwin",
+        });
+        const { withSessionWriterLock } = await import(
+          ${JSON.stringify(writerLockUrl)});
+        process.stdin.setEncoding("utf8");
+        await withSessionWriterLock(process.argv[1], async () => {
+          process.stdout.write("acquired\\n");
+          await new Promise((resolve) => process.stdin.once("data", resolve));
+        });
+        process.stdout.write("released\\n");
+      `;
+      const contenderScript = `
+        import { writeFile } from "node:fs/promises";
+        Object.defineProperty(process, "platform", {
+          configurable: true,
+          value: "darwin",
+        });
+        const {
+          sessionWriterLockRuntime,
+          withSessionWriterLock,
+        } = await import(${JSON.stringify(writerLockUrl)});
+        const publish = sessionWriterLockRuntime.publishPosixCandidate;
+        sessionWriterLockRuntime.publishPosixCandidate = async (...args) => {
+          try {
+            await publish(...args);
+          } catch (error) {
+            if (error?.code !== "EPERM") throw error;
+            throw Object.assign(new Error("simulated POSIX contention"), {
+              code: "EEXIST",
+            });
+          }
+        };
+        const probe = sessionWriterLockRuntime.probePosixLivenessPort;
+        let probeCount = 0;
+        process.stdin.setEncoding("utf8");
+        sessionWriterLockRuntime.probePosixLivenessPort = async (port) => {
+          probeCount += 1;
+          if (probeCount === 1) {
+            process.stdout.write("observed-owner-a\\n");
+            await new Promise((resolve) => process.stdin.once("data", resolve));
+            return false;
+          }
+          return probe(port);
+        };
+        try {
+          await withSessionWriterLock(process.argv[1], async () => {
+            await writeFile(process.argv[2], "entered\\n", "utf8");
+            process.stdout.write("stale-callback-entered\\n");
+          }, { timeoutMs: 1_500 });
+          process.stdout.write("unexpected-success\\n");
+        } catch (error) {
+          process.stdout.write("error:" + error.message + "\\n");
+        }
+      `;
+      const ownerA = spawnNode(ownerScript, [lockPath]);
+      let ownerB: ChildProcessWithoutNullStreams | undefined;
+      let contender: ChildProcessWithoutNullStreams | undefined;
+
+      try {
+        await waitForLine(ownerA, "acquired");
+        const recordA = JSON.parse(
+          await readFile(join(lockPath, "owner.json"), "utf8"),
+        ) as { token: string };
+        contender = spawnNode(contenderScript, [lockPath, callbackMarker]);
+        await waitForLine(contender, "observed-owner-a");
+
+        ownerA.stdin.end("release\\n");
+        await waitForLine(ownerA, "released");
+        await waitForClose(ownerA);
+        children.delete(ownerA);
+
+        ownerB = spawnNode(ownerScript, [lockPath]);
+        await waitForLine(ownerB, "acquired");
+        const recordB = JSON.parse(
+          await readFile(join(lockPath, "owner.json"), "utf8"),
+        ) as { token: string };
+        expect(recordB.token).not.toBe(recordA.token);
+
+        contender.stdin.write("continue\\n");
+        await expect(
+          waitForLine(
+            contender,
+            /^(?:error:|stale-callback-entered|unexpected-success)/u,
+          ),
+        ).resolves.toMatch(/^error:.*(?:lock|acquisition)/iu);
+        contender.stdin.end();
+        await waitForClose(contender);
+        children.delete(contender);
+        contender = undefined;
+
+        await expect(access(callbackMarker)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        expect(
+          JSON.parse(
+            await readFile(join(lockPath, "owner.json"), "utf8"),
+          ).token,
+        ).toBe(recordB.token);
+        expect(
+          JSON.parse(
+            await readFile(
+              `${lockPath}.reaped-${recordA.token}/owner.json`,
+              "utf8",
+            ),
+          ).token,
+        ).toBe(recordA.token);
+      } finally {
+        if (contender !== undefined) {
+          contender.kill();
+          await waitForClose(contender);
+          children.delete(contender);
+        }
+        if (ownerB !== undefined) {
+          ownerB.stdin.end("release\\n");
+          await waitForClose(ownerB);
+          children.delete(ownerB);
+        }
+        if (children.has(ownerA)) {
+          ownerA.kill();
+          await waitForClose(ownerA);
+          children.delete(ownerA);
+        }
+      }
+    },
+    15_000,
+  );
+
+  test(
+    "keeps the liveness socket open through the lease and closes it on release",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-writer-liveness-release-"),
+      );
+      cleanup.push(rootDir);
+      const lockPath = join(rootDir, "session.writer.lock");
+      const writerLockUrl = pathToFileURL(
+        resolve("src/session/writer-lock.ts"),
+      ).href;
+      const script = `
+        import { createConnection } from "node:net";
+        import { readFile } from "node:fs/promises";
+        Object.defineProperty(process, "platform", {
+          configurable: true,
+          value: "darwin",
+        });
+        const { withSessionWriterLock } = await import(
+          ${JSON.stringify(writerLockUrl)});
+        const connect = (port) => new Promise((resolve, reject) => {
+          const socket = createConnection({ host: "127.0.0.1", port });
+          socket.once("connect", () => {
+            socket.destroy();
+            resolve();
+          });
+          socket.once("error", reject);
+        });
+        let port;
+        await withSessionWriterLock(process.argv[1], async () => {
+          const record = JSON.parse(await readFile(
+            process.argv[1] + "/owner.json", "utf8"));
+          port = record.livenessPort;
+          if (!Number.isInteger(port)) {
+            throw new Error("lease did not publish a liveness port");
+          }
+          await connect(port);
+        });
+        try {
+          await connect(port);
+          throw new Error("released liveness port still accepts connections");
+        } catch (error) {
+          if (error?.code !== "ECONNREFUSED") throw error;
+        }
+        process.stdout.write("liveness-closed\\n");
+      `;
+      const owner = spawnNode(script, [lockPath]);
+
+      await expect(waitForLine(owner, "liveness-closed")).resolves.toBe(
+        "liveness-closed",
+      );
+      await waitForClose(owner);
+      children.delete(owner);
+      await expect(access(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  test(
+    "closes the liveness socket when lease publication fails",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-writer-liveness-failure-"),
+      );
+      cleanup.push(rootDir);
+      const lockPath = join(rootDir, "session.writer.lock");
+      const writerLockUrl = pathToFileURL(
+        resolve("src/session/writer-lock.ts"),
+      ).href;
+      const script = `
+        import { createConnection } from "node:net";
+        import { readFile } from "node:fs/promises";
+        Object.defineProperty(process, "platform", {
+          configurable: true,
+          value: "darwin",
+        });
+        const {
+          sessionWriterLockRuntime,
+          withSessionWriterLock,
+        } = await import(${JSON.stringify(writerLockUrl)});
+        let port;
+        sessionWriterLockRuntime.publishPosixCandidate = async (candidate) => {
+          const record = JSON.parse(await readFile(
+            candidate + "/owner.json", "utf8"));
+          port = record.livenessPort;
+          throw Object.assign(new Error("simulated publication failure"), {
+            code: "EACCES",
+          });
+        };
+        try {
+          await withSessionWriterLock(process.argv[1], async () => undefined);
+          throw new Error("publication unexpectedly succeeded");
+        } catch (error) {
+          if (!/publication failure/i.test(error.message)) throw error;
+        }
+        await new Promise((resolve, reject) => {
+          const socket = createConnection({ host: "127.0.0.1", port });
+          socket.once("connect", () => {
+            socket.destroy();
+            reject(new Error("failed acquisition left liveness port open"));
+          });
+          socket.once("error", (error) => {
+            socket.destroy();
+            if (error.code === "ECONNREFUSED") resolve(); else reject(error);
+          });
+        });
+        process.stdout.write("failed-acquisition-cleaned\\n");
+      `;
+      const owner = spawnNode(script, [lockPath]);
+
+      await expect(
+        waitForLine(owner, "failed-acquisition-cleaned"),
+      ).resolves.toBe("failed-acquisition-cleaned");
+      await waitForClose(owner);
+      children.delete(owner);
+      expect(await readdir(rootDir)).toEqual([]);
+    },
+  );
+
+  test(
+    "closes the liveness socket when lease release fails closed",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-writer-liveness-release-failure-"),
+      );
+      cleanup.push(rootDir);
+      const lockPath = join(rootDir, "session.writer.lock");
+      const writerLockUrl = pathToFileURL(
+        resolve("src/session/writer-lock.ts"),
+      ).href;
+      const script = `
+        import { createConnection } from "node:net";
+        import { readFile, writeFile } from "node:fs/promises";
+        Object.defineProperty(process, "platform", {
+          configurable: true,
+          value: "darwin",
+        });
+        const { withSessionWriterLock } = await import(
+          ${JSON.stringify(writerLockUrl)});
+        let port;
+        try {
+          await withSessionWriterLock(process.argv[1], async () => {
+            const ownerPath = process.argv[1] + "/owner.json";
+            const record = JSON.parse(await readFile(ownerPath, "utf8"));
+            port = record.livenessPort;
+            await writeFile(ownerPath, "{}\\n", "utf8");
+          });
+          throw new Error("compromised release unexpectedly succeeded");
+        } catch (error) {
+          if (error?.name !== "SessionWriterLockCompromisedError") throw error;
+        }
+        await new Promise((resolve, reject) => {
+          const socket = createConnection({ host: "127.0.0.1", port });
+          socket.once("connect", () => {
+            socket.destroy();
+            reject(new Error("failed release left liveness port open"));
+          });
+          socket.once("error", (error) => {
+            socket.destroy();
+            if (error.code === "ECONNREFUSED") resolve(); else reject(error);
+          });
+        });
+        process.stdout.write("failed-release-cleaned\\n");
+      `;
+      const owner = spawnNode(script, [lockPath]);
+
+      await expect(waitForLine(owner, "failed-release-cleaned")).resolves.toBe(
+        "failed-release-cleaned",
+      );
+      await waitForClose(owner);
+      children.delete(owner);
+      expect(await readdir(lockPath)).toEqual(["owner.json"]);
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "does not steal a live socket-backed lease while its owner is paused",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-writer-paused-owner-"),
+      );
+      cleanup.push(rootDir);
+      const lockPath = join(rootDir, "session.writer.lock");
+      const writerLockUrl = pathToFileURL(
+        resolve("src/session/writer-lock.ts"),
+      ).href;
+      const script = `
+        import { withSessionWriterLock } from ${JSON.stringify(writerLockUrl)};
+        await withSessionWriterLock(process.argv[1], async () => {
+          process.stdout.write("acquired\\n");
+          await new Promise(() => undefined);
+        });
+      `;
+      const owner = spawnNode(script, [lockPath]);
+      await waitForLine(owner, "acquired");
+      try {
+        expect(owner.kill("SIGSTOP")).toBe(true);
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+        let callbackEntered = false;
+        await expect(
+          withSessionWriterLock(lockPath, async () => {
+            callbackEntered = true;
+          }, { timeoutMs: 150 }),
+        ).rejects.toThrow(/lock|acquisition/i);
+        expect(callbackEntered).toBe(false);
+      } finally {
+        owner.kill("SIGCONT");
+        owner.kill();
+        await waitForClose(owner);
+        children.delete(owner);
+      }
     },
   );
 

@@ -7,21 +7,15 @@ import { join } from "node:path";
 import { afterEach, expect, test } from "vitest";
 
 import {
-  posixProcessIsRunnable,
-  posixProcessStateRuntime,
   posixProcessTableRuntime,
   readPosixProcessTable,
   terminateProcessTree,
 } from "./process-tree.js";
 
 const originalProcessTableExecutor = posixProcessTableRuntime.execute;
-const originalProcessStateExecutor = posixProcessStateRuntime.execute;
-const originalLinuxStatReader = posixProcessStateRuntime.readLinuxStat;
 
 afterEach(() => {
   posixProcessTableRuntime.execute = originalProcessTableExecutor;
-  posixProcessStateRuntime.execute = originalProcessStateExecutor;
-  posixProcessStateRuntime.readLinuxStat = originalLinuxStatReader;
 });
 
 const CHILD_PROGRAM = `
@@ -278,44 +272,6 @@ test("POSIX process-table lookup falls back across portable state selectors", as
   };
 
   await expect(readPosixProcessTable()).resolves.toBe(" 42 Z\n");
-  expect(selectors).toEqual(["state", "stat", "s"]);
-});
-
-test("macOS owner-state lookup classifies leading Z as non-runnable", async () => {
-  const selectors: string[] = [];
-  posixProcessStateRuntime.execute = async (pid, selector) => {
-    expect(pid).toBe(42);
-    selectors.push(selector);
-    return "  Z+\n";
-  };
-
-  await expect(posixProcessIsRunnable(42, "darwin")).resolves.toBe(false);
-  expect(selectors).toEqual(["state"]);
-});
-
-test("portable owner-state uncertainty fails closed to the caller", async () => {
-  const selectors: string[] = [];
-  posixProcessStateRuntime.execute = async (_pid, selector) => {
-    selectors.push(selector);
-    throw new Error(`unsupported ${selector}`);
-  };
-
-  await expect(posixProcessIsRunnable(42, "darwin")).rejects.toThrow(
-    /supported state selector/i,
-  );
-  expect(selectors).toEqual(["state", "stat", "s"]);
-});
-
-test("portable owner-state malformed output remains uncertain", async () => {
-  const selectors: string[] = [];
-  posixProcessStateRuntime.execute = async (_pid, selector) => {
-    selectors.push(selector);
-    return "  ?\n";
-  };
-
-  await expect(posixProcessIsRunnable(42, "darwin")).rejects.toThrow(
-    /supported state selector/i,
-  );
   expect(selectors).toEqual(["state", "stat", "s"]);
 });
 
