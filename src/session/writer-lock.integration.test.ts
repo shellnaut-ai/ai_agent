@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, rm, utimes } from "node:fs/promises";
+import { mkdtemp, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -35,6 +35,69 @@ afterEach(async () => {
 });
 
 describe("cross-process session writer lock", () => {
+  test(
+    "the non-Windows lease has no native-addon or executable dependency",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-writer-no-path-"),
+      );
+      cleanup.push(rootDir);
+      const lockPath = join(rootDir, "session.writer.lock");
+      const writerLockUrl = pathToFileURL(
+        resolve("src/session/writer-lock.ts"),
+      ).href;
+      const script = `
+      import Module from "node:module";
+      const originalLoad = Module._load;
+      Module._load = function (request, parent, isMain) {
+        if (request === "fs-native-extensions") {
+          throw new Error("native addons are unavailable");
+        }
+        return originalLoad.call(this, request, parent, isMain);
+      };
+      Object.defineProperty(process, "platform", {
+        configurable: true,
+        value: "linux",
+      });
+      const { withSessionWriterLock } = await import(
+        ${JSON.stringify(writerLockUrl)});
+      await withSessionWriterLock(process.argv[1], async () => {
+        process.stdout.write("acquired-without-runtime-dependency\\n");
+      });
+    `;
+      const owner = spawnNode(script, [lockPath], { PATH: "" });
+
+      await expect(
+        waitForLine(owner, "acquired-without-runtime-dependency"),
+      ).resolves.toBe("acquired-without-runtime-dependency");
+      await waitForClose(owner);
+      children.delete(owner);
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "migrates an unlocked legacy artifact after a quiescent upgrade",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-writer-stale-"),
+      );
+      cleanup.push(rootDir);
+      const lockPath = join(rootDir, "session.writer.lock");
+      await writeFile(lockPath, "abandoned-owner-metadata\n", "utf8");
+      const old = new Date(Date.now() - 86_400_000);
+      await utimes(lockPath, old, old);
+
+      await expect(
+        withSessionWriterLock(lockPath, async () => "recovered", {
+          timeoutMs: 5_000,
+        }),
+      ).resolves.toBe("recovered");
+      expect(await readdir(rootDir)).toEqual([
+        expect.stringMatching(/^session\.writer\.lock\.reaped-legacy-/u),
+      ]);
+    },
+  );
+
   test("does not steal a live lease and recovers after its owner process dies", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-writer-lock-"));
     cleanup.push(rootDir);
@@ -141,6 +204,7 @@ describe("cross-process session writer lock", () => {
 function spawnNode(
   script: string,
   args: readonly string[],
+  environment: NodeJS.ProcessEnv = {},
 ): ChildProcessWithoutNullStreams {
   const child = spawn(
     process.execPath,
@@ -150,6 +214,7 @@ function spawnNode(
       env: {
         PATH: process.env["PATH"] ?? "",
         SystemRoot: process.env["SystemRoot"] ?? "C:\\Windows",
+        ...environment,
       },
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,

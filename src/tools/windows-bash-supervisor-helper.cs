@@ -1,3 +1,4 @@
+// Runtime-compiled from this reviewed source; no precompiled helper is shipped.
 using System;
 using System.ComponentModel;
 using System.Globalization;

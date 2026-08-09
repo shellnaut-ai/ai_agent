@@ -113,8 +113,9 @@ function isProcessAlive(pid: number): boolean {
 
 async function waitForRecordedTree(
   path: string,
+  timeoutMs = 5_000,
 ): Promise<RecordedProcessTree> {
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
     try {
@@ -164,6 +165,7 @@ async function waitForProcessExit(pid: number): Promise<void> {
 async function withDeadline<T>(
   promise: Promise<T>,
   message: string,
+  timeoutMs = 5_000,
 ): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
 
@@ -171,7 +173,7 @@ async function withDeadline<T>(
     return await Promise.race([
       promise,
       new Promise<never>((_resolve, reject) => {
-        timeout = setTimeout(() => reject(new Error(message)), 5_000);
+        timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
       }),
     ]);
   } finally {
@@ -580,20 +582,29 @@ describe("tool integration", () => {
       cleanup.push(rootDir);
       const token = `pi-clone-${randomUUID()}`;
       const fixture = await createBashTreeFixture(rootDir, token);
+      // Runtime compilation is deliberately inside the Windows execution
+      // deadline. Give this process-tree test enough room to reach Bash under
+      // full-suite CPU load; dedicated cold-start tests below cover short
+      // setup deadlines.
+      const executionTimeoutMs = process.platform === "win32" ? 7_500 : 2_500;
       const tool = new BashTool({
         rootDir,
         shellPath: bashPath(),
-        timeoutMs: 2_500,
+        timeoutMs: executionTimeoutMs,
       });
       let tree: RecordedProcessTree | undefined;
       let execution: Promise<Awaited<ReturnType<BashTool["execute"]>>> | undefined;
 
       try {
         execution = tool.execute({ command: fixture.command });
-        tree = await waitForRecordedTree(fixture.treePath);
+        tree = await waitForRecordedTree(
+          fixture.treePath,
+          executionTimeoutMs + 2_500,
+        );
         const result = await withDeadline(
           execution,
           "Bash timeout termination did not settle.",
+          executionTimeoutMs + 2_500,
         );
 
         expect(result.isError).toBe(true);

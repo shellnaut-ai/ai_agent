@@ -66,6 +66,19 @@ assistant 메시지와 함께 JSONL에 저장한다. 같은 세션을 CLI 재시
 item ID를 다음 Codex 요청에 replay한다. compaction summary 자체에는 이 opaque state를 넣지
 않는다.
 
+### POSIX 세션 writer lease 업그레이드
+
+이 버전은 Linux/macOS의 외부 `flock` 실행 파일 대신 로컬 파일시스템의 atomic directory
+lease를 사용한다. 이전 버전과 새 버전의 lock 방식은 서로의 활성 lease를 확인할 수 없으므로
+rolling upgrade를 지원하지 않는다. 업그레이드 전에 해당 세션 저장소를 사용하는 이전 버전
+프로세스를 모두 종료한 뒤 새 버전을 시작해야 한다. 그러면 첫 접근에서 이전 버전이 남긴
+regular `.writer.lock` artifact를 원자적으로 보존 이름으로 옮기고 새 lease로 전환한다.
+
+새 lease의 PID liveness 판정은 같은 host/PID namespace의 로컬 저장소를 전제로 한다. 네트워크
+공유 또는 서로 다른 PID namespace에서 같은 세션 디렉터리를 동시에 쓰는 구성은 지원하지
+않는다. 같은 배포 버전에서는 활성 lease를 시간 경과로 빼앗지 않으며, 소유 프로세스가
+종료되면 다음 writer가 남은 lease를 복구한다.
+
 Bash는 timeout, 출력 한도 초과, `AbortSignal`에서 종료를 조정한다.
 
 - Windows에서는 supervisor가 Bash를 suspended 상태로 만들고 `KILL_ON_JOB_CLOSE` Job Object에

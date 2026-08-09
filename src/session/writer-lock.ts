@@ -1,5 +1,15 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import type { BigIntStats } from "node:fs";
+import {
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  rename,
+  rm,
+} from "node:fs/promises";
+import { hostname } from "node:os";
 import { join } from "node:path";
 
 export interface SessionWriterLockOptions {
@@ -19,9 +29,21 @@ interface LockLease {
 
 const inProcessTails = new Map<string, Promise<void>>();
 
-const POSIX_HOLDER =
-  "process.stdout.write(process.argv[1] + '\\n');" +
-  "process.stdin.resume();";
+interface PosixLeaseRecord {
+  readonly version: 1;
+  readonly token: string;
+  readonly pid: number;
+  readonly host: string;
+}
+
+interface PosixLeaseCandidate {
+  readonly path: string;
+  readonly record: PosixLeaseRecord;
+}
+
+const POSIX_OWNER_FILE = "owner.json";
+const POSIX_TOKEN_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 const WINDOWS_HOLDER = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -130,11 +152,12 @@ async function acquireOsLease(
   lockPath: string,
   timeoutMs: number,
 ): Promise<LockLease> {
+  if (process.platform !== "win32") {
+    return acquirePosixDirectoryLease(lockPath, timeoutMs);
+  }
+
   const token = randomUUID();
-  const child =
-    process.platform === "win32"
-      ? spawnWindowsHolder(lockPath, token, timeoutMs)
-      : spawnPosixHolder(lockPath, token);
+  const child = spawnWindowsHolder(lockPath, token, timeoutMs);
 
   try {
     await waitForAcquisition(child, token, timeoutMs);
@@ -164,6 +187,272 @@ async function acquireOsLease(
       }
     },
   };
+}
+
+async function acquirePosixDirectoryLease(
+  lockPath: string,
+  timeoutMs: number,
+): Promise<LockLease> {
+  const candidate = await createPosixLeaseCandidate(lockPath);
+  const deadline = performance.now() + timeoutMs;
+  let firstAttempt = true;
+
+  try {
+    while (true) {
+      if (!firstAttempt && performance.now() >= deadline) {
+        throw new Error("Timed out waiting for session writer lock.");
+      }
+
+      try {
+        await rename(candidate.path, lockPath);
+        break;
+      } catch (error: unknown) {
+        if (!isLeaseContentionError(error)) {
+          throw error;
+        }
+      }
+
+      firstAttempt = false;
+      await recoverAbandonedPosixLease(lockPath);
+      const remainingMs = deadline - performance.now();
+
+      if (remainingMs <= 0) {
+        throw new Error("Timed out waiting for session writer lock.");
+      }
+
+      await delay(Math.min(10, remainingMs));
+    }
+  } catch (error: unknown) {
+    await removeCandidateAfterFailure(candidate.path, error);
+  }
+
+  let released = false;
+
+  return {
+    async release(): Promise<void> {
+      if (released) {
+        return;
+      }
+
+      released = true;
+      await releasePosixDirectoryLease(lockPath, candidate.record);
+    },
+  };
+}
+
+async function createPosixLeaseCandidate(
+  lockPath: string,
+): Promise<PosixLeaseCandidate> {
+  const token = randomUUID();
+  const candidatePath = `${lockPath}.candidate-${token}`;
+  const record: PosixLeaseRecord = {
+    version: 1,
+    token,
+    pid: process.pid,
+    host: hostname(),
+  };
+  await mkdir(candidatePath, { mode: 0o700 });
+
+  try {
+    const ownerFile = await open(
+      join(candidatePath, POSIX_OWNER_FILE),
+      "wx",
+      0o600,
+    );
+
+    try {
+      await ownerFile.writeFile(`${JSON.stringify(record)}\n`, "utf8");
+      await ownerFile.sync();
+    } finally {
+      await ownerFile.close();
+    }
+  } catch (error: unknown) {
+    await removeCandidateAfterFailure(candidatePath, error);
+  }
+
+  return { path: candidatePath, record };
+}
+
+async function recoverAbandonedPosixLease(lockPath: string): Promise<void> {
+  let details: BigIntStats;
+
+  try {
+    // Capture the legacy inode in the same observation that classifies its
+    // type. A second stat here would create an ABA window in which a newly
+    // published live directory could be mistaken for the old regular file.
+    details = await lstat(lockPath, { bigint: true });
+  } catch (error: unknown) {
+    if (isErrorCode(error, "ENOENT")) {
+      return;
+    }
+
+    throw error;
+  }
+
+  if (details.isDirectory()) {
+    const record = await readPosixLeaseRecord(lockPath);
+
+    if (record === undefined || posixOwnerMayBeAlive(record)) {
+      return;
+    }
+
+    await moveLeaseToTombstone(
+      lockPath,
+      `${lockPath}.reaped-${record.token}`,
+    );
+    return;
+  }
+
+  if (details.isFile()) {
+    // Old releases leave a regular file after releasing util-linux flock.
+    // This migration is safe only after the documented quiescent upgrade;
+    // flock ownership cannot be queried from dependency-free Node.js.
+    const legacyIdentity =
+      `${details.dev.toString(16)}-${details.ino.toString(16)}`;
+    await moveLeaseToTombstone(
+      lockPath,
+      `${lockPath}.reaped-legacy-${legacyIdentity}`,
+    );
+  }
+}
+
+async function moveLeaseToTombstone(
+  lockPath: string,
+  tombstonePath: string,
+): Promise<void> {
+  try {
+    // The token-specific non-empty tombstone is intentionally retained. It
+    // makes a delayed stale observer's rename fail instead of moving a newer
+    // live owner (the cross-process ABA case).
+    await rename(lockPath, tombstonePath);
+  } catch (error: unknown) {
+    if (
+      isErrorCode(error, "ENOENT") ||
+      isErrorCode(error, "EEXIST") ||
+      isErrorCode(error, "ENOTEMPTY") ||
+      isErrorCode(error, "ENOTDIR") ||
+      isErrorCode(error, "EISDIR")
+    ) {
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function readPosixLeaseRecord(
+  lockPath: string,
+): Promise<PosixLeaseRecord | undefined> {
+  let raw: string;
+
+  try {
+    raw = await readFile(join(lockPath, POSIX_OWNER_FILE), "utf8");
+  } catch (error: unknown) {
+    if (
+      isErrorCode(error, "ENOENT") ||
+      isErrorCode(error, "ENOTDIR")
+    ) {
+      return undefined;
+    }
+
+    throw error;
+  }
+
+  let value: unknown;
+
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Reflect.get(value, "version") !== 1 ||
+    typeof Reflect.get(value, "token") !== "string" ||
+    !POSIX_TOKEN_PATTERN.test(Reflect.get(value, "token") as string) ||
+    !Number.isInteger(Reflect.get(value, "pid")) ||
+    Number(Reflect.get(value, "pid")) <= 0 ||
+    typeof Reflect.get(value, "host") !== "string" ||
+    (Reflect.get(value, "host") as string).length === 0
+  ) {
+    return undefined;
+  }
+
+  return {
+    version: 1,
+    token: Reflect.get(value, "token") as string,
+    pid: Number(Reflect.get(value, "pid")),
+    host: Reflect.get(value, "host") as string,
+  };
+}
+
+function posixOwnerMayBeAlive(record: PosixLeaseRecord): boolean {
+  if (record.host !== hostname()) {
+    return true;
+  }
+
+  try {
+    process.kill(record.pid, 0);
+    return true;
+  } catch (error: unknown) {
+    return !isErrorCode(error, "ESRCH");
+  }
+}
+
+async function releasePosixDirectoryLease(
+  lockPath: string,
+  expected: PosixLeaseRecord,
+): Promise<void> {
+  const current = await readPosixLeaseRecord(lockPath);
+
+  if (
+    current === undefined ||
+    current.token !== expected.token ||
+    current.pid !== expected.pid ||
+    current.host !== expected.host
+  ) {
+    throw new Error("Session writer lock ownership changed before release.");
+  }
+
+  const releasedPath = `${lockPath}.released-${expected.token}`;
+  await rename(lockPath, releasedPath);
+  await rm(releasedPath, { recursive: true, force: false });
+}
+
+async function removeCandidateAfterFailure(
+  candidatePath: string,
+  originalError: unknown,
+): Promise<never> {
+  try {
+    await rm(candidatePath, { recursive: true, force: true });
+  } catch (cleanupError: unknown) {
+    throw new AggregateError(
+      [originalError, cleanupError],
+      "Session writer lock acquisition and cleanup both failed.",
+    );
+  }
+
+  throw originalError;
+}
+
+function isLeaseContentionError(error: unknown): boolean {
+  return (
+    isErrorCode(error, "EEXIST") ||
+    isErrorCode(error, "ENOTEMPTY") ||
+    isErrorCode(error, "ENOTDIR") ||
+    isErrorCode(error, "EISDIR")
+  );
+}
+
+function isErrorCode(error: unknown, code: string): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === code;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function spawnWindowsHolder(
@@ -204,35 +493,6 @@ function spawnWindowsHolder(
   );
 }
 
-function spawnPosixHolder(
-  lockPath: string,
-  token: string,
-): ChildProcessWithoutNullStreams {
-  return spawn(
-    "flock",
-    [
-      "-x",
-      lockPath,
-      process.execPath,
-      "-e",
-      POSIX_HOLDER,
-      token,
-    ],
-    {
-      env: {
-        PATH: process.env["PATH"] ?? "",
-        ...(process.env["LD_LIBRARY_PATH"] === undefined
-          ? {}
-          : { LD_LIBRARY_PATH: process.env["LD_LIBRARY_PATH"] }),
-        ...(process.env["DYLD_LIBRARY_PATH"] === undefined
-          ? {}
-          : { DYLD_LIBRARY_PATH: process.env["DYLD_LIBRARY_PATH"] }),
-      },
-      stdio: ["pipe", "pipe", "pipe"],
-    },
-  );
-}
-
 async function waitForAcquisition(
   child: ChildProcessWithoutNullStreams,
   token: string,
@@ -244,10 +504,8 @@ async function waitForAcquisition(
 
   await new Promise<void>((resolve, reject) => {
     // PowerShell enforces the Windows deadline itself, but allow its cold
-    // startup to finish so its explicit timeout result wins. POSIX flock is
-    // deliberately invoked with portable short flags, so this timer is its
-    // acquisition deadline and killing the holder releases any kernel lease.
-    const startupGraceMs = process.platform === "win32" ? 5_000 : 0;
+    // startup to finish so its explicit timeout result wins.
+    const startupGraceMs = 5_000;
     const timer = setTimeout(() => {
       finish(() => reject(new Error("Timed out waiting for session writer lock.")));
     }, timeoutMs + startupGraceMs);
