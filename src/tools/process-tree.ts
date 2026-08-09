@@ -4,6 +4,7 @@ import { win32 } from "node:path";
 
 const POSIX_TERMINATION_GRACE_MS = 500;
 const POSIX_POLL_INTERVAL_MS = 25;
+const POSIX_PROCESS_TABLE_TIMEOUT_MS = 250;
 
 function processExists(pid: number): boolean {
   try {
@@ -88,11 +89,14 @@ export const posixProcessTableRuntime: {
 function executePosixProcessTable(stateSelector: string): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     execFile(
-      "ps",
+      "/bin/ps",
       ["-A", "-o", "pgid=", "-o", `${stateSelector}=`],
       {
         encoding: "utf8",
-        env: { ...process.env, LC_ALL: "C" },
+        env: { LANG: "C", LC_ALL: "C" },
+        killSignal: "SIGKILL",
+        maxBuffer: 1_048_576,
+        timeout: POSIX_PROCESS_TABLE_TIMEOUT_MS,
       },
       (error, stdout) => {
         if (error !== null) {
@@ -106,14 +110,61 @@ function executePosixProcessTable(stateSelector: string): Promise<string> {
   });
 }
 
+function validatePosixProcessTable(table: string): string {
+  const lines = table
+    .split(/\r?\n/u)
+    .filter((line) => line.trim().length !== 0);
+
+  if (lines.length === 0) {
+    throw new Error("POSIX process table was empty.");
+  }
+
+  for (const line of lines) {
+    if (!/^\s*\d+\s+[A-Za-z]\S*\s*$/u.test(line)) {
+      throw new Error("POSIX process table contained a malformed row.");
+    }
+  }
+
+  return table;
+}
+
+function withProcessTableTimeout<T>(operation: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(Object.assign(new Error("POSIX process-table lookup timed out."), {
+        code: "ETIMEDOUT",
+      }));
+    }, POSIX_PROCESS_TABLE_TIMEOUT_MS);
+    timer.unref();
+
+    void operation.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 export async function readPosixProcessTable(): Promise<string> {
   const errors: unknown[] = [];
 
   for (const selector of ["state", "stat", "s"] as const) {
     try {
-      return await posixProcessTableRuntime.execute(selector);
+      return validatePosixProcessTable(
+        await withProcessTableTimeout(
+          posixProcessTableRuntime.execute(selector),
+        ),
+      );
     } catch (error: unknown) {
       errors.push(error);
+      if ((error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
+        break;
+      }
     }
   }
 
@@ -129,7 +180,7 @@ async function genericPosixGroupHasRunnableMembers(
   const table = await readPosixProcessTable();
 
   for (const line of table.split(/\r?\n/u)) {
-    const match = /^\s*(\d+)\s+(\S)/u.exec(line);
+    const match = /^\s*(\d+)\s+([A-Za-z])\S*\s*$/u.exec(line);
 
     if (
       match !== null &&

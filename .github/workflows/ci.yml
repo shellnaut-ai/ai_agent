@@ -90,7 +90,7 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
-      - name: Verify portable writer lease
-        run: npm test -- --run src/session/writer-lock.integration.test.ts src/session/jsonl-store-consistency.test.ts
+      - name: Verify portable POSIX runtime
+        run: npm test -- --run src/session/writer-lock.integration.test.ts src/session/jsonl-store-consistency.test.ts src/tools/process-tree.test.ts src/tools/tool-integration.test.ts
       - name: Audit dependencies
         run: npm audit --audit-level=high

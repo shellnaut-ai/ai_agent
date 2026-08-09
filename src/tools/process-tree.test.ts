@@ -1,10 +1,17 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 
 import {
   posixProcessTableRuntime,
@@ -16,6 +23,8 @@ const originalProcessTableExecutor = posixProcessTableRuntime.execute;
 
 afterEach(() => {
   posixProcessTableRuntime.execute = originalProcessTableExecutor;
+  vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 const CHILD_PROGRAM = `
@@ -274,6 +283,129 @@ test("POSIX process-table lookup falls back across portable state selectors", as
   await expect(readPosixProcessTable()).resolves.toBe(" 42 Z\n");
   expect(selectors).toEqual(["state", "stat", "s"]);
 });
+
+test.each(["", "not-a-process-row\n", "42\n", "42 ?\n"])(
+  "POSIX process-table lookup rejects malformed output %j",
+  async (output) => {
+    posixProcessTableRuntime.execute = async () => output;
+
+    await expect(readPosixProcessTable()).rejects.toThrow(
+      /process table|supported state selector/i,
+    );
+  },
+);
+
+test("POSIX empty process-table output fails closed as a runnable group", async () => {
+  vi.useFakeTimers();
+  posixProcessTableRuntime.execute = async () => "";
+  const signals: Array<NodeJS.Signals | 0 | undefined> = [];
+  vi.spyOn(process, "kill").mockImplementation(((_pid, signal) => {
+    signals.push(signal as NodeJS.Signals | 0 | undefined);
+    return true;
+  }) as typeof process.kill);
+  const child = {
+    pid: 42,
+    exitCode: null,
+    signalCode: null,
+  } as ChildProcess;
+
+  const termination = terminateProcessTree(child, "darwin");
+  const rejection = expect(termination).rejects.toThrow(
+    /retained runnable members/i,
+  );
+  await vi.advanceTimersByTimeAsync(2_000);
+
+  await rejection;
+  expect(signals).toContain("SIGKILL");
+});
+
+test("POSIX process-table lookup bounds a hung ps execution", async () => {
+  vi.useFakeTimers();
+  posixProcessTableRuntime.execute = async () =>
+    new Promise<string>(() => undefined);
+  vi.spyOn(process, "kill").mockImplementation(((_pid, signal) => {
+    if (signal === 0) return true;
+    return true;
+  }) as typeof process.kill);
+  const child = {
+    pid: 42,
+    exitCode: null,
+    signalCode: null,
+  } as ChildProcess;
+  let outcome: "pending" | "resolved" | "rejected" = "pending";
+  void terminateProcessTree(child, "darwin").then(
+    () => { outcome = "resolved"; },
+    () => { outcome = "rejected"; },
+  );
+
+  await vi.advanceTimersByTimeAsync(5_000);
+
+  expect(outcome).toBe("rejected");
+});
+
+test("POSIX process-table parses zombie and runnable states", async () => {
+  vi.useFakeTimers();
+  let output = " 42 Z+\n";
+  posixProcessTableRuntime.execute = async () => output;
+  let alive = true;
+  const signals: Array<NodeJS.Signals | 0 | undefined> = [];
+  vi.spyOn(process, "kill").mockImplementation(((_pid, signal) => {
+    signals.push(signal as NodeJS.Signals | 0 | undefined);
+    if (signal === 0 && !alive) {
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    }
+    if (signal === "SIGKILL") alive = false;
+    return true;
+  }) as typeof process.kill);
+  const child = {
+    pid: 42,
+    exitCode: null,
+    signalCode: null,
+  } as ChildProcess;
+
+  await expect(terminateProcessTree(child, "darwin")).resolves.toBeUndefined();
+  expect(signals).not.toContain("SIGKILL");
+
+  output = " 42 S+\n";
+  signals.length = 0;
+  alive = true;
+  const runnableTermination = terminateProcessTree(child, "darwin");
+  await vi.advanceTimersByTimeAsync(1_000);
+  await expect(runnableTermination).resolves.toBeUndefined();
+  expect(signals).toContain("SIGKILL");
+});
+
+test.skipIf(process.platform === "win32")(
+  "POSIX process-table lookup ignores a PATH-shadowed ps executable",
+  async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-shadow-ps-"));
+    const marker = join(rootDir, "shadow-ran");
+    const shadow = join(rootDir, "ps");
+    const originalPath = process.env["PATH"];
+
+    try {
+      await writeFile(
+        shadow,
+        `#!/bin/sh\nprintf shadow > ${JSON.stringify(marker)}\nprintf ' 42 S\\n'\n`,
+        "utf8",
+      );
+      await chmod(shadow, 0o700);
+      process.env["PATH"] = `${rootDir}${delimiter}${originalPath ?? ""}`;
+
+      await expect(originalProcessTableExecutor("state")).resolves.toMatch(
+        /\d/u,
+      );
+      await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      if (originalPath === undefined) {
+        delete process.env["PATH"];
+      } else {
+        process.env["PATH"] = originalPath;
+      }
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  },
+);
 
 test.skipIf(process.platform !== "linux")(
   "terminateProcessTree treats a zombie-only process group as terminated",

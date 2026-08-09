@@ -578,6 +578,50 @@ describe("OpenAICodexProvider", () => {
     expect(events.at(-1)).toMatchObject({ type: "error" });
   });
 
+  test("validates the complete final call batch before emitting any call", async () => {
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async () => sseResponse([
+        JSON.stringify({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: {
+            type: "function_call",
+            id: "fc-good",
+            call_id: "call-good",
+            name: "read",
+            arguments: '{"path":"good.txt"}',
+          },
+        }),
+        JSON.stringify({
+          type: "response.output_item.added",
+          output_index: 1,
+          item: {
+            type: "function_call",
+            id: "fc-bad",
+            call_id: "call-bad",
+            name: "read",
+            arguments: "{",
+          },
+        }),
+        JSON.stringify({
+          type: "response.completed",
+          response: { status: "completed" },
+        }),
+      ]),
+    });
+
+    const events = await collect(provider.stream(request()));
+
+    expect(events.filter((event) => event.type === "tool-call")).toEqual([]);
+    expect(events.some((event) => event.type === "done")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { message: expect.stringMatching(/invalid arguments/i) },
+    });
+  });
+
   test("uses a final function item without provisional events", async () => {
     const provider = new OpenAICodexProvider({
       model,

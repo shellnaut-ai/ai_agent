@@ -15,7 +15,7 @@
 - Preserve llama.cpp, OpenAI-compatible, approval, retry, branching, and compaction behavior.
 - Persist user and assistant intent before any mutating tool executes.
 - Never automatically repeat a tool whose prior outcome is unknown.
-- Windows termination covers the exact child PID tree; POSIX termination covers the spawned process group and does not claim escaped-session descendants.
+- Windows termination covers the Job Object-managed process tree; POSIX termination covers the spawned process group and does not claim escaped-session descendants.
 - Every production behavior follows RED → verify failure → GREEN → verify pass.
 - Commit only files belonging to the current task.
 

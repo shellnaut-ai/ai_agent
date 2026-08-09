@@ -276,25 +276,29 @@ interface PendingToolCall {
 function* completeToolCalls(
   calls: ReadonlyMap<number, PendingToolCall>,
 ): Iterable<StreamEvent> {
-  for (const [, call] of [...calls.entries()].sort(
-    ([left], [right]) => left - right,
-  )) {
-    let argumentsValue: unknown;
-    try {
-      argumentsValue = JSON.parse(
-        (call.finalArgumentsText ?? call.argumentsText) || "{}",
-      ) as unknown;
-    } catch {
-      throw malformed(`function call "${call.name}" has invalid arguments`);
-    }
-    yield {
-      type: "tool-call",
-      toolCall: {
-        id: call.id,
-        name: call.name,
-        arguments: argumentsValue,
-      },
-    };
+  const completedCalls = [...calls.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, call]): StreamEvent => {
+      let argumentsValue: unknown;
+      try {
+        argumentsValue = JSON.parse(
+          (call.finalArgumentsText ?? call.argumentsText) || "{}",
+        ) as unknown;
+      } catch {
+        throw malformed(`function call "${call.name}" has invalid arguments`);
+      }
+      return {
+        type: "tool-call",
+        toolCall: {
+          id: call.id,
+          name: call.name,
+          arguments: argumentsValue,
+        },
+      };
+    });
+
+  for (const event of completedCalls) {
+    yield event;
   }
 }
 
