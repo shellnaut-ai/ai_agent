@@ -31,11 +31,27 @@ try {
     ),
   );
 
-  const packed = await runNpm(
-    ["pack", "--json", "--pack-destination", archiveRoot],
-    { cwd: repositoryRoot },
-  );
-  const packResult = JSON.parse(packed.stdout);
+  const packArguments = [
+    "pack",
+    "--json",
+    "--pack-destination",
+    archiveRoot,
+  ];
+  if (process.platform !== "win32") {
+    // Standalone pack/publish intentionally fails closed without the Windows
+    // PowerShell 5.1 provenance compiler. POSIX CI owns an internal package
+    // smoke only: rebuild explicitly, then skip that Windows-only lifecycle.
+    await runNpm(["run", "build"], { cwd: repositoryRoot });
+    packArguments.push("--ignore-scripts");
+  }
+  const packed = await runNpm(packArguments, { cwd: repositoryRoot });
+  const jsonStart = packed.stdout.startsWith("[")
+    ? 0
+    : packed.stdout.lastIndexOf("\n[") + 1;
+  if (jsonStart < 1 && !packed.stdout.startsWith("[")) {
+    throw new Error("npm pack did not emit a JSON manifest.");
+  }
+  const packResult = JSON.parse(packed.stdout.slice(jsonStart));
 
   if (
     !Array.isArray(packResult) ||

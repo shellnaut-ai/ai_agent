@@ -258,6 +258,150 @@ describe("cross-process session writer lock", () => {
     },
   );
 
+  test.skipIf(process.platform !== "linux")(
+    "recovers a same-version lease whose owner is a real zombie",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-writer-zombie-owner-"),
+      );
+      cleanup.push(rootDir);
+      const lockPath = join(rootDir, "session.writer.lock");
+      const token = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const fixture = String.raw`
+import json, os, signal, socket, sys, time
+lock_path, token = sys.argv[1], sys.argv[2]
+zombie = os.fork()
+if zombie == 0:
+    os.mkdir(lock_path)
+    with open(os.path.join(lock_path, "owner.json"), "w", encoding="utf-8") as output:
+        json.dump({
+            "version": 1,
+            "token": token,
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+        }, output)
+        output.write("\n")
+        output.flush()
+        os.fsync(output.fileno())
+    os._exit(0)
+
+def reap_and_exit(_signal, _frame):
+    os.waitpid(zombie, 0)
+    sys.exit(0)
+
+signal.signal(signal.SIGUSR1, reap_and_exit)
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    try:
+        with open(f"/proc/{zombie}/stat", "r", encoding="utf-8") as source:
+            stat = source.read()
+        if stat[stat.rfind(")") + 2] == "Z":
+            print(f"zombie:{zombie}", flush=True)
+            break
+    except FileNotFoundError:
+        pass
+    time.sleep(0.01)
+else:
+    raise RuntimeError("child did not become a zombie")
+
+while True:
+    signal.pause()
+`;
+      const holder = spawn("python3", ["-c", fixture, lockPath, token], {
+        env: process.env,
+        stdio: ["pipe", "pipe", "pipe"],
+      }) as ChildProcessWithoutNullStreams;
+      children.add(holder);
+      try {
+        await expect(waitForLine(holder, /^zombie:\d+$/u)).resolves.toMatch(
+          /^zombie:\d+$/u,
+        );
+        let callbackEntered = false;
+
+        await expect(
+          withSessionWriterLock(lockPath, async () => {
+            callbackEntered = true;
+            return "recovered-zombie";
+          }, { timeoutMs: 1_000 }),
+        ).resolves.toBe("recovered-zombie");
+        expect(callbackEntered).toBe(true);
+        expect(await readdir(rootDir)).toEqual([
+          `session.writer.lock.reaped-${token}`,
+        ]);
+      } finally {
+        holder.kill("SIGUSR1");
+        await waitForClose(holder);
+        children.delete(holder);
+      }
+    },
+    15_000,
+  );
+
+  test(
+    "fails closed when portable owner-state inspection is uncertain",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-writer-state-uncertain-"),
+      );
+      cleanup.push(rootDir);
+      const lockPath = join(rootDir, "session.writer.lock");
+      const callbackMarker = join(rootDir, "callback-entered");
+      const writerLockUrl = pathToFileURL(
+        resolve("src/session/writer-lock.ts"),
+      ).href;
+      const processTreeUrl = pathToFileURL(
+        resolve("src/tools/process-tree.ts"),
+      ).href;
+      const script = `
+        import { mkdir, writeFile } from "node:fs/promises";
+        import { hostname } from "node:os";
+        Object.defineProperty(process, "platform", {
+          configurable: true,
+          value: "darwin",
+        });
+        const { posixProcessStateRuntime } = await import(
+          ${JSON.stringify(processTreeUrl)});
+        const { withSessionWriterLock } = await import(
+          ${JSON.stringify(writerLockUrl)});
+        await mkdir(process.argv[1]);
+        await writeFile(
+          process.argv[1] + "/owner.json",
+          JSON.stringify({
+            version: 1,
+            token: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            pid: process.pid,
+            host: hostname(),
+          }) + "\\n",
+          "utf8",
+        );
+        posixProcessStateRuntime.execute = async () => {
+          throw Object.assign(new Error("simulated ps permission failure"), {
+            code: "EACCES",
+          });
+        };
+        try {
+          await withSessionWriterLock(process.argv[1], async () => {
+            await writeFile(process.argv[2], "entered\\n", "utf8");
+          }, { timeoutMs: 100 });
+          process.stdout.write("unexpected-success\\n");
+        } catch (error) {
+          process.stdout.write("error:" + error.message + "\\n");
+        }
+      `;
+      const contender = spawnNode(script, [lockPath, callbackMarker]);
+
+      await expect(waitForLine(contender, /^error:/u)).resolves.toMatch(
+        /lock|acquisition/i,
+      );
+      await waitForClose(contender);
+      children.delete(contender);
+      await expect(access(callbackMarker)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      expect(await readdir(lockPath)).toEqual(["owner.json"]);
+    },
+  );
+
   test("does not steal a live lease and recovers after its owner process dies", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-writer-lock-"));
     cleanup.push(rootDir);

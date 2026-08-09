@@ -579,6 +579,82 @@ function Get-PeHeaderManifest([byte[]]$bytes) {
   }
 }
 
+function Find-ByteSequenceOffsets([byte[]]$bytes, [byte[]]$sequence) {
+  if ($sequence.Length -eq 0) {
+    throw "Cannot locate an empty sequence in the reviewed helper image."
+  }
+
+  for (
+    $offset = 0;
+    $offset -le ($bytes.Length - $sequence.Length);
+    $offset += 1
+  ) {
+    $matches = $true
+    for ($index = 0; $index -lt $sequence.Length; $index += 1) {
+      if ($bytes[$offset + $index] -ne $sequence[$index]) {
+        $matches = $false
+        break
+      }
+    }
+    if ($matches) { Write-Output $offset }
+  }
+}
+
+function Get-NormalizedWholePeImage(
+  [byte[]]$bytes,
+  [Reflection.Assembly]$assembly
+) {
+  $normalized = New-Object byte[] $bytes.Length
+  [Array]::Copy($bytes, 0, $normalized, 0, $bytes.Length)
+
+  $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+  Assert-ByteRange $bytes $peOffset 24 "PE signature and COFF header"
+  if ((Read-PeUInt32 $bytes $peOffset "PE signature") -ne 0x00004550) {
+    throw "Reviewed helper does not have a PE signature."
+  }
+  # Windows PowerShell 5.1's compiler varies this four-byte build timestamp.
+  [Array]::Clear($normalized, [int]($peOffset + 8), 4)
+
+  $mvid = $assembly.ManifestModule.ModuleVersionId
+  $mvidBytes = $mvid.ToByteArray()
+  $mvidOffsets = @(Find-ByteSequenceOffsets $bytes $mvidBytes)
+  if ($mvidOffsets.Count -ne 1) {
+    throw "Reviewed helper image must contain exactly one MVID GUID value."
+  }
+  [Array]::Clear($normalized, [int]$mvidOffsets[0], $mvidBytes.Length)
+
+  $privateTypes = @($assembly.GetTypes() | Where-Object {
+    $_.FullName -match '^<PrivateImplementationDetails>\{[0-9A-Fa-f-]{36}\}$'
+  })
+  if ($privateTypes.Count -gt 1) {
+    throw "Reviewed helper has multiple MVID-derived private implementation types."
+  }
+  if ($privateTypes.Count -eq 1) {
+    $privatePrefix = '<PrivateImplementationDetails>{'
+    $expectedPrivateName =
+      "$privatePrefix$($mvid.ToString('D').ToUpperInvariant())}"
+    if (![string]::Equals(
+        $privateTypes[0].FullName,
+        $expectedPrivateName,
+        [StringComparison]::Ordinal)) {
+      throw "Reviewed helper private implementation type is not MVID-derived."
+    }
+    $privateNameBytes = [Text.Encoding]::ASCII.GetBytes($expectedPrivateName)
+    $privateNameOffsets = @(
+      Find-ByteSequenceOffsets $bytes $privateNameBytes
+    )
+    if ($privateNameOffsets.Count -ne 1) {
+      throw "Reviewed helper image must contain exactly one MVID-derived private type name."
+    }
+    [Array]::Clear(
+      $normalized,
+      [int]($privateNameOffsets[0] + $privatePrefix.Length),
+      36)
+  }
+
+  return [Convert]::ToBase64String($normalized)
+}
+
 function Get-AssemblyManifest([Reflection.Assembly]$assembly) {
   $resources = @($assembly.GetManifestResourceNames() | Sort-Object |
     ForEach-Object {
@@ -696,6 +772,15 @@ try {
   }
   $committedAssembly = [Reflection.Assembly]::Load($committedBytes)
   $freshAssembly = [Reflection.Assembly]::Load($freshBytes)
+  $committedWholeImage = Get-NormalizedWholePeImage `
+    $committedBytes $committedAssembly
+  $freshWholeImage = Get-NormalizedWholePeImage $freshBytes $freshAssembly
+  if (![string]::Equals(
+      $committedWholeImage,
+      $freshWholeImage,
+      [StringComparison]::Ordinal)) {
+    throw "Reviewed helper normalized whole PE image differs from source."
+  }
   $committedManifest = Get-AssemblyManifest $committedAssembly |
     ConvertTo-Json -Depth 100 -Compress
   $freshManifest = Get-AssemblyManifest $freshAssembly |

@@ -12,6 +12,8 @@ import {
 import { hostname } from "node:os";
 import { join } from "node:path";
 
+import { posixProcessIsRunnable } from "../tools/process-tree.js";
+
 export interface SessionWriterLockOptions {
   readonly timeoutMs?: number;
 }
@@ -307,7 +309,7 @@ async function recoverAbandonedPosixLease(lockPath: string): Promise<void> {
   if (details.isDirectory()) {
     const record = await readPosixLeaseRecord(lockPath);
 
-    if (record === undefined || posixOwnerMayBeAlive(record)) {
+    if (record === undefined || await posixOwnerMayBeAlive(record)) {
       return;
     }
 
@@ -423,16 +425,26 @@ async function readPosixLeaseRecord(
   };
 }
 
-function posixOwnerMayBeAlive(record: PosixLeaseRecord): boolean {
+async function posixOwnerMayBeAlive(
+  record: PosixLeaseRecord,
+): Promise<boolean> {
   if (record.host !== hostname()) {
     return true;
   }
 
   try {
     process.kill(record.pid, 0);
-    return true;
   } catch (error: unknown) {
     return !isErrorCode(error, "ESRCH");
+  }
+
+  try {
+    return await posixProcessIsRunnable(record.pid, process.platform);
+  } catch {
+    // State inspection is advisory. Unsupported ps selectors, permission
+    // errors, timeouts, and malformed output must never reap a possibly live
+    // owner; a later retry can observe an unambiguous ESRCH/dead state.
+    return true;
   }
 }
 

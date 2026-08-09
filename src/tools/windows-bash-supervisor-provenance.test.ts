@@ -64,7 +64,9 @@ test.skipIf(process.platform !== "win32")(
 
         await expect(
           runVerifier(tamperedSource, canonicalPayload),
-        ).rejects.toThrow(/semantic manifest differs from source/i);
+        ).rejects.toThrow(
+          /(?:semantic manifest|normalized whole PE image) differs from source/i,
+        );
       }
 
       const canonicalPayloadText = await readFile(canonicalPayload, "utf8");
@@ -113,6 +115,33 @@ test.skipIf(process.platform !== "win32")(
       await expect(
         runVerifier(canonicalSource, peHeaderTamperedPayload),
       ).rejects.toThrow(/PE\/COFF\/CLR header manifest differs/i);
+
+      const sections = readPeSections(peHeaderTamperedBytes);
+      for (const sectionName of [".text", ".rsrc", ".reloc"] as const) {
+        const section = sections.get(sectionName);
+        expect(section, `${sectionName} section is required`).toBeDefined();
+        const sectionTamperedBytes = Buffer.from(
+          Buffer.from(canonicalBase64, "base64"),
+        );
+        const mutationOffset = section!.rawOffset + section!.rawSize - 1;
+        expect(mutationOffset).toBeLessThan(sectionTamperedBytes.length);
+        sectionTamperedBytes[mutationOffset] =
+          (sectionTamperedBytes[mutationOffset] ?? 0) ^ 0x01;
+        const sectionTamperedPayload = join(
+          rootDir,
+          `${sectionName.slice(1)}-body-payload.ts`,
+        );
+        await writeFile(
+          sectionTamperedPayload,
+          serializePayload(sectionTamperedBytes),
+          "utf8",
+        );
+
+        await expect(
+          runVerifier(canonicalSource, sectionTamperedPayload),
+          `${sectionName} body mutation must be bound to reviewed source`,
+        ).rejects.toThrow(/normalized whole PE image differs/i);
+      }
     } finally {
       await rm(rootDir, { recursive: true, force: true });
     }
@@ -138,6 +167,32 @@ function serializePayload(bytes: Buffer): string {
     '].join("");',
     "",
   ].join("\n");
+}
+
+function readPeSections(
+  bytes: Buffer,
+): Map<string, { readonly rawOffset: number; readonly rawSize: number }> {
+  const peOffset = bytes.readUInt32LE(0x3c);
+  const sectionCount = bytes.readUInt16LE(peOffset + 6);
+  const optionalHeaderSize = bytes.readUInt16LE(peOffset + 20);
+  const sectionTableOffset = peOffset + 24 + optionalHeaderSize;
+  const sections = new Map<
+    string,
+    { readonly rawOffset: number; readonly rawSize: number }
+  >();
+
+  for (let index = 0; index < sectionCount; index += 1) {
+    const offset = sectionTableOffset + index * 40;
+    const name = bytes
+      .toString("ascii", offset, offset + 8)
+      .replace(/\0+$/u, "");
+    sections.set(name, {
+      rawSize: bytes.readUInt32LE(offset + 16),
+      rawOffset: bytes.readUInt32LE(offset + 20),
+    });
+  }
+
+  return sections;
 }
 
 function runVerifier(sourcePath: string, payloadPath: string): Promise<string> {

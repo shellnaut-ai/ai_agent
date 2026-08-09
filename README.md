@@ -26,6 +26,10 @@ npm run check
 Vitest는 helper source와 실행 payload의 normalized semantic manifest도 재검증한다.
 Node.js 22 이상이 필요하다.
 
+`npm pack`/`npm publish`의 `prepack`은 Windows PowerShell 5.1 helper provenance
+검증 뒤에만 build를 수행한다. 따라서 릴리스 패키지는 Windows에서 생성해야 하며,
+다른 OS의 standalone pack/publish는 verifier를 건너뛰지 않고 fail closed한다.
+
 ## CLI
 
 ```powershell

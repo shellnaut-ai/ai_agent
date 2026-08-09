@@ -21,7 +21,7 @@
     "dev": "tsx src/demo.ts",
     "prebuild": "npm run clean",
     "precli": "npm run build",
-    "prepack": "npm run build",
+    "prepack": "npm run verify:windows-helper && npm run build",
     "smoke:cli-eof": "node scripts/smoke-cli-eof.mjs",
     "smoke:package-dist": "node scripts/smoke-package-dist.mjs",
     "test": "vitest run --passWithNoTests",
