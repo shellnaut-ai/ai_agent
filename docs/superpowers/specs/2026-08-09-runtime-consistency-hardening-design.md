@@ -230,8 +230,8 @@ provider serialization 오류로 종료한다.
 6. compaction으로 message index가 바뀐 뒤에도 kept assistant의 reasoning과 function-call
    item `id`가 포함되는 test.
 7. malformed providerState JSONL을 line number와 함께 거부하는 test.
-8. timeout, output limit, AbortSignal에서 Windows child tree 또는 POSIX process group이
-   종료되는 test.
+8. timeout, output limit, AbortSignal에서 Windows Job Object가 관리하는 프로세스 또는
+   POSIX process group이 종료되는 test.
 9. user append, assistant checkpoint, tool-result append, final assistant checkpoint 각각의
    저장 실패가 이후 상태 전이를 중단하는 test.
 10. 기존 전체 `npm run check` 회귀 검사.
