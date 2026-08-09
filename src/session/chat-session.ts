@@ -44,6 +44,26 @@ export class ChatSession {
       content: userContent,
     };
 
+    try {
+      const recovered = await this.session.recoverInterruptedToolCalls();
+
+      if (recovered.length > 0) {
+        yield {
+          type: "session-recovery",
+          recoveredToolCallIds: recovered.map(
+            (message) => message.toolCallId,
+          ),
+        };
+      }
+    } catch (error: unknown) {
+      yield {
+        type: "error",
+        reason: "error",
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+      return;
+    }
+
     if (this.compactionService) {
       let preparation;
 
@@ -98,25 +118,40 @@ export class ChatSession {
       }
     }
 
+    try {
+      await this.session.appendMessage(newMessage);
+    } catch (error: unknown) {
+      yield {
+        type: "error",
+        reason: "error",
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+      return;
+    }
+
     const request = {
       model: this.model,
-      messages: [
-        ...this.session.buildActiveMessages(),
-        newMessage,
-      ],
+      messages: [...this.session.buildActiveMessages()],
     };
 
     for await (const event of this.agentLoop.stream(request, options)) {
-      if (event.type === "done") {
-        const completedMessages: Message[] = [
-          newMessage,
-          ...event.newMessages.map((message) => ({
-            ...message,
-          })),
-        ];
-
+      if (event.type === "message-checkpoint") {
         try {
-          await this.session.appendMessages(completedMessages);
+          await this.session.appendMessage(event.message);
+        } catch (error: unknown) {
+          yield {
+            type: "error",
+            reason: "error",
+            error: error instanceof Error ? error : new Error(String(error)),
+          };
+
+          return;
+        }
+      }
+
+      if (event.type === "tool-result") {
+        try {
+          await this.session.appendMessage(event.message);
         } catch (error: unknown) {
           yield {
             type: "error",

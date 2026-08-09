@@ -99,6 +99,12 @@ describe("main capability baseline", () => {
         content: 'Tool "write-test" was denied by the user.',
         isError: true,
       },
+      message: {
+        role: "tool",
+        toolCallId: "write-1",
+        content: 'Tool "write-test" was denied by the user.',
+        isError: true,
+      },
     });
     expect(events.at(-1)).toMatchObject({
       type: "done",

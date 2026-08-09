@@ -124,11 +124,12 @@ export class AgentLoop {
           }
 
           if (event.type === "tool-call") {
-            toolCalls.push(event.toolCall);
+            const toolCall = structuredClone(event.toolCall);
+            toolCalls.push(toolCall);
 
             yield {
               type: "tool-call",
-              toolCall: event.toolCall,
+              toolCall: structuredClone(toolCall),
             };
 
             continue;
@@ -146,7 +147,10 @@ export class AgentLoop {
 
           if (event.type === "done") {
             terminalReason = event.reason;
-            terminalProviderState = event.providerState;
+            terminalProviderState =
+              event.providerState === undefined
+                ? undefined
+                : structuredClone(event.providerState);
 
             break;
           }
@@ -212,6 +216,11 @@ export class AgentLoop {
             : { providerState: terminalProviderState }),
         };
 
+        yield {
+          type: "message-checkpoint",
+          message: structuredClone(assistantMessage),
+        };
+
         workingMessages.push(assistantMessage);
 
         newMessages.push(assistantMessage);
@@ -270,14 +279,15 @@ export class AgentLoop {
             isError: result.isError,
           };
 
-          workingMessages.push(resultMessage);
-
-          newMessages.push(resultMessage);
-
           yield {
             type: "tool-result",
             result,
+            message: structuredClone(resultMessage),
           };
+
+          workingMessages.push(resultMessage);
+
+          newMessages.push(resultMessage);
         }
       }
 

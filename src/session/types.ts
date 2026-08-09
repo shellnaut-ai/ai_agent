@@ -82,4 +82,8 @@ export type ChatEvent =
       readonly type: "compaction-done";
       readonly tokensBefore: number;
       readonly tokensAfter: number;
+    }
+  | {
+      readonly type: "session-recovery";
+      readonly recoveredToolCallIds: readonly string[];
     };
