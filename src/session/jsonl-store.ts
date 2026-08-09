@@ -3,6 +3,7 @@ import {
   appendFile,
   mkdir,
   readFile,
+  truncate,
   writeFile,
 } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -39,6 +40,41 @@ interface EntryBaseFields {
   readonly id: string;
   readonly parentId: string | null;
   readonly timestamp: string;
+}
+
+interface JsonlSourceLine {
+  readonly line: string;
+  readonly lineNumber: number;
+  readonly startOffset: number;
+  readonly terminated: boolean;
+}
+
+function splitJsonlSourceLines(content: string): JsonlSourceLine[] {
+  const lines: JsonlSourceLine[] = [];
+  let startOffset = 0;
+  let lineNumber = 1;
+
+  while (startOffset < content.length) {
+    const newlineOffset = content.indexOf("\n", startOffset);
+    const terminated = newlineOffset >= 0;
+    const endOffset = terminated ? newlineOffset : content.length;
+    let line = content.slice(startOffset, endOffset);
+
+    if (line.endsWith("\r")) {
+      line = line.slice(0, -1);
+    }
+
+    lines.push({ line, lineNumber, startOffset, terminated });
+
+    if (!terminated) {
+      break;
+    }
+
+    startOffset = newlineOffset + 1;
+    lineNumber += 1;
+  }
+
+  return lines;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -518,12 +554,7 @@ export class JsonlSessionStore implements SessionStore {
       };
     }
 
-    const lines = content
-      .split(/\r?\n/)
-      .map((line, index) => ({
-        line,
-        lineNumber: index + 1,
-      }))
+    const lines = splitJsonlSourceLines(content)
       .filter(({ line }) => line.trim().length > 0);
 
     if (lines.length === 0) {
@@ -567,15 +598,26 @@ export class JsonlSessionStore implements SessionStore {
     const nextEntriesById = new Map<string, SessionEntry>();
     const approvalKeys = new Set<string>();
     let nextLeafId: string | null = null;
+    let repairedIncompleteTail = false;
 
     for (let index = 1; index < lines.length; index += 1) {
-      const { line, lineNumber } = lines[index];
+      const {
+        line,
+        lineNumber,
+        startOffset,
+        terminated,
+      } = lines[index];
       let value: unknown;
 
       try {
         value = JSON.parse(line);
       } catch {
-        if (index === lines.length - 1) {
+        if (index === lines.length - 1 && !terminated) {
+          await truncate(
+            this.filePath,
+            Buffer.byteLength(content.slice(0, startOffset), "utf8"),
+          );
+          repairedIncompleteTail = true;
           break;
         }
 
@@ -628,6 +670,10 @@ export class JsonlSessionStore implements SessionStore {
       nextEntries.push(storedEntry);
       nextEntriesById.set(storedEntry.id, storedEntry);
       nextLeafId = leafIdAfterEntry(storedEntry);
+    }
+
+    if (!repairedIncompleteTail && !content.endsWith("\n")) {
+      await appendFile(this.filePath, "\n", { encoding: "utf8" });
     }
 
     this.entries = nextEntries;

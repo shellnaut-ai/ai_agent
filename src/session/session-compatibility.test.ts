@@ -1,4 +1,10 @@
-import { appendFile, mkdtemp, rm } from "node:fs/promises";
+import {
+  appendFile,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -272,6 +278,117 @@ describe("session compatibility", () => {
         model,
       }).load(),
     ).rejects.toThrow("line 2");
+  });
+
+  test("repairs an incomplete final JSON record before later checkpoint writes", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-session-"));
+    cleanup.push(rootDir);
+    const store = new JsonlSessionStore({
+      rootDir,
+      sessionId: "incomplete-tail",
+      model,
+    });
+    await store.load();
+    await new Session(store).appendMessage({
+      role: "user",
+      content: "preserve me",
+    });
+    await appendFile(
+      store.filePath,
+      '{"type":"message","id":"torn',
+      "utf8",
+    );
+
+    const resumedStore = new JsonlSessionStore({
+      rootDir,
+      sessionId: "incomplete-tail",
+      model,
+    });
+    await resumedStore.load();
+    await new Session(resumedStore).appendMessage({
+      role: "assistant",
+      content: "durable answer",
+      toolCalls: [],
+    });
+
+    const freshStore = new JsonlSessionStore({
+      rootDir,
+      sessionId: "incomplete-tail",
+      model,
+    });
+    await freshStore.load();
+    expect(new Session(freshStore).getMessages()).toEqual([
+      { role: "user", content: "preserve me" },
+      {
+        role: "assistant",
+        content: "durable answer",
+        toolCalls: [],
+      },
+    ]);
+    expect(await readFile(store.filePath, "utf8")).not.toContain('"torn');
+  });
+
+  test("rejects a malformed newline-terminated final record without overwriting it", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-session-"));
+    cleanup.push(rootDir);
+    const store = new JsonlSessionStore({
+      rootDir,
+      sessionId: "malformed-complete-tail",
+      model,
+    });
+    await store.load();
+    await new Session(store).appendMessage({
+      role: "user",
+      content: "valid prefix",
+    });
+    await appendFile(store.filePath, '{"type":not-json}\n', "utf8");
+    const beforeLoad = await readFile(store.filePath, "utf8");
+
+    await expect(
+      new JsonlSessionStore({
+        rootDir,
+        sessionId: "malformed-complete-tail",
+        model,
+      }).load(),
+    ).rejects.toThrow("line 3");
+    expect(await readFile(store.filePath, "utf8")).toBe(beforeLoad);
+  });
+
+  test("normalizes a valid final record without a newline before appending", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-session-"));
+    cleanup.push(rootDir);
+    const store = new JsonlSessionStore({
+      rootDir,
+      sessionId: "missing-final-newline",
+      model,
+    });
+    await store.load();
+    await new Session(store).appendMessage({
+      role: "user",
+      content: "valid prefix",
+    });
+    const withNewline = await readFile(store.filePath, "utf8");
+    await writeFile(store.filePath, withNewline.slice(0, -1), "utf8");
+
+    const resumedStore = new JsonlSessionStore({
+      rootDir,
+      sessionId: "missing-final-newline",
+      model,
+    });
+    await resumedStore.load();
+    await new Session(resumedStore).appendMessage({
+      role: "assistant",
+      content: "next record",
+      toolCalls: [],
+    });
+
+    const freshStore = new JsonlSessionStore({
+      rootDir,
+      sessionId: "missing-final-newline",
+      model,
+    });
+    await freshStore.load();
+    expect(new Session(freshStore).getMessages()).toHaveLength(2);
   });
 
   test("does not expose messages when persistence fails", async () => {

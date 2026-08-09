@@ -41,6 +41,18 @@ const interruptedToolResultContent =
   "The outcome is unknown. Inspect workspace state before retrying " +
   "this operation.";
 
+export class InterruptedToolRecoveryError extends Error {
+  readonly recoveredMessages: readonly ToolResultMessage[];
+
+  constructor(
+    cause: unknown,
+    recoveredMessages: readonly ToolResultMessage[],
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.recoveredMessages = structuredClone(recoveredMessages);
+  }
+}
+
 function getBranchToolCallState(
   entries: readonly SessionEntry[],
 ): BranchToolCallState {
@@ -284,7 +296,12 @@ export class Session {
         isError: true,
       };
 
-      await this.appendMessage(message);
+      try {
+        await this.appendMessage(message);
+      } catch (error: unknown) {
+        throw new InterruptedToolRecoveryError(error, recovered);
+      }
+
       recovered.push(structuredClone(message));
     }
 

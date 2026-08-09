@@ -1,3 +1,7 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, test, vi } from "vitest";
 
 import { AuthRequiredError } from "../auth/oauth-resolver.js";
@@ -8,6 +12,8 @@ import type {
   StreamEvent,
 } from "../model/types.js";
 import type { ToolCall } from "../tools/types.js";
+import { JsonlSessionStore } from "../session/jsonl-store.js";
+import { Session } from "../session/session.js";
 import { OpenAICodexProvider } from "./openai-codex-provider.js";
 
 const credential: OAuthCredential = {
@@ -279,6 +285,88 @@ describe("OpenAICodexProvider", () => {
       id: "fc_1",
       call_id: "call-1",
     }));
+  });
+
+  test("replays durable Codex state after restart recovery of a missing tool result", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "pi-clone-codex-recovery-"));
+
+    try {
+      const firstProvider = new OpenAICodexProvider({
+        model,
+        resolver: { resolve: async () => credential },
+        fetch: async () => replayResponse(),
+      });
+      const firstEvents = await collect(firstProvider.stream({
+        model,
+        messages: [{ role: "user", content: "read a.txt" }],
+        tools: [],
+      }));
+      const assistant = assistantFrom(firstEvents);
+
+      const initialStore = new JsonlSessionStore({
+        rootDir,
+        sessionId: "restart-recovery",
+        model,
+      });
+      await initialStore.load();
+      const initialSession = new Session(initialStore);
+      await initialSession.appendMessage({
+        role: "user",
+        content: "read a.txt",
+      });
+      await initialSession.appendMessage(assistant);
+
+      const restartedStore = new JsonlSessionStore({
+        rootDir,
+        sessionId: "restart-recovery",
+        model,
+      });
+      await restartedStore.load();
+      const restartedSession = new Session(restartedStore);
+      await expect(restartedSession.recoverInterruptedToolCalls())
+        .resolves.toEqual([
+          expect.objectContaining({
+            role: "tool",
+            toolCallId: "call-1",
+            isError: true,
+          }),
+        ]);
+
+      let captured: Request | undefined;
+      const restoredProvider = new OpenAICodexProvider({
+        model,
+        resolver: { resolve: async () => credential },
+        fetch: async (input, init) => {
+          captured = new Request(input, init);
+          return terminalResponse();
+        },
+      });
+      await collect(restoredProvider.stream({
+        model,
+        messages: [...restartedSession.buildActiveMessages()],
+        tools: [],
+      }));
+
+      const input = await requestInput(captured);
+      expect(input).toContainEqual({
+        type: "reasoning",
+        id: "rs_1",
+        summary: [],
+        encrypted_content: "encrypted",
+      });
+      expect(input).toContainEqual(expect.objectContaining({
+        type: "function_call",
+        id: "fc_1",
+        call_id: "call-1",
+      }));
+      expect(input).toContainEqual(expect.objectContaining({
+        type: "function_call_output",
+        call_id: "call-1",
+        output: expect.stringContaining("outcome is unknown"),
+      }));
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
   });
 
   test("replays Codex metadata when compaction shifts the assistant message index", async () => {

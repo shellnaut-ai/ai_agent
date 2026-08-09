@@ -3,7 +3,7 @@ import type { AgentLoopOptions } from "../agent/types.js";
 import { CompactionService } from "../context/compaction.js";
 import type { Message, Model, UserMessage } from "../model/types.js";
 import type { ToolDefinition } from "../tools/types.js";
-import { Session } from "./session.js";
+import { InterruptedToolRecoveryError, Session } from "./session.js";
 import type { ChatEvent } from "./types.js";
 
 export interface ChatSessionOptions {
@@ -18,6 +18,7 @@ export class ChatSession {
   private readonly session: Session;
   private readonly compactionService: CompactionService | undefined;
   private readonly toolDefinitions: readonly ToolDefinition[];
+  private turnActive = false;
 
   constructor(
     agentLoop: AgentLoop,
@@ -39,6 +40,28 @@ export class ChatSession {
     userContent: string,
     options?: AgentLoopOptions,
   ): AsyncIterable<ChatEvent> {
+    if (this.turnActive) {
+      yield {
+        type: "error",
+        reason: "error",
+        error: new Error("ChatSession already has an active turn."),
+      };
+      return;
+    }
+
+    this.turnActive = true;
+
+    try {
+      yield* this.streamTurnUnlocked(userContent, options);
+    } finally {
+      this.turnActive = false;
+    }
+  }
+
+  private async *streamTurnUnlocked(
+    userContent: string,
+    options?: AgentLoopOptions,
+  ): AsyncIterable<ChatEvent> {
     const newMessage: UserMessage = {
       role: "user",
       content: userContent,
@@ -56,10 +79,27 @@ export class ChatSession {
         };
       }
     } catch (error: unknown) {
+      if (
+        error instanceof InterruptedToolRecoveryError &&
+        error.recoveredMessages.length > 0
+      ) {
+        yield {
+          type: "session-recovery",
+          recoveredToolCallIds: error.recoveredMessages.map(
+            (message) => message.toolCallId,
+          ),
+        };
+      }
+
       yield {
         type: "error",
         reason: "error",
-        error: error instanceof Error ? error : new Error(String(error)),
+        error:
+          error instanceof InterruptedToolRecoveryError
+            ? new Error(error.message)
+            : error instanceof Error
+              ? error
+              : new Error(String(error)),
       };
       return;
     }

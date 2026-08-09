@@ -5,6 +5,48 @@ import type { ChatEvent } from "../session/types.js";
 import { runChat } from "./chat.js";
 
 describe("runChat", () => {
+  test("prints a partial recovery warning before its persistence error", async () => {
+    const output: string[] = [];
+    const errors: string[] = [];
+    const inputs = ["continue", "/exit"];
+    const io = {
+      async question(): Promise<string | undefined> {
+        return inputs.shift();
+      },
+      write(content: string): void {
+        output.push(content);
+      },
+      writeError(content: string): void {
+        errors.push(content);
+      },
+      onEscape(): () => void {
+        return () => undefined;
+      },
+      onInterrupt(): () => void {
+        return () => undefined;
+      },
+    };
+    const session = {
+      async *streamTurn(): AsyncIterable<ChatEvent> {
+        yield {
+          type: "session-recovery",
+          recoveredToolCallIds: ["call-1"],
+        };
+        yield {
+          type: "error",
+          reason: "error",
+          error: new Error("second recovery append failed"),
+        };
+      },
+    };
+
+    await runChat(session, io);
+
+    expect(output.join("").match(/call-1 outcome is unknown/g))
+      .toHaveLength(1);
+    expect(errors.join("")).toContain("second recovery append failed");
+  });
+
   test("reports each recovered tool call as an unknown outcome", async () => {
     const output: string[] = [];
     const inputs = ["continue", "/exit"];

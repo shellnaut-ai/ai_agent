@@ -84,7 +84,7 @@ export class AgentLoop {
       for (let step = 0; step < maxSteps; step += 1) {
         const modelRequest: ModelRequest = {
           model: request.model,
-          messages: workingMessages,
+          messages: structuredClone(workingMessages),
           tools: definitions,
         };
 
@@ -247,7 +247,7 @@ export class AgentLoop {
             const decision = this.approvalHandler
               ? await this.approvalHandler.requestApproval(
                   {
-                    toolCall: preparation.executableCall,
+                    toolCall: structuredClone(preparation.executableCall),
                     definition: preparation.tool.definition,
                   },
                   {

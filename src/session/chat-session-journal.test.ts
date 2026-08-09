@@ -153,6 +153,94 @@ function createToolThenRunner(
 }
 
 describe("ChatSession incremental journal", () => {
+  test("rejects a concurrent turn until the active consumer returns", async () => {
+    const { store } = await createStore("single-flight");
+    let providerCalls = 0;
+    const runner: ModelStreamRunner = {
+      async *stream(): AsyncIterable<StreamEvent> {
+        providerCalls += 1;
+        yield { type: "start" };
+        yield { type: "done", reason: "stop" };
+      },
+    };
+    const chat = new ChatSession(
+      new AgentLoop(runner, new ToolRegistry()),
+      model,
+      { session: new Session(store) },
+    );
+    const first = chat.streamTurn("first")[Symbol.asyncIterator]();
+
+    await expect(first.next()).resolves.toEqual({
+      done: false,
+      value: { type: "start" },
+    });
+    await expect(collect(chat.streamTurn("concurrent"))).resolves.toEqual([
+      {
+        type: "error",
+        reason: "error",
+        error: new Error("ChatSession already has an active turn."),
+      },
+    ]);
+    expect(providerCalls).toBe(0);
+
+    await first.return?.();
+    const afterReturn = await collect(chat.streamTurn("after return"));
+
+    expect(afterReturn.at(-1)).toMatchObject({
+      type: "done",
+      reason: "stop",
+    });
+    expect(providerCalls).toBe(1);
+  });
+
+  test("releases the turn guard after persistence, abort, Provider error, and success", async () => {
+    const { store } = await createStore("single-flight-release");
+    let providerCalls = 0;
+    const runner: ModelStreamRunner = {
+      async *stream(): AsyncIterable<StreamEvent> {
+        providerCalls += 1;
+        yield { type: "start" };
+
+        if (providerCalls === 1) {
+          yield {
+            type: "error",
+            reason: "error",
+            error: new Error("provider failed"),
+          };
+          return;
+        }
+
+        yield { type: "done", reason: "stop" };
+      },
+    };
+    const chat = new ChatSession(
+      new AgentLoop(runner, new ToolRegistry()),
+      model,
+      { session: new Session(store) },
+    );
+    store.failMessageAppend("user", 1);
+
+    expect((await collect(chat.streamTurn("persistence failure"))).at(-1))
+      .toMatchObject({ type: "error", reason: "error" });
+
+    const controller = new AbortController();
+    controller.abort();
+    expect((await collect(
+      chat.streamTurn("aborted", { signal: controller.signal }),
+    )).at(-1)).toMatchObject({ type: "error", reason: "aborted" });
+
+    expect((await collect(chat.streamTurn("provider failure"))).at(-1))
+      .toMatchObject({
+        type: "error",
+        error: { message: "provider failed" },
+      });
+    expect((await collect(chat.streamTurn("success"))).at(-1))
+      .toMatchObject({ type: "done", reason: "stop" });
+    expect((await collect(chat.streamTurn("after success"))).at(-1))
+      .toMatchObject({ type: "done", reason: "stop" });
+    expect(providerCalls).toBe(3);
+  });
+
   test("does not execute a mutating tool when its assistant checkpoint append fails", async () => {
     const { rootDir, store } = await createStore("checkpoint-failure");
     const session = new Session(store);
@@ -502,6 +590,64 @@ describe("ChatSession incremental journal", () => {
         ],
       },
     ]);
+  });
+
+  test("reports each partial recovery exactly once across an append failure", async () => {
+    const { store } = await createStore("partial-recovery-reporting");
+    const session = new Session(store);
+    await session.appendMessage({ role: "user", content: "run both" });
+    await session.appendMessage({
+      role: "assistant",
+      content: "",
+      toolCalls: [
+        { id: "call-1", name: "write-test", arguments: {} },
+        { id: "call-2", name: "write-test", arguments: {} },
+      ],
+    });
+    let providerCalls = 0;
+    const runner: ModelStreamRunner = {
+      async *stream(): AsyncIterable<StreamEvent> {
+        providerCalls += 1;
+        yield { type: "start" };
+        yield { type: "done", reason: "stop" };
+      },
+    };
+    const chat = new ChatSession(
+      new AgentLoop(runner, new ToolRegistry()),
+      model,
+      { session },
+    );
+    store.failMessageAppend("tool", 2);
+
+    const firstAttempt = await collect(chat.streamTurn("blocked turn"));
+
+    expect(firstAttempt).toEqual([
+      {
+        type: "session-recovery",
+        recoveredToolCallIds: ["call-1"],
+      },
+      {
+        type: "error",
+        reason: "error",
+        error: new Error("tool result persistence failed"),
+      },
+    ]);
+    expect(providerCalls).toBe(0);
+
+    const secondAttempt = await collect(chat.streamTurn("resume safely"));
+    const thirdAttempt = await collect(chat.streamTurn("no duplicates"));
+    const recoveryIds = [
+      ...firstAttempt,
+      ...secondAttempt,
+      ...thirdAttempt,
+    ].flatMap((event) =>
+      event.type === "session-recovery"
+        ? [...event.recoveredToolCallIds]
+        : [],
+    );
+
+    expect(recoveryIds).toEqual(["call-1", "call-2"]);
+    expect(providerCalls).toBe(2);
   });
 
   test("reports recovered call IDs before starting the next provider call", async () => {

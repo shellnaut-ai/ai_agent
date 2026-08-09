@@ -1,6 +1,7 @@
 import { Type } from "typebox";
 import { describe, expect, test } from "vitest";
 
+import type { ToolApprovalHandler } from "../approval/types.js";
 import type { ModelStreamRunner } from "../model/runtime.js";
 import type {
   ModelRequest,
@@ -26,6 +27,127 @@ const model = {
 };
 
 describe("AgentLoop integration policies", () => {
+  test("isolates internal working messages from Provider request mutation", async () => {
+    let providerCalls = 0;
+    let followUpRequest: ModelRequest | undefined;
+    const runner: ModelStreamRunner = {
+      async *stream(request: ModelRequest): AsyncIterable<StreamEvent> {
+        providerCalls += 1;
+        yield { type: "start" };
+
+        if (providerCalls === 1) {
+          const firstMessage = request.messages[0];
+
+          if (firstMessage?.role === "user") {
+            (firstMessage as { content: string }).content = "mutated";
+          }
+
+          request.messages.push({ role: "user", content: "injected" });
+          yield {
+            type: "tool-call",
+            toolCall: {
+              id: "call-1",
+              name: "missing-tool",
+              arguments: {},
+            },
+          };
+          yield { type: "done", reason: "tool-call" };
+          return;
+        }
+
+        followUpRequest = structuredClone(request);
+        yield { type: "done", reason: "stop" };
+      },
+    };
+
+    await collect(
+      new AgentLoop(runner, new ToolRegistry()).stream({
+        model,
+        messages: [{ role: "user", content: "original" }],
+      }),
+    );
+
+    expect(followUpRequest?.messages).toEqual([
+      { role: "user", content: "original" },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [
+          {
+            id: "call-1",
+            name: "missing-tool",
+            arguments: {},
+          },
+        ],
+      },
+      {
+        role: "tool",
+        toolCallId: "call-1",
+        content: 'Tool "missing-tool" is not registered.',
+        isError: true,
+      },
+    ]);
+  });
+
+  test("isolates executable tool arguments from approval callback mutation", async () => {
+    let providerCalls = 0;
+    let executedPath: string | undefined;
+    const runner: ModelStreamRunner = {
+      async *stream(): AsyncIterable<StreamEvent> {
+        providerCalls += 1;
+        yield { type: "start" };
+
+        if (providerCalls === 1) {
+          yield {
+            type: "tool-call",
+            toolCall: {
+              id: "call-1",
+              name: "write-test",
+              arguments: { path: "original.txt" },
+            },
+          };
+          yield { type: "done", reason: "tool-call" };
+          return;
+        }
+
+        yield { type: "done", reason: "stop" };
+      },
+    };
+    const tool: Tool = {
+      approval: "always",
+      definition: {
+        name: "write-test",
+        description: "Records approved arguments.",
+        inputSchema: Type.Object(
+          { path: Type.String() },
+          { additionalProperties: false },
+        ),
+      },
+      async execute(input) {
+        executedPath = (input as { path: string }).path;
+        return { content: "written", isError: false };
+      },
+    };
+    const approvalHandler: ToolApprovalHandler = {
+      async requestApproval(request) {
+        (request.toolCall.arguments as { path: string }).path =
+          "approval-mutation.txt";
+        return "allow-once";
+      },
+    };
+    const registry = new ToolRegistry();
+    registry.register(tool);
+
+    await collect(
+      new AgentLoop(runner, registry, approvalHandler).stream({
+        model,
+        messages: [],
+      }),
+    );
+
+    expect(executedPath).toBe("original.txt");
+  });
+
   test("isolates durable tool intent and results from outward event mutation", async () => {
     let providerCalls = 0;
     let executedPath: string | undefined;
