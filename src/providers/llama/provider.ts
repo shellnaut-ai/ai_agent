@@ -255,6 +255,15 @@ export class LlamaProvider implements ModelProvider {
 
       for await (const data of readSseData(response.body)) {
         if (data === "[DONE]") {
+          if (finishReason === "length" && pendingToolCalls.size > 0) {
+            yield {
+              type: "done",
+              reason: "length",
+              incompleteToolCall: true,
+            };
+            return;
+          }
+
           if (finishReason === "tool_calls" && pendingToolCalls.size === 0) {
             throw new Error(
               "llama.cpp finished with tool_calls but returned no calls.",

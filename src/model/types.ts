@@ -79,5 +79,6 @@ export type StreamEvent =
       type: "done";
       reason: StopReason;
       providerState?: ProviderMessageState;
+      incompleteToolCall?: boolean;
     }
   | { type: "error"; reason: ErrorReason; error: Error };

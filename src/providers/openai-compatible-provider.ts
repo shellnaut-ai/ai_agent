@@ -180,6 +180,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
               yield {
                 type: "done",
                 reason: reason === "length" ? "length" : "stop",
+                ...(reason === "length" && pending.size > 0
+                  ? { incompleteToolCall: true }
+                  : {}),
               };
             }
             return;

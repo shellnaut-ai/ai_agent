@@ -226,7 +226,14 @@ export class OpenAICodexProvider implements ModelProvider {
 
           collectTerminalReasoning(event, reasoningItems);
           const providerState = createProviderState(reasoningItems, toolItems);
-          yield { type: "done", reason: "length", providerState };
+          yield {
+            type: "done",
+            reason: "length",
+            providerState,
+            ...(sawToolCall || pendingCalls.size > 0
+              ? { incompleteToolCall: true }
+              : {}),
+          };
           return;
         }
 
