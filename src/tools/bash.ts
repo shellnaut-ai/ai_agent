@@ -1,9 +1,14 @@
 import { spawn } from "node:child_process";
 import { realpath } from "node:fs/promises";
+import type { Readable } from "node:stream";
 import { resolve } from "node:path";
 import { Type } from "typebox";
 
 import { terminateProcessTree } from "./process-tree.js";
+import {
+  spawnWindowsBashSupervisor,
+  type WindowsBashSupervisor,
+} from "./windows-bash-supervisor.js";
 import type {
   Tool,
   ToolDefinition,
@@ -24,18 +29,10 @@ interface CapturedOutput {
   truncated: boolean;
 }
 
-const WINDOWS_MANAGED_COMMAND = `
-__pi_clone_managed_command_7f2c=$1
-shift
-__pi_clone_wait_for_jobs_7f2c() {
-  __pi_clone_exit_status_7f2c=$?
-  trap - EXIT
-  wait
-  exit "$__pi_clone_exit_status_7f2c"
+interface StreamEndWatcher {
+  readonly promise: Promise<void>;
+  dispose(): void;
 }
-trap '__pi_clone_wait_for_jobs_7f2c' EXIT
-eval "$__pi_clone_managed_command_7f2c"
-`;
 
 function captureChunk(
   output: CapturedOutput,
@@ -56,6 +53,45 @@ function captureChunk(
   if (buffer.byteLength > remainingBytes) {
     output.truncated = true;
   }
+}
+
+function watchStreamEnd(stream: Readable): StreamEndWatcher {
+  if (stream.readableEnded || stream.destroyed) {
+    return {
+      promise: Promise.resolve(),
+      dispose: () => undefined,
+    };
+  }
+
+  let resolveEnd: () => void = () => undefined;
+  let rejectEnd: (error: Error) => void = () => undefined;
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolveEnd = resolvePromise;
+    rejectEnd = rejectPromise;
+  });
+  const dispose = (): void => {
+    stream.off("end", onEnd);
+    stream.off("close", onClose);
+    stream.off("error", onError);
+  };
+  const onEnd = (): void => {
+    dispose();
+    resolveEnd();
+  };
+  const onClose = (): void => {
+    dispose();
+    resolveEnd();
+  };
+  const onError = (error: Error): void => {
+    dispose();
+    rejectEnd(error);
+  };
+
+  stream.once("end", onEnd);
+  stream.once("close", onClose);
+  stream.once("error", onError);
+
+  return { promise, dispose };
 }
 
 function createAbortError(signal: AbortSignal): Error {
@@ -142,20 +178,27 @@ export class BashTool implements Tool {
       };
     }
 
+    let supervisor: WindowsBashSupervisor | undefined;
+
     try {
       const rootRealPath = await realpath(this.rootDir);
-      const shellArgs =
+      supervisor =
         process.platform === "win32"
-          ? ["-lc", WINDOWS_MANAGED_COMMAND, "bash", commandValue]
-          : ["-lc", commandValue];
-
-      const child = spawn(this.shellPath, shellArgs, {
-        cwd: rootRealPath,
-        detached: process.platform !== "win32",
-        env: process.env,
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
-      });
+          ? await spawnWindowsBashSupervisor({
+              shellPath: this.shellPath,
+              command: commandValue,
+              cwd: rootRealPath,
+            })
+          : undefined;
+      const child =
+        supervisor?.child ??
+        spawn(this.shellPath, ["-lc", commandValue], {
+          cwd: rootRealPath,
+          detached: true,
+          env: process.env,
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+        });
 
       const stdout: CapturedOutput = {
         chunks: [],
@@ -172,6 +215,11 @@ export class BashTool implements Tool {
       let timedOut = false;
       let outputLimitExceeded = false;
       let terminationPromise: Promise<void> | undefined;
+      let detachSupervisor = false;
+      let stdoutStream: Readable | undefined;
+      let stderrStream: Readable | undefined;
+      let stdoutEnd: StreamEndWatcher | undefined;
+      let stderrEnd: StreamEndWatcher | undefined;
 
       let rejectTerminal: (error: Error) => void = () => undefined;
       const onChildError = (error: Error): void => rejectTerminal(error);
@@ -229,9 +277,6 @@ export class BashTool implements Tool {
         }
       };
 
-      child.stdout.on("data", onStdoutData);
-      child.stderr.on("data", onStderrData);
-
       const onAbort = (): void => {
         void requestTermination();
       };
@@ -250,10 +295,39 @@ export class BashTool implements Tool {
       timeout.unref();
 
       try {
-        const terminal = await terminalPromise;
+        const output =
+          supervisor === undefined
+            ? { stdout: child.stdout!, stderr: child.stderr! }
+            : await supervisor.output;
+        stdoutStream = output.stdout;
+        stderrStream = output.stderr;
+
+        output.stdout.on("data", onStdoutData);
+        output.stderr.on("data", onStderrData);
+        stdoutEnd = watchStreamEnd(output.stdout);
+        stderrEnd = watchStreamEnd(output.stderr);
+        output.stdout.resume();
+        output.stderr.resume();
+
+        const terminal =
+          supervisor === undefined
+            ? await terminalPromise
+            : await Promise.race([
+                Promise.all([
+                  supervisor.rootExit,
+                  stdoutEnd.promise,
+                  stderrEnd.promise,
+                ]).then(([exitCode]) => ({
+                  exitCode,
+                  signal: null,
+                })),
+                terminalPromise,
+              ]);
 
         if (terminationPromise !== undefined) {
           await terminationPromise;
+        } else if (supervisor !== undefined) {
+          detachSupervisor = true;
         }
 
         if (options?.signal?.aborted) {
@@ -280,10 +354,28 @@ export class BashTool implements Tool {
       } finally {
         clearTimeout(timeout);
         options?.signal?.removeEventListener("abort", onAbort);
-        child.stdout.off("data", onStdoutData);
-        child.stderr.off("data", onStderrData);
+        stdoutStream?.off("data", onStdoutData);
+        stderrStream?.off("data", onStderrData);
         child.off("error", onChildError);
         child.off("close", onChildClose);
+
+        try {
+          if (
+            supervisor !== undefined &&
+            !detachSupervisor &&
+            child.exitCode === null &&
+            child.signalCode === null
+          ) {
+            await requestTermination();
+          }
+        } finally {
+          try {
+            await supervisor?.dispose(detachSupervisor);
+          } finally {
+            stdoutEnd?.dispose();
+            stderrEnd?.dispose();
+          }
+        }
       }
     } catch (error: unknown) {
       if (options?.signal?.aborted) {

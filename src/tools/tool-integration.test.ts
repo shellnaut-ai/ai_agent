@@ -99,7 +99,9 @@ async function waitForRecordedTree(
         typeof value === "object" &&
         value !== null &&
         Number.isInteger(Reflect.get(value, "parentPid")) &&
-        Number.isInteger(Reflect.get(value, "descendantPid"))
+        Number(Reflect.get(value, "parentPid")) > 0 &&
+        Number.isInteger(Reflect.get(value, "descendantPid")) &&
+        Number(Reflect.get(value, "descendantPid")) > 0
       ) {
         return value as RecordedProcessTree;
       }
@@ -397,7 +399,7 @@ describe("tool integration", () => {
       const tool = new BashTool({
         rootDir,
         shellPath: bashPath(),
-        timeoutMs: 1_000,
+        timeoutMs: 2_500,
       });
       let tree: RecordedProcessTree | undefined;
       let execution: Promise<Awaited<ReturnType<BashTool["execute"]>>> | undefined;
@@ -508,7 +510,7 @@ describe("tool integration", () => {
       const tool = new BashTool({
         rootDir,
         shellPath: bashPath(),
-        timeoutMs: 1_000,
+        timeoutMs: 2_500,
       });
       let tree: RecordedProcessTree | undefined;
       let execution: Promise<Awaited<ReturnType<BashTool["execute"]>>> | undefined;
@@ -537,5 +539,191 @@ describe("tool integration", () => {
       }
     },
     20_000,
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "bash timeout kills a background tree when exec replaces the user shell",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-bash-exec-root-"),
+      );
+      cleanup.push(rootDir);
+      const token = `pi-clone-${randomUUID()}`;
+      const fixture = await createBashTreeFixture(rootDir, token);
+      const tool = new BashTool({
+        rootDir,
+        shellPath: bashPath(),
+        timeoutMs: 2_500,
+      });
+      let tree: RecordedProcessTree | undefined;
+      let execution: Promise<Awaited<ReturnType<BashTool["execute"]>>> | undefined;
+
+      try {
+        execution = tool.execute({
+          command: `${fixture.command} & exec true`,
+        });
+        tree = await waitForRecordedTree(fixture.treePath);
+        const result = await withDeadline(
+          execution,
+          "Bash exec-root termination did not settle.",
+        );
+
+        expect(JSON.parse(result.content)).toMatchObject({
+          timedOut: true,
+          outputTruncated: false,
+        });
+        await Promise.all([
+          waitForProcessExit(tree.parentPid),
+          waitForProcessExit(tree.descendantPid),
+        ]);
+      } finally {
+        await cleanupBashFixture(token, tree, execution);
+      }
+    },
+    20_000,
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "bash timeout kills a background tree when the user replaces the EXIT trap",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-bash-user-trap-"),
+      );
+      cleanup.push(rootDir);
+      const token = `pi-clone-${randomUUID()}`;
+      const fixture = await createBashTreeFixture(rootDir, token);
+      const tool = new BashTool({
+        rootDir,
+        shellPath: bashPath(),
+        timeoutMs: 2_500,
+      });
+      let tree: RecordedProcessTree | undefined;
+      let execution: Promise<Awaited<ReturnType<BashTool["execute"]>>> | undefined;
+
+      try {
+        execution = tool.execute({
+          command: `${fixture.command} & trap 'true' EXIT; exit 7`,
+        });
+        tree = await waitForRecordedTree(fixture.treePath);
+        const result = await withDeadline(
+          execution,
+          "Bash user-trap termination did not settle.",
+        );
+
+        expect(JSON.parse(result.content)).toMatchObject({
+          timedOut: true,
+          outputTruncated: false,
+        });
+        await Promise.all([
+          waitForProcessExit(tree.parentPid),
+          waitForProcessExit(tree.descendantPid),
+        ]);
+      } finally {
+        await cleanupBashFixture(token, tree, execution);
+      }
+    },
+    20_000,
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "bash preserves prompt exit status when a background tree redirects output",
+    async () => {
+      const rootDir = await mkdtemp(
+        join(tmpdir(), "ai-agent-bash-redirected-background-"),
+      );
+      cleanup.push(rootDir);
+      const token = `pi-clone-${randomUUID()}`;
+      const fixture = await createBashTreeFixture(rootDir, token);
+      const tool = new BashTool({
+        rootDir,
+        shellPath: bashPath(),
+        timeoutMs: 10_000,
+      });
+      let tree: RecordedProcessTree | undefined;
+      let execution: Promise<Awaited<ReturnType<BashTool["execute"]>>> | undefined;
+
+      try {
+        execution = tool.execute({
+          command: `${fixture.command} > background.log 2>&1 & exit 7`,
+        });
+        tree = await waitForRecordedTree(fixture.treePath);
+        const result = await withDeadline(
+          execution,
+          "Bash redirected background command did not return promptly.",
+        );
+
+        expect(JSON.parse(result.content)).toMatchObject({
+          exitCode: 7,
+          signal: null,
+          timedOut: false,
+          outputTruncated: false,
+        });
+      } finally {
+        await cleanupBashFixture(token, tree, execution);
+      }
+    },
+    20_000,
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "bash preserves the direct shell zero argument",
+    async () => {
+      const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-bash-zero-"));
+      cleanup.push(rootDir);
+      const directZero = (
+        await captureCommandOutput(bashPath(), [
+          "-lc",
+          'printf "%s" "$0"',
+        ])
+      ).trim();
+      const tool = new BashTool({
+        rootDir,
+        shellPath: bashPath(),
+        timeoutMs: 5_000,
+      });
+
+      const result = await tool.execute({
+        command: 'printf "%s" "$0"',
+      });
+      const parsed = JSON.parse(result.content) as { readonly stdout: string };
+
+      expect(parsed.stdout).toBe(directZero);
+    },
+    15_000,
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "bash preserves caller environment values used by the supervisor",
+    async () => {
+      const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-bash-env-"));
+      cleanup.push(rootDir);
+      const environmentName = "PI_CLONE_BASH_COMMAND_PATH";
+      const previousValue = process.env[environmentName];
+      const expectedValue = `caller-owned-${randomUUID()}`;
+      process.env[environmentName] = expectedValue;
+
+      try {
+        const tool = new BashTool({
+          rootDir,
+          shellPath: bashPath(),
+          timeoutMs: 5_000,
+        });
+        const result = await tool.execute({
+          command: `printf "%s" "$${environmentName}"`,
+        });
+        const parsed = JSON.parse(result.content) as {
+          readonly stdout: string;
+        };
+
+        expect(parsed.stdout).toBe(expectedValue);
+      } finally {
+        if (previousValue === undefined) {
+          delete process.env[environmentName];
+        } else {
+          process.env[environmentName] = previousValue;
+        }
+      }
+    },
+    15_000,
   );
 });
