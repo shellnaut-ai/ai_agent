@@ -66,6 +66,15 @@ export async function runChat(
           );
         }
 
+        if (event.type === "session-recovery") {
+          for (const toolCallId of event.recoveredToolCallIds) {
+            io.write(
+              `[Recovery] Tool call ${toolCallId} outcome is unknown. ` +
+                `Inspect workspace state before retrying.\n`,
+            );
+          }
+        }
+
         if (event.type === "retry") {
           if (assistantLineOpen) {
             io.write("\n");

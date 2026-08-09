@@ -14,16 +14,19 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "check": "npm run typecheck && npm test && npm run build && npm run smoke:cli-eof",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-runtime-assets.mjs",
+    "check": "npm run typecheck && npm test && npm run build && npm run smoke:package-dist && npm run smoke:cli-eof",
     "cli": "node --enable-source-maps dist/cli.js",
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "dev": "tsx src/demo.ts",
     "prebuild": "npm run clean",
     "precli": "npm run build",
+    "prepack": "npm run verify:windows-helper && npm run build",
     "smoke:cli-eof": "node scripts/smoke-cli-eof.mjs",
+    "smoke:package-dist": "node scripts/smoke-package-dist.mjs",
     "test": "vitest run --passWithNoTests",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify:windows-helper": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/verify-windows-bash-supervisor-assembly.ps1"
   },
   "repository": {
     "type": "git",

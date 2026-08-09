@@ -4,11 +4,13 @@ import type {
   AssistantMessage,
   Message,
   ModelRequest,
+  ProviderMessageState,
   StopReason,
   ToolResultMessage,
 } from "../model/types.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { ToolCall, ToolResult } from "../tools/types.js";
+import { cloneToolDefinition } from "../tools/definition.js";
 import type { AgentEvent, AgentLoopOptions, AgentRequest } from "./types.js";
 
 export class AgentLoop {
@@ -76,20 +78,39 @@ export class AgentLoop {
 
     const newMessages: Message[] = [];
     let completedToolBatches = 0;
+    const seenToolCallIds = new Set<string>();
 
-    const definitions = this.toolRegistry.listDefinitions();
+    for (const message of request.messages) {
+      if (message.role !== "assistant") {
+        continue;
+      }
+
+      for (const call of message.toolCalls) {
+        if (seenToolCallIds.has(call.id)) {
+          yield {
+            type: "error",
+            reason: "error",
+            error: new Error(`Duplicate tool call ID "${call.id}".`),
+          };
+          return;
+        }
+
+        seenToolCallIds.add(call.id);
+      }
+    }
 
     try {
       for (let step = 0; step < maxSteps; step += 1) {
         const modelRequest: ModelRequest = {
           model: request.model,
-          messages: workingMessages,
-          tools: definitions,
+          messages: structuredClone(workingMessages),
+          tools: this.toolRegistry.listDefinitions(),
         };
 
         let assistantContent = "";
         const toolCalls: ToolCall[] = [];
         let terminalReason: StopReason | undefined;
+        let terminalProviderState: ProviderMessageState | undefined;
 
         for await (const event of this.runtime.stream(modelRequest, {
           signal: options?.signal,
@@ -122,11 +143,18 @@ export class AgentLoop {
           }
 
           if (event.type === "tool-call") {
-            toolCalls.push(event.toolCall);
+            const toolCall = structuredClone(event.toolCall);
+
+            if (seenToolCallIds.has(toolCall.id)) {
+              throw new Error(`Duplicate tool call ID "${toolCall.id}".`);
+            }
+
+            seenToolCallIds.add(toolCall.id);
+            toolCalls.push(toolCall);
 
             yield {
               type: "tool-call",
-              toolCall: event.toolCall,
+              toolCall: structuredClone(toolCall),
             };
 
             continue;
@@ -144,6 +172,10 @@ export class AgentLoop {
 
           if (event.type === "done") {
             terminalReason = event.reason;
+            terminalProviderState =
+              event.providerState === undefined
+                ? undefined
+                : structuredClone(event.providerState);
 
             break;
           }
@@ -204,6 +236,14 @@ export class AgentLoop {
           role: "assistant",
           content: assistantContent,
           toolCalls: [...toolCalls],
+          ...(terminalProviderState === undefined
+            ? {}
+            : { providerState: terminalProviderState }),
+        };
+
+        yield {
+          type: "message-checkpoint",
+          message: structuredClone(assistantMessage),
         };
 
         workingMessages.push(assistantMessage);
@@ -232,8 +272,10 @@ export class AgentLoop {
             const decision = this.approvalHandler
               ? await this.approvalHandler.requestApproval(
                   {
-                    toolCall: preparation.executableCall,
-                    definition: preparation.tool.definition,
+                    toolCall: structuredClone(preparation.executableCall),
+                    definition: cloneToolDefinition(
+                      preparation.tool.definition,
+                    ),
                   },
                   {
                     signal: options?.signal,
@@ -264,14 +306,15 @@ export class AgentLoop {
             isError: result.isError,
           };
 
-          workingMessages.push(resultMessage);
-
-          newMessages.push(resultMessage);
-
           yield {
             type: "tool-result",
             result,
+            message: structuredClone(resultMessage),
           };
+
+          workingMessages.push(resultMessage);
+
+          newMessages.push(resultMessage);
         }
       }
 

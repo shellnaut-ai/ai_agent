@@ -12,6 +12,10 @@ import {
   type ToolInputValidator,
   type ToolValidationResult,
 } from "./validation.js";
+import {
+  cloneFrozenToolDefinition,
+  cloneToolDefinition,
+} from "./definition.js";
 
 interface RegisteredTool {
   readonly tool: Tool;
@@ -25,11 +29,19 @@ export class ToolRegistry {
     if (this.tools.has(tool.definition.name)) {
       throw new Error(`Tool "${tool.definition.name}" is already registered`);
     }
-    this.tools.set(tool.definition.name, {
-      tool,
+    const definition = cloneFrozenToolDefinition(tool.definition);
+    const approval = tool.approval;
+    const execute = tool.execute.bind(tool);
+    const registeredTool = Object.freeze<Tool>({
+      definition,
+      approval,
+      execute: (input, options) => execute(input, options),
+    });
+    this.tools.set(definition.name, {
+      tool: registeredTool,
       validator: createToolInputValidator(
-        tool.definition.name,
-        tool.definition.inputSchema,
+        definition.name,
+        definition.inputSchema,
       ),
     });
   }
@@ -40,7 +52,7 @@ export class ToolRegistry {
 
   listDefinitions(): readonly ToolDefinition[] {
     return [...this.tools.values()].map(
-      ({ tool }) => tool.definition,
+      ({ tool }) => cloneToolDefinition(tool.definition),
     );
   }
 

@@ -10,6 +10,19 @@ export type ProviderId =
   | "openai-compatible"
   | "openai-codex";
 
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | readonly JsonValue[]
+  | { readonly [key: string]: JsonValue };
+
+export interface ProviderMessageState {
+  readonly provider: ProviderId;
+  readonly value: JsonValue;
+}
+
 // 외부 혹은 로컬 모델들의 공통된 속성만 추출, 원본의 경우 확장을 위해 더 많은 요소가 있지만 당장의 클론 코딩에선 필요 없기 때문에 제외.
 export interface Model {
   // provider에 어떤 모델 이름을 보낼 것인지
@@ -35,6 +48,7 @@ export interface AssistantMessage {
   readonly role: "assistant";
   readonly content: string;
   readonly toolCalls: readonly ToolCall[];
+  readonly providerState?: ProviderMessageState;
 }
 
 export interface ToolResultMessage {
@@ -61,5 +75,9 @@ export type StreamEvent =
   | { type: "start" }
   | { type: "text-delta"; delta: string }
   | { type: "tool-call"; toolCall: ToolCall }
-  | { type: "done"; reason: StopReason }
+  | {
+      type: "done";
+      reason: StopReason;
+      providerState?: ProviderMessageState;
+    }
   | { type: "error"; reason: ErrorReason; error: Error };

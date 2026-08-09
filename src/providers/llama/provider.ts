@@ -6,6 +6,7 @@ import type {
   ProviderId,
   StreamEvent,
 } from "../../model/types.js";
+import { serializeToolCallArguments } from "../../tools/arguments.js";
 import { readSseData } from "./sse.js";
 
 export interface LlamaProviderOptions {
@@ -136,7 +137,7 @@ function toLlamaMessage(message: Message): Record<string, unknown> {
         type: "function",
         function: {
           name: call.name,
-          arguments: JSON.stringify(call.arguments),
+          arguments: serializeToolCallArguments(call),
         },
       })),
     };

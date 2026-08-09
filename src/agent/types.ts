@@ -1,8 +1,10 @@
 import type {
+  AssistantMessage,
   ErrorReason,
   Message,
   Model,
   StopReason,
+  ToolResultMessage,
 } from "../model/types.js";
 import type { ToolCall, ToolResult } from "../tools/types.js";
 
@@ -44,8 +46,13 @@ export type AgentEvent =
       toolCall: ToolCall;
     }
   | {
+      type: "message-checkpoint";
+      message: AssistantMessage;
+    }
+  | {
       type: "tool-result";
       result: ToolResult;
+      message: ToolResultMessage;
     }
   | {
       type: "done";

@@ -1,8 +1,14 @@
 import { spawn } from "node:child_process";
 import { realpath } from "node:fs/promises";
+import type { Readable } from "node:stream";
 import { resolve } from "node:path";
 import { Type } from "typebox";
 
+import { terminateProcessTree } from "./process-tree.js";
+import {
+  windowsBashSupervisorRuntime,
+  type WindowsBashSupervisor,
+} from "./windows-bash-supervisor.js";
 import type {
   Tool,
   ToolDefinition,
@@ -21,6 +27,11 @@ interface CapturedOutput {
   readonly chunks: Buffer[];
   byteLength: number;
   truncated: boolean;
+}
+
+interface StreamEndWatcher {
+  readonly promise: Promise<void>;
+  dispose(): void;
 }
 
 function captureChunk(
@@ -44,6 +55,56 @@ function captureChunk(
   }
 }
 
+function watchStreamEnd(stream: Readable): StreamEndWatcher {
+  if (stream.readableEnded || stream.destroyed) {
+    return {
+      promise: Promise.resolve(),
+      dispose: () => undefined,
+    };
+  }
+
+  let resolveEnd: () => void = () => undefined;
+  let rejectEnd: (error: Error) => void = () => undefined;
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolveEnd = resolvePromise;
+    rejectEnd = rejectPromise;
+  });
+  const dispose = (): void => {
+    stream.off("end", onEnd);
+    stream.off("close", onClose);
+    stream.off("error", onError);
+  };
+  const onEnd = (): void => {
+    dispose();
+    resolveEnd();
+  };
+  const onClose = (): void => {
+    dispose();
+    resolveEnd();
+  };
+  const onError = (error: Error): void => {
+    dispose();
+    rejectEnd(error);
+  };
+
+  stream.once("end", onEnd);
+  stream.once("close", onClose);
+  stream.once("error", onError);
+
+  void promise.catch(() => undefined);
+
+  return { promise, dispose };
+}
+
+function createAbortError(signal: AbortSignal): Error {
+  const error = new Error("The operation was aborted", {
+    cause: signal.reason,
+  });
+  error.name = "AbortError";
+  (error as NodeJS.ErrnoException).code = "ABORT_ERR";
+  return error;
+}
+
 export class BashTool implements Tool {
   readonly approval = "always" as const;
 
@@ -56,6 +117,7 @@ export class BashTool implements Tool {
       {
         command: Type.String({
           minLength: 1,
+          pattern: "^[^\\u0000]*$",
           description: "Complete Bash command to execute.",
         }),
       },
@@ -75,7 +137,6 @@ export class BashTool implements Tool {
     this.shellPath = options.shellPath ?? "bash";
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.maxOutputBytes = options.maxOutputBytes ?? 64 * 1024;
-
     if (this.shellPath.trim().length === 0) {
       throw new Error("BashTool shellPath must be a non-empty string.");
     }
@@ -119,16 +180,34 @@ export class BashTool implements Tool {
       };
     }
 
+    if (commandValue.includes("\0")) {
+      return {
+        content: "bash.command must not contain NUL characters.",
+        isError: true,
+      };
+    }
+
+    let supervisor: WindowsBashSupervisor | undefined;
+
     try {
       const rootRealPath = await realpath(this.rootDir);
-
-      const child = spawn(this.shellPath, ["-lc", commandValue], {
-        cwd: rootRealPath,
-        env: process.env,
-        signal: options?.signal,
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
-      });
+      supervisor =
+        process.platform === "win32"
+          ? await windowsBashSupervisorRuntime.spawn({
+              shellPath: this.shellPath,
+              command: commandValue,
+              cwd: rootRealPath,
+            })
+          : undefined;
+      const child =
+        supervisor?.child ??
+        spawn(this.shellPath, ["-lc", commandValue], {
+          cwd: rootRealPath,
+          detached: true,
+          env: process.env,
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+        });
 
       const stdout: CapturedOutput = {
         chunks: [],
@@ -144,76 +223,208 @@ export class BashTool implements Tool {
 
       let timedOut = false;
       let outputLimitExceeded = false;
+      let terminationPromise: Promise<void> | undefined;
+      let detachSupervisor = false;
+      let stdoutStream: Readable | undefined;
+      let stderrStream: Readable | undefined;
+      let stdoutEnd: StreamEndWatcher | undefined;
+      let stderrEnd: StreamEndWatcher | undefined;
+
+      let rejectTerminal: (error: Error) => void = () => undefined;
+      const onChildError = (error: Error): void => rejectTerminal(error);
+      let resolveTerminal: (
+        terminal: {
+          readonly exitCode: number | null;
+          readonly signal: NodeJS.Signals | null;
+        },
+      ) => void = () => undefined;
+      const onChildClose = (
+        exitCode: number | null,
+        signal: NodeJS.Signals | null,
+      ): void => resolveTerminal({ exitCode, signal });
+
+      const terminalPromise = new Promise<{
+        readonly exitCode: number | null;
+        readonly signal: NodeJS.Signals | null;
+      }>((resolvePromise, rejectPromise) => {
+        resolveTerminal = resolvePromise;
+        rejectTerminal = rejectPromise;
+        child.once("error", onChildError);
+        child.once("close", onChildClose);
+      });
+      void terminalPromise.catch(() => undefined);
+
+      const requestTermination = (): Promise<void> => {
+        terminationPromise ??= (async () => {
+          try {
+            await terminateProcessTree(child, process.platform);
+          } catch (terminationError: unknown) {
+            if (
+              process.platform === "win32" &&
+              child.exitCode === null &&
+              child.signalCode === null
+            ) {
+              try {
+                child.kill();
+              } catch (fallbackError: unknown) {
+                throw new AggregateError(
+                  [terminationError, fallbackError],
+                  "Windows Bash supervisor termination failed.",
+                );
+              }
+            }
+
+            throw terminationError;
+          }
+        })();
+        void terminationPromise.catch((error: unknown) => {
+          rejectTerminal(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+        });
+        return terminationPromise;
+      };
 
       const terminateForOutputLimit = (): void => {
         if (!outputLimitExceeded) {
           outputLimitExceeded = true;
-          child.kill("SIGTERM");
+          void requestTermination();
         }
       };
 
-      child.stdout.on("data", (chunk: unknown) => {
+      const onStdoutData = (chunk: unknown): void => {
         captureChunk(stdout, chunk, this.maxOutputBytes);
 
         if (stdout.truncated) {
           terminateForOutputLimit();
         }
-      });
+      };
 
-      child.stderr.on("data", (chunk: unknown) => {
+      const onStderrData = (chunk: unknown): void => {
         captureChunk(stderr, chunk, this.maxOutputBytes);
 
         if (stderr.truncated) {
           terminateForOutputLimit();
         }
-      });
+      };
+
+      const onAbort = (): void => {
+        void requestTermination();
+      };
+
+      options?.signal?.addEventListener("abort", onAbort, { once: true });
+
+      if (options?.signal?.aborted) {
+        onAbort();
+      }
 
       const timeout = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGTERM");
+        void requestTermination();
       }, this.timeoutMs);
 
       timeout.unref();
 
-      const terminal = await new Promise<{
-        readonly exitCode: number | null;
-        readonly signal: NodeJS.Signals | null;
-      }>((resolveTerminal, rejectTerminal) => {
-        child.once("error", (error: Error) => {
-          clearTimeout(timeout);
-          rejectTerminal(error);
-        });
+      try {
+        let terminal: {
+          readonly exitCode: number | null;
+          readonly signal: NodeJS.Signals | null;
+        };
 
-        child.once("close", (exitCode, signal) => {
-          clearTimeout(timeout);
-          resolveTerminal({
-            exitCode,
-            signal,
-          });
-        });
-      });
+        try {
+          const output =
+            supervisor === undefined
+              ? { stdout: child.stdout!, stderr: child.stderr! }
+              : await supervisor.output;
+          stdoutStream = output.stdout;
+          stderrStream = output.stderr;
 
-      if (options?.signal?.aborted) {
-        throw new Error("Tool execution aborted.");
+          output.stdout.on("data", onStdoutData);
+          output.stderr.on("data", onStderrData);
+          stdoutEnd = watchStreamEnd(output.stdout);
+          stderrEnd = watchStreamEnd(output.stderr);
+          output.stdout.resume();
+          output.stderr.resume();
+
+          terminal =
+            supervisor === undefined
+              ? await terminalPromise
+              : await Promise.race([
+                  Promise.all([
+                    supervisor.rootExit,
+                    stdoutEnd.promise,
+                    stderrEnd.promise,
+                    supervisor.close,
+                  ]).then(([exitCode]) => ({
+                    exitCode,
+                    signal: null,
+                  })),
+                  terminalPromise.then(
+                    () => new Promise<never>(() => undefined),
+                    (error: unknown) => Promise.reject(error),
+                  ),
+                ]);
+        } catch (error: unknown) {
+          if (terminationPromise === undefined) {
+            throw error;
+          }
+
+          terminal = await terminalPromise;
+        }
+
+        if (terminationPromise !== undefined) {
+          await terminationPromise;
+        } else if (supervisor !== undefined) {
+          detachSupervisor = true;
+        }
+
+        if (options?.signal?.aborted) {
+          throw createAbortError(options.signal);
+        }
+
+        const result = {
+          exitCode: terminal.exitCode,
+          signal: terminal.signal,
+          timedOut,
+          outputTruncated: outputLimitExceeded,
+          stdout: Buffer.concat(stdout.chunks).toString("utf8"),
+          stderr: Buffer.concat(stderr.chunks).toString("utf8"),
+        };
+
+        return {
+          content: JSON.stringify(result, null, 2),
+          isError:
+            timedOut ||
+            outputLimitExceeded ||
+            terminal.exitCode !== 0 ||
+            terminal.signal !== null,
+        };
+      } finally {
+        clearTimeout(timeout);
+        options?.signal?.removeEventListener("abort", onAbort);
+        stdoutStream?.off("data", onStdoutData);
+        stderrStream?.off("data", onStderrData);
+        child.off("error", onChildError);
+        child.off("close", onChildClose);
+
+        try {
+          if (
+            supervisor !== undefined &&
+            !detachSupervisor &&
+            child.exitCode === null &&
+            child.signalCode === null
+          ) {
+            await requestTermination();
+          }
+        } finally {
+          try {
+            await supervisor?.dispose(detachSupervisor);
+          } finally {
+            stdoutEnd?.dispose();
+            stderrEnd?.dispose();
+          }
+        }
       }
-
-      const result = {
-        exitCode: terminal.exitCode,
-        signal: terminal.signal,
-        timedOut,
-        outputTruncated: outputLimitExceeded,
-        stdout: Buffer.concat(stdout.chunks).toString("utf8"),
-        stderr: Buffer.concat(stderr.chunks).toString("utf8"),
-      };
-
-      return {
-        content: JSON.stringify(result, null, 2),
-        isError:
-          timedOut ||
-          outputLimitExceeded ||
-          terminal.exitCode !== 0 ||
-          terminal.signal !== null,
-      };
     } catch (error: unknown) {
       if (options?.signal?.aborted) {
         throw error;

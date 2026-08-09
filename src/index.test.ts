@@ -7,6 +7,8 @@ import {
   OpenAICompatibleProvider,
   ToolRegistry,
   WorkspacePaths,
+  type JsonValue,
+  type ProviderMessageState,
 } from "./index.js";
 
 describe("public package entry", () => {
@@ -19,5 +21,19 @@ describe("public package entry", () => {
       ToolRegistry,
       WorkspacePaths,
     ]).not.toContain(undefined);
+  });
+
+  test("exports the provider message state contract", () => {
+    const state: ProviderMessageState = {
+      provider: "openai-codex",
+      value: {
+        reasoningItems: [{ type: "reasoning", id: "rs_1" }],
+      },
+    };
+    const value: JsonValue = state.value;
+
+    expect(value).toEqual({
+      reasoningItems: [{ type: "reasoning", id: "rs_1" }],
+    });
   });
 });

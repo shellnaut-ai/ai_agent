@@ -3,14 +3,19 @@ import {
   appendFile,
   mkdir,
   readFile,
+  stat,
+  truncate,
   writeFile,
 } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import type {
   AssistantMessage,
+  JsonValue,
   Message,
   Model,
+  ProviderId,
+  ProviderMessageState,
   ToolResultMessage,
   UserMessage,
 } from "../model/types.js";
@@ -25,11 +30,16 @@ import type {
   SessionHeaderRecord,
   SessionStore,
 } from "./types.js";
+import {
+  SessionWriterLockCompromisedError,
+  withSessionWriterLock,
+} from "./writer-lock.js";
 
 export interface JsonlSessionStoreOptions {
   readonly rootDir: string;
   readonly sessionId: string;
   readonly model: Model;
+  readonly writerLockTimeoutMs?: number;
 }
 
 interface EntryBaseFields {
@@ -38,8 +48,125 @@ interface EntryBaseFields {
   readonly timestamp: string;
 }
 
+interface JsonlSourceLine {
+  readonly line: string;
+  readonly lineNumber: number;
+  readonly startOffset: number;
+  readonly terminated: boolean;
+}
+
+function splitJsonlSourceLines(content: string): JsonlSourceLine[] {
+  const lines: JsonlSourceLine[] = [];
+  let startOffset = 0;
+  let lineNumber = 1;
+
+  while (startOffset < content.length) {
+    const newlineOffset = content.indexOf("\n", startOffset);
+    const terminated = newlineOffset >= 0;
+    const endOffset = terminated ? newlineOffset : content.length;
+    let line = content.slice(startOffset, endOffset);
+
+    if (line.endsWith("\r")) {
+      line = line.slice(0, -1);
+    }
+
+    lines.push({ line, lineNumber, startOffset, terminated });
+
+    if (!terminated) {
+      break;
+    }
+
+    startOffset = newlineOffset + 1;
+    lineNumber += 1;
+  }
+
+  return lines;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isPlainJsonObject(
+  value: unknown,
+): value is Record<string, unknown> {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isProviderId(value: unknown): value is ProviderId {
+  return (
+    value === "codex" ||
+    value === "claude" ||
+    value === "llama" ||
+    value === "fake" ||
+    value === "openai-compatible" ||
+    value === "openai-codex"
+  );
+}
+
+function parseJsonValue(value: unknown): JsonValue {
+  if (
+    value === null ||
+    typeof value === "boolean" ||
+    typeof value === "string"
+  ) {
+    return value;
+  }
+
+  if (typeof value === "number") {
+    if (Number.isFinite(value)) {
+      return value;
+    }
+
+    throw new Error("Provider state must contain only finite numbers.");
+  }
+
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index)) {
+        throw new Error("Provider state must not contain sparse arrays.");
+      }
+    }
+
+    return value.map(parseJsonValue);
+  }
+
+  if (isPlainJsonObject(value)) {
+    const result: Record<string, JsonValue> = {};
+
+    for (const [key, item] of Object.entries(value)) {
+      Object.defineProperty(result, key, {
+        value: parseJsonValue(item),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+
+    return result;
+  }
+
+  throw new Error("Provider state must contain only JSON-compatible values.");
+}
+
+function parseProviderState(value: unknown): ProviderMessageState {
+  if (!isPlainJsonObject(value) || !isProviderId(value.provider)) {
+    throw new Error("Invalid provider state in session file.");
+  }
+
+  if (!("value" in value)) {
+    throw new Error("Invalid provider state in session file.");
+  }
+
+  return {
+    provider: value.provider,
+    value: parseJsonValue(value.value),
+  };
 }
 
 function isFileNotFound(error: unknown): boolean {
@@ -67,7 +194,8 @@ function parseToolCall(value: unknown): ToolCall {
     !isRecord(value) ||
     typeof value.id !== "string" ||
     typeof value.name !== "string" ||
-    !("arguments" in value)
+    !("arguments" in value) ||
+    value.arguments === undefined
   ) {
     throw new Error("Invalid ToolCall in session file.");
   }
@@ -98,10 +226,15 @@ function parseMessage(value: unknown): Message {
     typeof value.content === "string" &&
     Array.isArray(value.toolCalls)
   ) {
+    const providerState =
+      "providerState" in value
+        ? parseProviderState(value.providerState)
+        : undefined;
     const message: AssistantMessage = {
       role: "assistant",
       content: value.content,
       toolCalls: value.toolCalls.map(parseToolCall),
+      ...(providerState === undefined ? {} : { providerState }),
     };
 
     return message;
@@ -368,11 +501,14 @@ export class JsonlSessionStore implements SessionStore {
 
   private readonly model: Model;
   private readonly sessionDirectory: string;
+  private readonly writerLockPath: string;
+  private readonly writerLockTimeoutMs: number;
   private entries: SessionEntry[] = [];
   private entriesById = new Map<string, SessionEntry>();
   private currentLeafId: string | null = null;
   private writeQueue: Promise<void> = Promise.resolve();
   private initialized = false;
+  private poisonError: Error | undefined;
 
   constructor(options: JsonlSessionStoreOptions) {
     if (!/^[A-Za-z0-9_-]{1,100}$/.test(options.sessionId)) {
@@ -389,13 +525,20 @@ export class JsonlSessionStore implements SessionStore {
       this.sessionDirectory,
       `${options.sessionId}.jsonl`,
     );
+    this.writerLockPath = `${this.filePath}.writer.lock`;
+    this.writerLockTimeoutMs = options.writerLockTimeoutMs ?? 30_000;
   }
 
   async load(): Promise<LoadedSession> {
+    this.assertNotPoisoned();
     await mkdir(this.sessionDirectory, {
       recursive: true,
     });
 
+    return this.runWithWriterLock(async () => this.loadFromDisk());
+  }
+
+  private async loadFromDisk(): Promise<LoadedSession> {
     let content: string;
 
     try {
@@ -434,12 +577,7 @@ export class JsonlSessionStore implements SessionStore {
       };
     }
 
-    const lines = content
-      .split(/\r?\n/)
-      .map((line, index) => ({
-        line,
-        lineNumber: index + 1,
-      }))
+    const lines = splitJsonlSourceLines(content)
       .filter(({ line }) => line.trim().length > 0);
 
     if (lines.length === 0) {
@@ -483,15 +621,30 @@ export class JsonlSessionStore implements SessionStore {
     const nextEntriesById = new Map<string, SessionEntry>();
     const approvalKeys = new Set<string>();
     let nextLeafId: string | null = null;
+    let repairedIncompleteTail = false;
 
     for (let index = 1; index < lines.length; index += 1) {
-      const { line, lineNumber } = lines[index];
+      const {
+        line,
+        lineNumber,
+        startOffset,
+        terminated,
+      } = lines[index];
       let value: unknown;
 
       try {
         value = JSON.parse(line);
       } catch {
-        if (index === lines.length - 1) {
+        if (index === lines.length - 1 && !terminated) {
+          try {
+            await truncate(
+              this.filePath,
+              Buffer.byteLength(content.slice(0, startOffset), "utf8"),
+            );
+          } catch (error: unknown) {
+            throw this.poison(error);
+          }
+          repairedIncompleteTail = true;
           break;
         }
 
@@ -546,6 +699,10 @@ export class JsonlSessionStore implements SessionStore {
       nextLeafId = leafIdAfterEntry(storedEntry);
     }
 
+    if (!repairedIncompleteTail && !content.endsWith("\n")) {
+      await this.appendContentSafely("\n");
+    }
+
     this.entries = nextEntries;
     this.entriesById = nextEntriesById;
     this.currentLeafId = nextLeafId;
@@ -586,7 +743,10 @@ export class JsonlSessionStore implements SessionStore {
     const parsedEntries = entries.map(parseSessionEntry);
 
     await this.enqueueWrite(async () => {
-      await this.appendEntriesNow(parsedEntries);
+      await this.runWithWriterLock(async () => {
+        await this.loadFromDisk();
+        await this.appendEntriesNow(parsedEntries);
+      });
     });
   }
 
@@ -609,9 +769,7 @@ export class JsonlSessionStore implements SessionStore {
       .map((entry) => JSON.stringify(entry))
       .join("\n");
 
-    await appendFile(this.filePath, `${content}\n`, {
-      encoding: "utf8",
-    });
+    await this.appendContentSafely(`${content}\n`);
 
     this.entries.push(...storedEntries);
 
@@ -682,23 +840,26 @@ export class JsonlSessionStore implements SessionStore {
     this.assertInitialized();
 
     await this.enqueueWrite(async () => {
-      const target = this.entriesById.get(leafId);
+      await this.runWithWriterLock(async () => {
+        await this.loadFromDisk();
+        const target = this.entriesById.get(leafId);
 
-      if (!target || target.type === "leaf") {
-        throw new Error(
-          `Session leaf target "${leafId}" was not found.`,
-        );
-      }
+        if (!target || target.type === "leaf") {
+          throw new Error(
+            `Session leaf target "${leafId}" was not found.`,
+          );
+        }
 
-      const entry: LeafEntry = {
-        type: "leaf",
-        id: this.createEntryId(),
-        parentId: this.currentLeafId,
-        timestamp: new Date().toISOString(),
-        targetId: leafId,
-      };
+        const entry: LeafEntry = {
+          type: "leaf",
+          id: this.createEntryId(),
+          parentId: this.currentLeafId,
+          timestamp: new Date().toISOString(),
+          targetId: leafId,
+        };
 
-      await this.appendEntriesNow([entry]);
+        await this.appendEntriesNow([entry]);
+      });
     });
   }
 
@@ -716,14 +877,18 @@ export class JsonlSessionStore implements SessionStore {
     };
 
     await this.enqueueWrite(async () => {
-      await appendFile(this.filePath, `${JSON.stringify(record)}\n`, {
-        encoding: "utf8",
+      await this.runWithWriterLock(async () => {
+        await this.loadFromDisk();
+        await this.appendContentSafely(`${JSON.stringify(record)}\n`);
       });
     });
   }
 
   private async enqueueWrite(operation: () => Promise<void>): Promise<void> {
-    const result = this.writeQueue.then(operation);
+    const result = this.writeQueue.then(() => {
+      this.assertNotPoisoned();
+      return operation();
+    });
 
     this.writeQueue = result.catch(() => {
       return;
@@ -737,6 +902,66 @@ export class JsonlSessionStore implements SessionStore {
       throw new Error(
         "Session store must be loaded before it can be used.",
       );
+    }
+  }
+
+  private async appendContentSafely(content: string): Promise<void> {
+    this.assertNotPoisoned();
+    const committedEof = (await stat(this.filePath)).size;
+
+    try {
+      await appendFile(this.filePath, content, { encoding: "utf8" });
+    } catch (appendError: unknown) {
+      try {
+        await truncate(this.filePath, committedEof);
+      } catch (rollbackError: unknown) {
+        throw this.poison(
+          new AggregateError(
+            [appendError, rollbackError],
+            "Session append failed and rollback to the committed EOF failed.",
+          ),
+        );
+      }
+
+      throw appendError;
+    }
+  }
+
+  private async runWithWriterLock<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    this.assertNotPoisoned();
+
+    try {
+      return await withSessionWriterLock(
+        this.writerLockPath,
+        operation,
+        { timeoutMs: this.writerLockTimeoutMs },
+      );
+    } catch (error: unknown) {
+      if (error instanceof SessionWriterLockCompromisedError) {
+        throw this.poison(error);
+      }
+
+      throw error;
+    }
+  }
+
+  private poison(cause: unknown): Error {
+    if (this.poisonError === undefined) {
+      this.poisonError = new Error(
+        "Session store is poisoned because durable writer recovery failed. " +
+          "Create a new store instance and reload the journal before continuing.",
+        { cause },
+      );
+    }
+
+    return this.poisonError;
+  }
+
+  private assertNotPoisoned(): void {
+    if (this.poisonError !== undefined) {
+      throw this.poisonError;
     }
   }
 }

@@ -6,7 +6,10 @@ import type {
   CompactionTurn,
   PreviousCompaction,
 } from "../context/types.js";
-import type { Message } from "../model/types.js";
+import type {
+  Message,
+  ToolResultMessage,
+} from "../model/types.js";
 import type {
   CompactionEntry,
   MessageEntry,
@@ -26,6 +29,52 @@ function messagesFromEntries(
       (entry): entry is MessageEntry => entry.type === "message",
     )
     .map((entry) => cloneMessage(entry.message));
+}
+
+interface BranchToolCallState {
+  readonly callIds: Set<string>;
+  readonly pendingCallIds: Map<string, true>;
+}
+
+const interruptedToolResultContent =
+  "Tool execution was interrupted before its result was recorded. " +
+  "The outcome is unknown. Inspect workspace state before retrying " +
+  "this operation.";
+
+export class InterruptedToolRecoveryError extends Error {
+  readonly recoveredMessages: readonly ToolResultMessage[];
+
+  constructor(
+    cause: unknown,
+    recoveredMessages: readonly ToolResultMessage[],
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.recoveredMessages = structuredClone(recoveredMessages);
+  }
+}
+
+function getBranchToolCallState(
+  entries: readonly SessionEntry[],
+): BranchToolCallState {
+  const callIds = new Set<string>();
+  const pendingCallIds = new Map<string, true>();
+
+  for (const entry of entries) {
+    if (entry.type !== "message") {
+      continue;
+    }
+
+    if (entry.message.role === "assistant") {
+      for (const toolCall of entry.message.toolCalls) {
+        callIds.add(toolCall.id);
+        pendingCallIds.set(toolCall.id, true);
+      }
+    } else if (entry.message.role === "tool") {
+      pendingCallIds.delete(entry.message.toolCallId);
+    }
+  }
+
+  return { callIds, pendingCallIds };
 }
 
 export class Session {
@@ -191,6 +240,72 @@ export class Session {
 
     await this.store.appendEntries(entries);
     return entries.map((entry) => structuredClone(entry));
+  }
+
+  async appendMessage(message: Message): Promise<MessageEntry> {
+    const branchState = getBranchToolCallState(
+      this.store.getPathToRoot(),
+    );
+
+    if (message.role === "assistant") {
+      for (const toolCall of message.toolCalls) {
+        if (branchState.callIds.has(toolCall.id)) {
+          throw new Error(
+            `Tool call ID "${toolCall.id}" is duplicated on the ` +
+              "active session branch.",
+          );
+        }
+
+        branchState.callIds.add(toolCall.id);
+      }
+    } else if (
+      message.role === "tool" &&
+      !branchState.pendingCallIds.has(message.toolCallId)
+    ) {
+      throw new Error(
+        `Tool result "${message.toolCallId}" does not match a ` +
+          "pending tool call on the active session branch.",
+      );
+    }
+
+    const entry: MessageEntry = {
+      type: "message",
+      id: this.store.createEntryId(),
+      parentId: this.store.getLeafId(),
+      timestamp: new Date().toISOString(),
+      message: cloneMessage(message),
+    };
+
+    await this.store.appendEntry(entry);
+    return structuredClone(entry);
+  }
+
+  async recoverInterruptedToolCalls(): Promise<
+    readonly ToolResultMessage[]
+  > {
+    const { pendingCallIds } = getBranchToolCallState(
+      this.store.getPathToRoot(),
+    );
+    const recovered: ToolResultMessage[] = [];
+
+    for (const toolCallId of pendingCallIds.keys()) {
+      const message: ToolResultMessage = {
+        role: "tool",
+        toolCallId,
+        content: interruptedToolResultContent,
+        isError: true,
+      };
+
+      try {
+        await this.appendMessage(message);
+      } catch (error: unknown) {
+        throw new InterruptedToolRecoveryError(error, recovered);
+      }
+
+      recovered.push(structuredClone(message));
+    }
+
+    return recovered;
   }
 
   async appendCompaction(
