@@ -1,11 +1,22 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { expect, test } from "vitest";
+import { afterEach, expect, test } from "vitest";
 
-import { terminateProcessTree } from "./process-tree.js";
+import {
+  posixProcessTableRuntime,
+  readPosixProcessTable,
+  terminateProcessTree,
+} from "./process-tree.js";
+
+const originalProcessTableExecutor = posixProcessTableRuntime.execute;
+
+afterEach(() => {
+  posixProcessTableRuntime.execute = originalProcessTableExecutor;
+});
 
 const CHILD_PROGRAM = `
 process.on("SIGTERM", () => {});
@@ -15,10 +26,82 @@ setInterval(() => {}, 1_000);
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
+
+    if (process.platform === "linux") {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const state = stat.slice(stat.lastIndexOf(")") + 2, -1)[0];
+
+        if (state === "Z" || state === "X" || state === "x") {
+          return false;
+        }
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          return false;
+        }
+
+        throw error;
+      }
+    }
+
     return true;
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code === "ESRCH") {
       return false;
+    }
+
+    throw error;
+  }
+}
+
+async function waitForJsonFile(path: string): Promise<{
+  readonly leader: number;
+  readonly holder: number;
+  readonly zombie: number;
+}> {
+  const deadline = Date.now() + 5_000;
+
+  while (Date.now() < deadline) {
+    try {
+      const value = JSON.parse(await readFile(path, "utf8")) as {
+        leader?: unknown;
+        holder?: unknown;
+        zombie?: unknown;
+      };
+
+      if (
+        Number.isInteger(value.leader) &&
+        Number.isInteger(value.holder) &&
+        Number.isInteger(value.zombie)
+      ) {
+        return value as {
+          readonly leader: number;
+          readonly holder: number;
+          readonly zombie: number;
+        };
+      }
+    } catch (error: unknown) {
+      if (
+        (error as NodeJS.ErrnoException).code !== "ENOENT" &&
+        !(error instanceof SyntaxError)
+      ) {
+        throw error;
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  throw new Error(`Timed out waiting for process state file: ${path}`);
+}
+
+function linuxProcessState(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ", 1)[0];
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
     }
 
     throw error;
@@ -175,3 +258,85 @@ test("terminateProcessTree rejects a non-positive child PID", async () => {
     "positive integer child PID",
   );
 });
+
+test("POSIX process-table lookup falls back across portable state selectors", async () => {
+  const selectors: string[] = [];
+  posixProcessTableRuntime.execute = async (selector) => {
+    selectors.push(selector);
+
+    if (selector !== "s") {
+      throw new Error(`Unsupported selector: ${selector}`);
+    }
+
+    return " 42 Z\n";
+  };
+
+  await expect(readPosixProcessTable()).resolves.toBe(" 42 Z\n");
+  expect(selectors).toEqual(["state", "stat", "s"]);
+});
+
+test.skipIf(process.platform !== "linux")(
+  "terminateProcessTree treats a zombie-only process group as terminated",
+  async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-zombie-group-"));
+    const statePath = join(rootDir, "state.json");
+    const fixture = String.raw`
+import json, os, signal, sys, time
+state_path = sys.argv[1]
+leader = os.getpid()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+holder = os.fork()
+if holder == 0:
+    os.setpgid(0, 0)
+    zombie = os.fork()
+    if zombie == 0:
+        os.setpgid(0, leader)
+        os._exit(0)
+    def cleanup(_signal, _frame):
+        try:
+            os.waitpid(zombie, 0)
+        finally:
+            os._exit(0)
+    signal.signal(signal.SIGUSR1, cleanup)
+    with open(state_path, "w", encoding="utf-8") as output:
+        json.dump({"leader": leader, "holder": os.getpid(), "zombie": zombie}, output)
+        output.flush()
+        os.fsync(output.fileno())
+    while True:
+        time.sleep(1)
+while True:
+    time.sleep(1)
+`;
+    const leader = spawn("python3", ["-c", fixture, statePath], {
+      detached: true,
+      stdio: "ignore",
+    });
+    let holderPid: number | undefined;
+    let zombiePid: number | undefined;
+
+    try {
+      const state = await waitForJsonFile(statePath);
+      holderPid = state.holder;
+      zombiePid = state.zombie;
+      expect(state.leader).toBe(leader.pid);
+
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline && linuxProcessState(zombiePid) !== "Z") {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(linuxProcessState(zombiePid)).toBe("Z");
+
+      await expect(terminateProcessTree(leader, "linux")).resolves.toBeUndefined();
+      expect(isProcessAlive(state.leader)).toBe(false);
+      expect(linuxProcessState(zombiePid)).toBe("Z");
+    } finally {
+      if (holderPid !== undefined && isProcessAlive(holderPid)) {
+        process.kill(holderPid, "SIGUSR1");
+        await waitForProcessExit(holderPid);
+      }
+      await forceCleanup(leader.pid, zombiePid);
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  },
+  15_000,
+);

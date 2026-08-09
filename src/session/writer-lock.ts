@@ -1,6 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { open } from "node:fs/promises";
 import { join } from "node:path";
 
 export interface SessionWriterLockOptions {
@@ -131,13 +130,11 @@ async function acquireOsLease(
   lockPath: string,
   timeoutMs: number,
 ): Promise<LockLease> {
-  const handle = await open(lockPath, "a", 0o600);
-  await handle.close();
   const token = randomUUID();
   const child =
     process.platform === "win32"
       ? spawnWindowsHolder(lockPath, token, timeoutMs)
-      : spawnPosixHolder(lockPath, token, timeoutMs);
+      : spawnPosixHolder(lockPath, token);
 
   try {
     await waitForAcquisition(child, token, timeoutMs);
@@ -210,14 +207,11 @@ function spawnWindowsHolder(
 function spawnPosixHolder(
   lockPath: string,
   token: string,
-  timeoutMs: number,
 ): ChildProcessWithoutNullStreams {
   return spawn(
     "flock",
     [
-      "--exclusive",
-      "--wait",
-      String(timeoutMs / 1_000),
+      "-x",
       lockPath,
       process.execPath,
       "-e",
@@ -227,6 +221,12 @@ function spawnPosixHolder(
     {
       env: {
         PATH: process.env["PATH"] ?? "",
+        ...(process.env["LD_LIBRARY_PATH"] === undefined
+          ? {}
+          : { LD_LIBRARY_PATH: process.env["LD_LIBRARY_PATH"] }),
+        ...(process.env["DYLD_LIBRARY_PATH"] === undefined
+          ? {}
+          : { DYLD_LIBRARY_PATH: process.env["DYLD_LIBRARY_PATH"] }),
       },
       stdio: ["pipe", "pipe", "pipe"],
     },
@@ -243,9 +243,14 @@ async function waitForAcquisition(
   let settled = false;
 
   await new Promise<void>((resolve, reject) => {
+    // PowerShell enforces the Windows deadline itself, but allow its cold
+    // startup to finish so its explicit timeout result wins. POSIX flock is
+    // deliberately invoked with portable short flags, so this timer is its
+    // acquisition deadline and killing the holder releases any kernel lease.
+    const startupGraceMs = process.platform === "win32" ? 5_000 : 0;
     const timer = setTimeout(() => {
       finish(() => reject(new Error("Timed out waiting for session writer lock.")));
-    }, timeoutMs + 5_000);
+    }, timeoutMs + startupGraceMs);
     timer.unref();
 
     const finish = (action: () => void): void => {

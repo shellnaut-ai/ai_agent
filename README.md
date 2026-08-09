@@ -72,8 +72,9 @@ Bash는 timeout, 출력 한도 초과, `AbortSignal`에서 종료를 조정한�
   배정한 뒤 실행한다. supervisor가 종료되면 Job Object가 닫히며 그 Job Object가 관리하는
   프로세스를 종료한다.
 - POSIX에서는 Bash가 생성한 process group에 `SIGTERM`을 보내고 짧은 grace period 뒤에도
-  남아 있으면 `SIGKILL`을 보낸다. `setsid`처럼 그 process group을 이탈한 descendant까지
-  종료한다고 보장하지 않는다.
+  실행 가능한 멤버가 남아 있으면 `SIGKILL`을 보낸다. reaping 전 zombie는 실행 가능한
+  멤버로 보지 않으며, `setsid`처럼 그 process group을 이탈한 descendant까지 종료한다고
+  보장하지 않는다.
 
 ## 통합 구조
 

@@ -21,8 +21,8 @@
   `outcome unknown` 오류 결과로 닫는다.
 - Provider 전용 replay 상태를 안정적인 assistant message와 함께 영속화한다.
 - Codex 세션이 CLI 재시작과 compaction 이후에도 필요한 replay item을 전송한다.
-- timeout, 출력 한도 초과, AbortSignal에서 Windows Bash child tree 또는 POSIX Bash
-  process group을 종료한다.
+- timeout, 출력 한도 초과, AbortSignal에서 Windows Job Object가 관리하는 Bash
+  process tree 또는 POSIX Bash process group의 실행 가능한 멤버를 종료한다.
 - 기존 llama.cpp, OpenAI-compatible, approval, session branching, compaction 계약을 보존한다.
 
 ## 비목표
@@ -196,8 +196,9 @@ provider serialization 오류로 종료한다.
 출력 한도, abort를 직렬화한다. 중복 종료 요청은 같은 Promise를 재사용한다.
 
 - POSIX: bash를 별도 process group으로 생성하고 같은 group에 `SIGTERM`을 보낸다. 짧은
-  grace period 뒤 살아 있으면 `SIGKILL`을 보낸다. 하위 프로세스가 스스로 `setsid` 등으로
-  group을 이탈한 경우까지 종료한다고 보장하지 않는다.
+  grace period 뒤 실행 가능한 멤버가 남아 있으면 `SIGKILL`을 보낸다. reaping 전 zombie는
+  실행 가능한 멤버로 보지 않으며, 하위 프로세스가 스스로 `setsid` 등으로 group을 이탈한
+  경우까지 종료한다고 보장하지 않는다.
 - Windows: supervisor는 Bash를 suspended 상태로 만든 뒤 `KILL_ON_JOB_CLOSE` Job Object에
   배정하고 그 뒤에만 실행한다. timeout, 출력 한도, abort에서는 supervisor를 종료하며,
   supervisor 종료로 Job Object가 닫혀 그 Job Object가 관리하는 프로세스를 종료한다.
@@ -230,8 +231,8 @@ provider serialization 오류로 종료한다.
 6. compaction으로 message index가 바뀐 뒤에도 kept assistant의 reasoning과 function-call
    item `id`가 포함되는 test.
 7. malformed providerState JSONL을 line number와 함께 거부하는 test.
-8. timeout, output limit, AbortSignal에서 Windows Job Object가 관리하는 프로세스 또는
-   POSIX process group이 종료되는 test.
+8. timeout, output limit, AbortSignal에서 Windows Job Object가 관리하는 프로세스가
+   종료되고 POSIX process group에 실행 가능한 멤버가 남지 않는 test.
 9. user append, assistant checkpoint, tool-result append, final assistant checkpoint 각각의
    저장 실패가 이후 상태 전이를 중단하는 test.
 10. 기존 전체 `npm run check` 회귀 검사.
@@ -244,6 +245,7 @@ provider serialization 오류로 종료한다.
 - 도구 실행 뒤 tool-result append가 실패한 재현에서는 다음 재개 시 unknown recovery가
   추가되고 도구가 자동 재실행되지 않는다.
 - Codex 재시작과 compaction 재현에서 reasoning item과 function-call item ID가 모두 보존된다.
-- Bash 종료 뒤 Windows에서는 Job Object가 관리하던 프로세스가, POSIX에서는 같은 process
-  group이 남지 않는다.
+- Bash 종료 뒤 Windows에서는 Job Object가 관리하던 프로세스가 남지 않고, POSIX에서는
+  같은 process group에 실행 가능한 멤버가 남지 않는다. reaping 전 zombie는 실행 가능한
+  멤버로 보지 않는다.
 - 기존 64개 테스트와 새 테스트, typecheck, build, CLI EOF smoke가 모두 통과한다.

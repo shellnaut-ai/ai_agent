@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
   mkdtemp,
   readFile,
@@ -82,6 +83,24 @@ function bashPath(): string {
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
+
+    if (process.platform === "linux") {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const state = stat.slice(stat.lastIndexOf(")") + 2, -1)[0];
+
+        if (state === "Z" || state === "X" || state === "x") {
+          return false;
+        }
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          return false;
+        }
+
+        throw error;
+      }
+    }
+
     return true;
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code === "ESRCH") {
@@ -347,27 +366,27 @@ function startChildBashScenario(
   const script = String.raw`
 import { writeFileSync } from "node:fs";
 import { BashTool } from "${new URL("./bash.ts", import.meta.url).href}";
-import { spawnWindowsBashSupervisor } from "${new URL("./windows-bash-supervisor.ts", import.meta.url).href}";
+import { spawnWindowsBashSupervisor, windowsBashSupervisorRuntime } from "${new URL("./windows-bash-supervisor.ts", import.meta.url).href}";
 
 const controller = new AbortController();
 const abortAfterMs = Number(process.env.PI_CLONE_CHILD_ABORT_AFTER_MS);
+windowsBashSupervisorRuntime.spawn = async (options) => {
+  const supervisor = await spawnWindowsBashSupervisor({
+    ...options,
+    scratchRootDir: process.env.PI_CLONE_CHILD_ROOT,
+    startupDelayMs: Number(process.env.PI_CLONE_CHILD_STARTUP_DELAY_MS),
+  });
+  writeFileSync(
+    process.env.PI_CLONE_CHILD_SUPERVISOR_PID,
+    String(supervisor.child.pid),
+    "utf8",
+  );
+  return supervisor;
+};
 const tool = new BashTool({
   rootDir: process.env.PI_CLONE_CHILD_ROOT,
   shellPath: process.env.PI_CLONE_CHILD_SHELL,
   timeoutMs: Number(process.env.PI_CLONE_CHILD_TIMEOUT_MS),
-  windowsSupervisorFactory: async (options) => {
-    const supervisor = await spawnWindowsBashSupervisor({
-      ...options,
-      scratchRootDir: process.env.PI_CLONE_CHILD_ROOT,
-      startupDelayMs: Number(process.env.PI_CLONE_CHILD_STARTUP_DELAY_MS),
-    });
-    writeFileSync(
-      process.env.PI_CLONE_CHILD_SUPERVISOR_PID,
-      String(supervisor.child.pid),
-      "utf8",
-    );
-    return supervisor;
-  },
 });
 
 if (Number.isFinite(abortAfterMs)) {

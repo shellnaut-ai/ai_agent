@@ -6,8 +6,7 @@ import { Type } from "typebox";
 
 import { terminateProcessTree } from "./process-tree.js";
 import {
-  spawnWindowsBashSupervisor,
-  type SpawnWindowsBashSupervisorOptions,
+  windowsBashSupervisorRuntime,
   type WindowsBashSupervisor,
 } from "./windows-bash-supervisor.js";
 import type {
@@ -17,16 +16,11 @@ import type {
   ToolOutput,
 } from "./types.js";
 
-export type WindowsBashSupervisorFactory = (
-  options: SpawnWindowsBashSupervisorOptions,
-) => Promise<WindowsBashSupervisor>;
-
 export interface BashToolOptions {
   readonly rootDir: string;
   readonly shellPath?: string;
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
-  readonly windowsSupervisorFactory?: WindowsBashSupervisorFactory;
 }
 
 interface CapturedOutput {
@@ -97,6 +91,8 @@ function watchStreamEnd(stream: Readable): StreamEndWatcher {
   stream.once("close", onClose);
   stream.once("error", onError);
 
+  void promise.catch(() => undefined);
+
   return { promise, dispose };
 }
 
@@ -121,6 +117,7 @@ export class BashTool implements Tool {
       {
         command: Type.String({
           minLength: 1,
+          pattern: "^[^\\u0000]*$",
           description: "Complete Bash command to execute.",
         }),
       },
@@ -134,16 +131,12 @@ export class BashTool implements Tool {
   private readonly shellPath: string;
   private readonly timeoutMs: number;
   private readonly maxOutputBytes: number;
-  private readonly windowsSupervisorFactory: WindowsBashSupervisorFactory;
 
   constructor(options: BashToolOptions) {
     this.rootDir = resolve(options.rootDir);
     this.shellPath = options.shellPath ?? "bash";
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.maxOutputBytes = options.maxOutputBytes ?? 64 * 1024;
-    this.windowsSupervisorFactory =
-      options.windowsSupervisorFactory ?? spawnWindowsBashSupervisor;
-
     if (this.shellPath.trim().length === 0) {
       throw new Error("BashTool shellPath must be a non-empty string.");
     }
@@ -187,13 +180,20 @@ export class BashTool implements Tool {
       };
     }
 
+    if (commandValue.includes("\0")) {
+      return {
+        content: "bash.command must not contain NUL characters.",
+        isError: true,
+      };
+    }
+
     let supervisor: WindowsBashSupervisor | undefined;
 
     try {
       const rootRealPath = await realpath(this.rootDir);
       supervisor =
         process.platform === "win32"
-          ? await this.windowsSupervisorFactory({
+          ? await windowsBashSupervisorRuntime.spawn({
               shellPath: this.shellPath,
               command: commandValue,
               cwd: rootRealPath,
@@ -328,17 +328,14 @@ export class BashTool implements Tool {
           terminal =
             supervisor === undefined
               ? await terminalPromise
-              : await Promise.race([
-                  Promise.all([
-                    supervisor.rootExit,
-                    stdoutEnd.promise,
-                    stderrEnd.promise,
-                  ]).then(([exitCode]) => ({
-                    exitCode,
-                    signal: null,
-                  })),
-                  terminalPromise,
-                ]);
+              : await Promise.all([
+                  supervisor.rootExit,
+                  stdoutEnd.promise,
+                  stderrEnd.promise,
+                ]).then(([exitCode]) => ({
+                  exitCode,
+                  signal: null,
+                }));
         } catch (error: unknown) {
           if (terminationPromise === undefined) {
             throw error;
