@@ -4,6 +4,7 @@ import type {
   ModelStreamRunner,
 } from "./runtime.js";
 import type { ModelRequest } from "./types.js";
+import { cloneModelRequest } from "./request-clone.js";
 
 export interface RetryOptions {
   readonly maxRetries: number;
@@ -63,6 +64,7 @@ export class RetryingModelRuntime implements ModelStreamRunner {
     options?: StreamOptions,
   ): AsyncIterable<ModelRuntimeEvent> {
     let startEmitted = false;
+    const pristineRequest = cloneModelRequest(request);
 
     for (
       let attemptIndex = 0;
@@ -73,7 +75,9 @@ export class RetryingModelRuntime implements ModelStreamRunner {
       let terminalEventSeen = false;
       let retryError: Error | undefined;
 
-      for await (const event of this.runner.stream(request, options)) {
+      const attemptRequest = cloneModelRequest(pristineRequest);
+
+      for await (const event of this.runner.stream(attemptRequest, options)) {
         if (event.type === "start") {
           if (!startEmitted) {
             startEmitted = true;

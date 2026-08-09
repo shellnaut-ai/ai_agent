@@ -413,84 +413,392 @@ describe("OpenAICodexProvider", () => {
     }));
   });
 
-  test("does not consume replay state owned by another provider", async () => {
-    let requestCount = 0;
-    let captured: Request | undefined;
+  test("does not emit a partial mutating call from response.incomplete", async () => {
     const provider = new OpenAICodexProvider({
       model,
       resolver: { resolve: async () => credential },
-      fetch: async (input, init) => {
-        requestCount += 1;
-        if (requestCount === 1) return replayResponse();
-        captured = new Request(input, init);
-        return terminalResponse();
+      fetch: async () => sseResponse([
+        JSON.stringify({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: {
+            type: "function_call",
+            call_id: "call-1",
+            name: "write",
+            arguments: '{"path":"partial',
+          },
+        }),
+        JSON.stringify({
+          type: "response.incomplete",
+          response: {
+            status: "incomplete",
+            incomplete_details: { reason: "max_output_tokens" },
+          },
+        }),
+      ]),
+    });
+
+    const events = await collect(provider.stream(request()));
+
+    expect(events.some((event) => event.type === "tool-call")).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: "done", reason: "length" });
+  });
+
+  test("fails content_filter incomplete responses explicitly", async () => {
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async () => sseResponse([
+        JSON.stringify({
+          type: "response.incomplete",
+          response: {
+            status: "incomplete",
+            incomplete_details: { reason: "content_filter" },
+          },
+        }),
+      ]),
+    });
+
+    const events = await collect(provider.stream(request()));
+
+    expect(events.some((event) => event.type === "tool-call")).toBe(false);
+    expect(events.some((event) => event.type === "done")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { message: expect.stringMatching(/content_filter/i) },
+    });
+  });
+
+  test("uses final function arguments when only the done event contains them", async () => {
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async () => sseResponse([
+        JSON.stringify({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: {
+            type: "function_call",
+            id: "fc-1",
+            call_id: "call-1",
+            name: "read",
+            arguments: "",
+          },
+        }),
+        JSON.stringify({
+          type: "response.function_call_arguments.done",
+          output_index: 0,
+          arguments: '{"path":"final.txt"}',
+        }),
+        JSON.stringify({
+          type: "response.completed",
+          response: { status: "completed" },
+        }),
+      ]),
+    });
+
+    const events = await collect(provider.stream(request()));
+
+    expect(events).toContainEqual({
+      type: "tool-call",
+      toolCall: {
+        id: "call-1",
+        name: "read",
+        arguments: { path: "final.txt" },
       },
     });
-    const firstEvents = await collect(provider.stream({
+  });
+
+  test("prefers canonical final arguments over provisional deltas", async () => {
+    const provider = new OpenAICodexProvider({
       model,
-      messages: [{ role: "user", content: "read a.txt" }],
-      tools: [],
-    }));
+      resolver: { resolve: async () => credential },
+      fetch: async () => sseResponse([
+        JSON.stringify({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: {
+            type: "function_call",
+            call_id: "call-1",
+            name: "read",
+            arguments: '{"path":"provisional.txt"}',
+          },
+        }),
+        JSON.stringify({
+          type: "response.function_call_arguments.done",
+          output_index: 0,
+          arguments: '{"path":"canonical.txt"}',
+        }),
+        JSON.stringify({
+          type: "response.completed",
+          response: { status: "completed" },
+        }),
+      ]),
+    });
+
+    const events = await collect(provider.stream(request()));
+    const call = events.find((event) => event.type === "tool-call");
+
+    expect(call).toMatchObject({
+      type: "tool-call",
+      toolCall: { arguments: { path: "canonical.txt" } },
+    });
+  });
+
+  test("rejects malformed canonical final arguments before emitting a call", async () => {
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async () => sseResponse([
+        JSON.stringify({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: {
+            type: "function_call",
+            call_id: "call-1",
+            name: "read",
+            arguments: "{}",
+          },
+        }),
+        JSON.stringify({
+          type: "response.function_call_arguments.done",
+          output_index: 0,
+          arguments: "{",
+        }),
+        JSON.stringify({
+          type: "response.completed",
+          response: { status: "completed" },
+        }),
+      ]),
+    });
+
+    const events = await collect(provider.stream(request()));
+
+    expect(events.some((event) => event.type === "tool-call")).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: "error" });
+  });
+
+  test("uses a final function item without provisional events", async () => {
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async () => sseResponse([
+        JSON.stringify({
+          type: "response.completed",
+          response: {
+            status: "completed",
+            output: [{
+              type: "function_call",
+              id: "fc-final",
+              call_id: "call-final",
+              name: "read",
+              arguments: '{"path":"final-only.txt"}',
+            }],
+          },
+        }),
+      ]),
+    });
+
+    const events = await collect(provider.stream(request()));
+
+    expect(events).toContainEqual({
+      type: "tool-call",
+      toolCall: {
+        id: "call-final",
+        name: "read",
+        arguments: { path: "final-only.txt" },
+      },
+    });
+    expect(events.at(-1)).toMatchObject({ type: "done", reason: "tool-call" });
+  });
+
+  test("maps reversed final function item IDs by call ID", async () => {
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async () => sseResponse([
+        JSON.stringify({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: {
+            type: "function_call",
+            call_id: "call-1",
+            name: "read",
+            arguments: "",
+          },
+        }),
+        JSON.stringify({
+          type: "response.output_item.added",
+          output_index: 1,
+          item: {
+            type: "function_call",
+            call_id: "call-2",
+            name: "read",
+            arguments: "",
+          },
+        }),
+        JSON.stringify({
+          type: "response.output_item.done",
+          output_index: 1,
+          item: {
+            type: "function_call",
+            id: "fc-2",
+            call_id: "call-2",
+            name: "read",
+            arguments: '{"path":"two.txt"}',
+          },
+        }),
+        JSON.stringify({
+          type: "response.output_item.done",
+          output_index: 0,
+          item: {
+            type: "function_call",
+            id: "fc-1",
+            call_id: "call-1",
+            name: "read",
+            arguments: '{"path":"one.txt"}',
+          },
+        }),
+        JSON.stringify({
+          type: "response.completed",
+          response: { status: "completed" },
+        }),
+      ]),
+    });
+
+    const events = await collect(provider.stream(request()));
+    const done = events.find((event) => event.type === "done");
+
+    expect(done).toMatchObject({
+      providerState: {
+        value: {
+          functionItemIds: { "call-1": "fc-1", "call-2": "fc-2" },
+        },
+      },
+    });
+    expect(
+      events
+        .filter((event) => event.type === "tool-call")
+        .map((event) => event.toolCall.id),
+    ).toEqual(["call-1", "call-2"]);
+  });
+
+  test("rejects duplicate Codex call IDs before emitting tools", async () => {
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async () => sseResponse([
+        JSON.stringify({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: {
+            type: "function_call",
+            call_id: "duplicate",
+            name: "read",
+            arguments: "{}",
+          },
+        }),
+        JSON.stringify({
+          type: "response.output_item.added",
+          output_index: 1,
+          item: {
+            type: "function_call",
+            call_id: "duplicate",
+            name: "read",
+            arguments: "{}",
+          },
+        }),
+      ]),
+    });
+
+    const events = await collect(provider.stream(request()));
+
+    expect(events.some((event) => event.type === "tool-call")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { message: expect.stringMatching(/duplicate/i) },
+    });
+  });
+
+  test("fails before fetch when replay state belongs to another provider", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const resolveCredential = vi.fn(async () => credential);
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: resolveCredential },
+      fetch,
+    });
     const assistant: AssistantMessage = {
-      ...assistantFrom(firstEvents),
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        id: "call-1",
+        name: "read",
+        arguments: { path: "a.txt" },
+      }],
       providerState: {
         provider: "fake",
-        value: {
-          reasoningItems: [{
-            type: "reasoning",
-            id: "foreign-rs",
-            summary: [],
-            encrypted_content: "foreign-encrypted",
-          }],
-          functionItemIds: { "call-1": "foreign-fc" },
-        },
+        value: { foreign: true },
       },
     };
 
-    await collect(provider.stream({
+    const events = await collect(provider.stream({
       model,
-      messages: [
-        { role: "user", content: "read a.txt" },
-        assistant,
-      ],
+      messages: [assistant],
       tools: [],
     }));
 
-    const input = await requestInput(captured);
-    expect(input).not.toContainEqual(expect.objectContaining({
-      type: "reasoning",
-    }));
-    expect(input).toContainEqual(expect.objectContaining({
-      type: "function_call",
-      call_id: "call-1",
-    }));
-    expect(input).not.toContainEqual(expect.objectContaining({
-      type: "function_call",
-      id: expect.any(String),
-      call_id: "call-1",
-    }));
+    expect(events.at(-1)).toMatchObject({ type: "error" });
+    expect(resolveCredential).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
   });
 
-  test("ignores malformed Codex replay state as one invalid value", async () => {
-    let requestCount = 0;
-    let captured: Request | undefined;
+  test("fails before credentials or fetch when replay arguments are undefined", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const resolveCredential = vi.fn(async () => credential);
     const provider = new OpenAICodexProvider({
       model,
-      resolver: { resolve: async () => credential },
-      fetch: async (input, init) => {
-        requestCount += 1;
-        if (requestCount === 1) return replayResponse();
-        captured = new Request(input, init);
-        return terminalResponse();
-      },
+      resolver: { resolve: resolveCredential },
+      fetch,
     });
-    const firstEvents = await collect(provider.stream({
+    const assistant: AssistantMessage = {
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        id: "call-undefined",
+        name: "read",
+        arguments: undefined,
+      }],
+    };
+
+    const events = await collect(provider.stream({
       model,
-      messages: [{ role: "user", content: "read a.txt" }],
+      messages: [assistant],
       tools: [],
     }));
+
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: {
+        message: 'Tool call "call-undefined" arguments must not be undefined.',
+      },
+    });
+    expect(resolveCredential).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("fails before fetch when persisted Codex replay state is malformed", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const resolveCredential = vi.fn(async () => credential);
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: resolveCredential },
+      fetch,
+    });
     const assistant: AssistantMessage = {
-      ...assistantFrom(firstEvents),
+      role: "assistant",
+      content: "",
+      toolCalls: [],
       providerState: {
         provider: "openai-codex",
         value: {
@@ -500,23 +808,32 @@ describe("OpenAICodexProvider", () => {
       },
     };
 
-    await collect(provider.stream({
+    const events = await collect(provider.stream({
       model,
-      messages: [
-        { role: "user", content: "read a.txt" },
-        assistant,
-      ],
+      messages: [assistant],
       tools: [],
     }));
 
-    const input = await requestInput(captured);
-    expect(input).not.toContainEqual(expect.objectContaining({
-      type: "reasoning",
+    expect(events.at(-1)).toMatchObject({ type: "error" });
+    expect(resolveCredential).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("accepts legacy assistant messages with no provider state", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => terminalResponse());
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch,
+    });
+
+    const events = await collect(provider.stream({
+      model,
+      messages: [{ role: "assistant", content: "legacy", toolCalls: [] }],
+      tools: [],
     }));
-    expect(input).not.toContainEqual(expect.objectContaining({
-      type: "function_call",
-      id: expect.any(String),
-      call_id: "call-1",
-    }));
+
+    expect(events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 });

@@ -6,6 +6,7 @@ import type {
   StreamEvent,
 } from "../model/types.js";
 import type { ToolDefinition } from "../tools/types.js";
+import { serializeToolCallArguments } from "../tools/arguments.js";
 import { readSseData } from "./sse.js";
 
 export interface OpenAICompatibleProviderOptions {
@@ -218,7 +219,7 @@ function serializeMessage(message: Message): Record<string, unknown> {
       type: "function",
       function: {
         name: call.name,
-        arguments: JSON.stringify(call.arguments),
+        arguments: serializeToolCallArguments(call),
       },
     })),
   };

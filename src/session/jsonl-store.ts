@@ -194,7 +194,8 @@ function parseToolCall(value: unknown): ToolCall {
     !isRecord(value) ||
     typeof value.id !== "string" ||
     typeof value.name !== "string" ||
-    !("arguments" in value)
+    !("arguments" in value) ||
+    value.arguments === undefined
   ) {
     throw new Error("Invalid ToolCall in session file.");
   }

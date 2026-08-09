@@ -9,6 +9,7 @@ import type {
   StreamEvent,
 } from "../model/types.js";
 import type { ToolDefinition } from "../tools/types.js";
+import { serializeToolCallArguments } from "../tools/arguments.js";
 import { readSseData } from "./sse.js";
 
 export interface CredentialResolver {
@@ -77,23 +78,10 @@ export class OpenAICodexProvider implements ModelProvider {
         );
       }
 
-      // 인증을 먼저 해결해야 credential이 없을 때 model endpoint에 요청하지 않는다.
-      const credential = await this.#resolver.resolve(options?.signal);
       const instructions = [this.#instructions, request.systemPrompt]
         .filter((value): value is string => value !== undefined)
         .join("\n\n");
-      const response = await this.#fetch(this.#endpoint, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${credential.accessToken}`,
-        "chatgpt-account-id": credential.accountId,
-        originator: this.#originator,
-        accept: "text/event-stream",
-        "content-type": "application/json",
-        "openai-beta": "responses=experimental",
-        "user-agent": "pi-clone/0.0.0",
-      },
-      body: JSON.stringify({
+      const body = JSON.stringify({
         model: request.model.id,
         ...(instructions === ""
           ? {}
@@ -107,36 +95,53 @@ export class OpenAICodexProvider implements ModelProvider {
         stream: true,
         store: false,
         include: ["reasoning.encrypted_content"],
-      }),
-      ...(options?.signal === undefined ? {} : { signal: options.signal }),
+      });
+      // 로컬 replay 직렬화 검증이 끝난 뒤에만 credential과 network를 사용한다.
+      const credential = await this.#resolver.resolve(options?.signal);
+      const response = await this.#fetch(this.#endpoint, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${credential.accessToken}`,
+          "chatgpt-account-id": credential.accountId,
+          originator: this.#originator,
+          accept: "text/event-stream",
+          "content-type": "application/json",
+          "openai-beta": "responses=experimental",
+          "user-agent": "pi-clone/0.0.0",
+        },
+        body,
+        ...(options?.signal === undefined ? {} : { signal: options.signal }),
       });
 
-    if (!response.ok) {
-      // 서버 body 전체는 출력하지 않는다. 단, 구조와 문장이 정확히 일치하는 알려진
-      // unsupported-model 오류만 우리가 만든 안전한 안내 문장으로 바꾼다.
-      const suffix = await safeHttpErrorSuffix(response, request.model.id);
-      throw new Error(
-        `OpenAI Codex provider request failed (${response.status})${suffix}`,
-      );
-    }
-    if (response.body === null) {
-      throw new Error("OpenAI Codex provider returned an empty response body");
-    }
+      if (!response.ok) {
+        // 서버 body 전체는 출력하지 않는다. 단, 구조와 문장이 정확히 일치하는 알려진
+        // unsupported-model 오류만 우리가 만든 안전한 안내 문장으로 바꾼다.
+        const suffix = await safeHttpErrorSuffix(response, request.model.id);
+        throw new Error(
+          `OpenAI Codex provider request failed (${response.status})${suffix}`,
+        );
+      }
+      if (response.body === null) {
+        throw new Error(
+          "OpenAI Codex provider returned an empty response body",
+        );
+      }
 
       let sawToolCall = false;
       const reasoningItems = new Map<string, Record<string, JsonValue>>();
       const toolItems = new Map<string, string>();
       const pendingCalls = new Map<number, PendingToolCall>();
+      const seenCallIds = new Set<string>();
       for await (const data of readSseData(response.body)) {
-      if (data === "[DONE]") break;
-      const event = parseEvent(data);
-      const type = requireString(event.type, "type");
+        if (data === "[DONE]") break;
+        const event = parseEvent(data);
+        const type = requireString(event.type, "type");
 
-      if (type === "response.output_text.delta") {
-        const delta = requireString(event.delta, "delta");
-        yield { type: "text-delta", delta };
-        continue;
-      }
+        if (type === "response.output_text.delta") {
+          const delta = requireString(event.delta, "delta");
+          yield { type: "text-delta", delta };
+          continue;
+        }
 
       if (type === "response.output_item.added") {
         const item = requireRecord(event.item, "item");
@@ -145,7 +150,13 @@ export class OpenAICodexProvider implements ModelProvider {
         const argumentsValue = optionalString(item.arguments, "item.arguments");
         const callId = requireString(item.call_id, "item.call_id");
         const functionItemId = optionalString(item.id, "item.id");
-        if (functionItemId !== undefined) toolItems.set(callId, functionItemId);
+        if (pendingCalls.has(index) || seenCallIds.has(callId)) {
+          throw malformed(`duplicate function call ID "${callId}"`);
+        }
+        seenCallIds.add(callId);
+        if (functionItemId !== undefined) {
+          setFunctionItemId(toolItems, callId, functionItemId);
+        }
         sawToolCall = true;
         pendingCalls.set(index, {
           id: callId,
@@ -166,11 +177,34 @@ export class OpenAICodexProvider implements ModelProvider {
         continue;
       }
 
+      if (type === "response.function_call_arguments.done") {
+        sawToolCall = true;
+        const index = requireIndex(event.output_index, "output_index");
+        const pending = pendingCalls.get(index);
+        if (pending === undefined) {
+          throw malformed("final function arguments have no function call");
+        }
+        setCanonicalArguments(
+          pending,
+          requireString(event.arguments, "arguments"),
+        );
+        continue;
+      }
+
       if (type === "response.output_item.done") {
         const item = requireRecord(event.item, "item");
         if (item.type === "reasoning") {
           const replay = parseReasoningItem(item);
           reasoningItems.set(requireString(replay.id, "item.id"), replay);
+        } else if (item.type === "function_call") {
+          sawToolCall = true;
+          recordFinalFunctionItem(
+            requireIndex(event.output_index, "output_index"),
+            item,
+            pendingCalls,
+            toolItems,
+            seenCallIds,
+          );
         }
         continue;
       }
@@ -180,21 +214,37 @@ export class OpenAICodexProvider implements ModelProvider {
         || type === "response.done"
         || type === "response.incomplete"
       ) {
-        collectTerminalReasoning(event, reasoningItems);
-        const replayItems = [...reasoningItems.values()];
+        if (type === "response.incomplete") {
+          const incompleteReason = readIncompleteReason(event);
+
+          if (incompleteReason !== "max_output_tokens") {
+            throw new Error(
+              `OpenAI Codex provider response was incomplete: ` +
+                `${incompleteReason ?? "unknown"}.`,
+            );
+          }
+
+          collectTerminalReasoning(event, reasoningItems);
+          const providerState = createProviderState(reasoningItems, toolItems);
+          yield { type: "done", reason: "length", providerState };
+          return;
+        }
+
+        collectTerminalOutput(
+          event,
+          reasoningItems,
+          pendingCalls,
+          toolItems,
+          seenCallIds,
+        );
         // store:false에서는 다음 요청이 이전 output item을 다시 보내야 한다.
         // provider wire metadata를 assistant message와 함께 영속화할 수 있게 전달한다.
-        const providerState: ProviderMessageState = {
-          provider: "openai-codex",
-          value: {
-            reasoningItems: replayItems,
-            functionItemIds: Object.fromEntries(toolItems),
-          },
-        };
-        if (sawToolCall) yield* completeToolCalls(pendingCalls);
+        const providerState = createProviderState(reasoningItems, toolItems);
+        const hasToolCalls = sawToolCall || pendingCalls.size > 0;
+        if (hasToolCalls) yield* completeToolCalls(pendingCalls);
         yield {
           type: "done",
-          reason: finishReason(type, event, sawToolCall),
+          reason: hasToolCalls ? "tool-call" : "stop",
           providerState,
         };
         return;
@@ -220,6 +270,7 @@ interface PendingToolCall {
   readonly id: string;
   readonly name: string;
   argumentsText: string;
+  finalArgumentsText?: string;
 }
 
 function* completeToolCalls(
@@ -230,7 +281,9 @@ function* completeToolCalls(
   )) {
     let argumentsValue: unknown;
     try {
-      argumentsValue = JSON.parse(call.argumentsText || "{}") as unknown;
+      argumentsValue = JSON.parse(
+        (call.finalArgumentsText ?? call.argumentsText) || "{}",
+      ) as unknown;
     } catch {
       throw malformed(`function call "${call.name}" has invalid arguments`);
     }
@@ -243,6 +296,85 @@ function* completeToolCalls(
       },
     };
   }
+}
+
+function setCanonicalArguments(
+  call: PendingToolCall,
+  argumentsText: string,
+): void {
+  if (
+    call.finalArgumentsText !== undefined &&
+    call.finalArgumentsText !== argumentsText
+  ) {
+    throw malformed(`function call "${call.name}" has conflicting final arguments`);
+  }
+
+  call.finalArgumentsText = argumentsText;
+}
+
+function setFunctionItemId(
+  toolItems: Map<string, string>,
+  callId: string,
+  functionItemId: string,
+): void {
+  const existing = toolItems.get(callId);
+
+  if (existing !== undefined && existing !== functionItemId) {
+    throw malformed(`function call "${callId}" has conflicting item IDs`);
+  }
+
+  toolItems.set(callId, functionItemId);
+}
+
+function recordFinalFunctionItem(
+  index: number,
+  item: Record<string, unknown>,
+  pendingCalls: Map<number, PendingToolCall>,
+  toolItems: Map<string, string>,
+  seenCallIds: Set<string>,
+): void {
+  const callId = requireString(item.call_id, "item.call_id");
+  const name = requireString(item.name, "item.name");
+  const argumentsText = requireString(item.arguments, "item.arguments");
+  const functionItemId = optionalString(item.id, "item.id");
+  const pending = pendingCalls.get(index);
+
+  if (pending === undefined) {
+    if (seenCallIds.has(callId)) {
+      throw malformed(`duplicate function call ID "${callId}"`);
+    }
+
+    seenCallIds.add(callId);
+    pendingCalls.set(index, {
+      id: callId,
+      name,
+      argumentsText: "",
+      finalArgumentsText: argumentsText,
+    });
+  } else {
+    if (pending.id !== callId || pending.name !== name) {
+      throw malformed(`final function item at index ${index} does not match its call`);
+    }
+
+    setCanonicalArguments(pending, argumentsText);
+  }
+
+  if (functionItemId !== undefined) {
+    setFunctionItemId(toolItems, callId, functionItemId);
+  }
+}
+
+function createProviderState(
+  reasoningItems: ReadonlyMap<string, Record<string, JsonValue>>,
+  toolItems: ReadonlyMap<string, string>,
+): ProviderMessageState {
+  return {
+    provider: "openai-codex",
+    value: {
+      reasoningItems: [...reasoningItems.values()],
+      functionItemIds: Object.fromEntries(toolItems),
+    },
+  };
 }
 
 async function safeHttpErrorSuffix(
@@ -322,7 +454,7 @@ function serializeMessages(
           : { id: functionItemId }),
         call_id: call.id,
         name: call.name,
-        arguments: JSON.stringify(call.arguments),
+        arguments: serializeToolCallArguments(call),
       });
     }
   }
@@ -338,24 +470,42 @@ function readCodexReplay(
   message: Extract<Message, { role: "assistant" }>,
 ): CodexReplay | undefined {
   const state = message.providerState;
-  if (state?.provider !== "openai-codex" || !isPlainRecord(state.value)) {
+
+  if (state === undefined) {
     return undefined;
+  }
+
+  if (state.provider !== "openai-codex") {
+    throw new Error(
+      `OpenAI Codex provider cannot serialize assistant state owned by ` +
+        `"${state.provider}".`,
+    );
+  }
+
+  if (!isPlainRecord(state.value)) {
+    throw invalidPersistedCodexState();
   }
 
   const reasoningItems = state.value.reasoningItems;
   const functionItemIds = state.value.functionItemIds;
   if (!Array.isArray(reasoningItems) || !isStringRecord(functionItemIds)) {
-    return undefined;
+    throw invalidPersistedCodexState();
   }
 
   const parsedReasoning: Record<string, JsonValue>[] = [];
   for (const value of reasoningItems) {
     const reasoning = readReasoningItem(value);
-    if (reasoning === undefined) return undefined;
+    if (reasoning === undefined) {
+      throw invalidPersistedCodexState();
+    }
     parsedReasoning.push(reasoning);
   }
 
   return { reasoningItems: parsedReasoning, functionItemIds };
+}
+
+function invalidPersistedCodexState(): Error {
+  return new Error("OpenAI Codex provider cannot serialize malformed persisted state.");
 }
 
 function readReasoningItem(
@@ -449,6 +599,53 @@ function collectTerminalReasoning(
   }
 }
 
+function collectTerminalOutput(
+  event: Record<string, unknown>,
+  reasoningItems: Map<string, Record<string, JsonValue>>,
+  pendingCalls: Map<number, PendingToolCall>,
+  toolItems: Map<string, string>,
+  seenCallIds: Set<string>,
+): void {
+  const response = optionalRecord(event.response, "response");
+  const output = response?.output;
+
+  if (output === undefined || output === null) {
+    return;
+  }
+
+  if (!Array.isArray(output)) {
+    throw malformed("response.output must be an array");
+  }
+
+  for (const [index, rawItem] of output.entries()) {
+    const item = requireRecord(rawItem, "response.output[]");
+
+    if (item.type === "reasoning") {
+      const replay = parseReasoningItem(item);
+      reasoningItems.set(requireString(replay.id, "item.id"), replay);
+    } else if (item.type === "function_call") {
+      recordFinalFunctionItem(
+        index,
+        item,
+        pendingCalls,
+        toolItems,
+        seenCallIds,
+      );
+    }
+  }
+}
+
+function readIncompleteReason(
+  event: Record<string, unknown>,
+): string | undefined {
+  const response = optionalRecord(event.response, "response");
+  const details = optionalRecord(
+    response?.incomplete_details,
+    "response.incomplete_details",
+  );
+  return optionalString(details?.reason, "response.incomplete_details.reason");
+}
+
 function serializeTool(tool: ToolDefinition): Record<string, unknown> {
   return {
     type: "function",
@@ -468,18 +665,6 @@ function parseEvent(data: string): Record<string, unknown> {
     }
     throw malformed("event must contain JSON");
   }
-}
-
-function finishReason(
-  type: string,
-  event: Record<string, unknown>,
-  sawToolCall: boolean,
-): "length" | "stop" | "tool-call" {
-  if (sawToolCall) return "tool-call";
-  if (type !== "response.incomplete") return "stop";
-  const response = optionalRecord(event.response, "response");
-  const details = optionalRecord(response?.incomplete_details, "response.incomplete_details");
-  return details?.reason === "max_output_tokens" ? "length" : "stop";
 }
 
 function requireRecord(value: unknown, field: string): Record<string, unknown> {

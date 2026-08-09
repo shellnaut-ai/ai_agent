@@ -221,6 +221,23 @@ describe("JSONL store consistency", () => {
     expect(await readFile(first.filePath, "utf8")).toBe(before);
   });
 
+  test("rejects undefined tool arguments before changing durable bytes", async () => {
+    const { first } = await createStores("undefined-tool-arguments");
+    const before = await readFile(first.filePath, "utf8");
+
+    await expect(new Session(first).appendMessage({
+      role: "assistant",
+      content: "",
+      toolCalls: [{
+        id: "call-undefined",
+        name: "read",
+        arguments: undefined,
+      }],
+    })).rejects.toThrow("Invalid ToolCall in session file.");
+
+    expect(await readFile(first.filePath, "utf8")).toBe(before);
+  });
+
   test("a poisoned checkpoint prevents tool side effects and later provider calls", async () => {
     const { first } = await createStores("poison-side-effect-gate");
     let providerCalls = 0;

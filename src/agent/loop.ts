@@ -10,6 +10,7 @@ import type {
 } from "../model/types.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { ToolCall, ToolResult } from "../tools/types.js";
+import { cloneToolDefinition } from "../tools/definition.js";
 import type { AgentEvent, AgentLoopOptions, AgentRequest } from "./types.js";
 
 export class AgentLoop {
@@ -77,15 +78,33 @@ export class AgentLoop {
 
     const newMessages: Message[] = [];
     let completedToolBatches = 0;
+    const seenToolCallIds = new Set<string>();
 
-    const definitions = this.toolRegistry.listDefinitions();
+    for (const message of request.messages) {
+      if (message.role !== "assistant") {
+        continue;
+      }
+
+      for (const call of message.toolCalls) {
+        if (seenToolCallIds.has(call.id)) {
+          yield {
+            type: "error",
+            reason: "error",
+            error: new Error(`Duplicate tool call ID "${call.id}".`),
+          };
+          return;
+        }
+
+        seenToolCallIds.add(call.id);
+      }
+    }
 
     try {
       for (let step = 0; step < maxSteps; step += 1) {
         const modelRequest: ModelRequest = {
           model: request.model,
           messages: structuredClone(workingMessages),
-          tools: definitions,
+          tools: this.toolRegistry.listDefinitions(),
         };
 
         let assistantContent = "";
@@ -125,6 +144,12 @@ export class AgentLoop {
 
           if (event.type === "tool-call") {
             const toolCall = structuredClone(event.toolCall);
+
+            if (seenToolCallIds.has(toolCall.id)) {
+              throw new Error(`Duplicate tool call ID "${toolCall.id}".`);
+            }
+
+            seenToolCallIds.add(toolCall.id);
             toolCalls.push(toolCall);
 
             yield {
@@ -248,7 +273,9 @@ export class AgentLoop {
               ? await this.approvalHandler.requestApproval(
                   {
                     toolCall: structuredClone(preparation.executableCall),
-                    definition: preparation.tool.definition,
+                    definition: cloneToolDefinition(
+                      preparation.tool.definition,
+                    ),
                   },
                   {
                     signal: options?.signal,

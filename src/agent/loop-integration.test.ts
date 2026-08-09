@@ -532,4 +532,168 @@ describe("AgentLoop integration policies", () => {
     expect(toolExecutions).toBe(1);
     expect(events.at(-1)).toMatchObject({ type: "error", reason: "error" });
   });
+
+  test("isolates later provider requests from definition mutation", async () => {
+    let providerCalls = 0;
+    let followUpTools: ModelRequest["tools"] | undefined;
+    const runner: ModelStreamRunner = {
+      async *stream(request): AsyncIterable<StreamEvent> {
+        providerCalls += 1;
+        yield { type: "start" };
+
+        if (providerCalls === 1) {
+          const definition = request.tools[0];
+
+          if (definition !== undefined) {
+            (definition as { description: string }).description = "mutated";
+            const properties = (definition.inputSchema as {
+              properties: Record<string, unknown>;
+            }).properties;
+            properties.path = Type.Number();
+          }
+
+          yield {
+            type: "tool-call",
+            toolCall: {
+              id: "call-1",
+              name: "read-test",
+              arguments: { path: "a.txt" },
+            },
+          };
+          yield { type: "done", reason: "tool-call" };
+          return;
+        }
+
+        followUpTools = request.tools;
+        yield { type: "done", reason: "stop" };
+      },
+    };
+    const registry = new ToolRegistry();
+    registry.register({
+      approval: "never",
+      definition: {
+        name: "read-test",
+        description: "Read a path.",
+        inputSchema: Type.Object({ path: Type.String() }),
+      },
+      async execute() {
+        return { content: "ok", isError: false };
+      },
+    });
+
+    await collect(new AgentLoop(runner, registry).stream({ model, messages: [] }));
+
+    expect(followUpTools?.[0]?.description).toBe("Read a path.");
+    expect(
+      (followUpTools?.[0]?.inputSchema as {
+        properties: { path: { type: string } };
+      }).properties.path.type,
+    ).toBe("string");
+    expect(registry.listDefinitions()[0]?.description).toBe("Read a path.");
+  });
+
+  test("isolates the registry and later requests from approval definition mutation", async () => {
+    let providerCalls = 0;
+    let toolExecutions = 0;
+    let followUpDescription: string | undefined;
+    const runner: ModelStreamRunner = {
+      async *stream(request): AsyncIterable<StreamEvent> {
+        providerCalls += 1;
+        yield { type: "start" };
+
+        if (providerCalls === 1) {
+          yield {
+            type: "tool-call",
+            toolCall: {
+              id: "call-1",
+              name: "write-test",
+              arguments: { path: "a.txt" },
+            },
+          };
+          yield { type: "done", reason: "tool-call" };
+          return;
+        }
+
+        followUpDescription = request.tools[0]?.description;
+        yield { type: "done", reason: "stop" };
+      },
+    };
+    const approvalHandler: ToolApprovalHandler = {
+      async requestApproval(request) {
+        (request.definition as { description: string }).description =
+          "approval mutation";
+        const properties = (request.definition.inputSchema as {
+          properties: Record<string, unknown>;
+        }).properties;
+        properties.path = Type.Number();
+        return "allow-once";
+      },
+    };
+    const registry = new ToolRegistry();
+    registry.register({
+      approval: "always",
+      definition: {
+        name: "write-test",
+        description: "Write a path.",
+        inputSchema: Type.Object({ path: Type.String() }),
+      },
+      async execute() {
+        toolExecutions += 1;
+        return { content: "ok", isError: false };
+      },
+    });
+
+    await collect(
+      new AgentLoop(runner, registry, approvalHandler).stream({
+        model,
+        messages: [],
+      }),
+    );
+
+    expect(toolExecutions).toBe(1);
+    expect(followUpDescription).toBe("Write a path.");
+    expect(registry.listDefinitions()[0]?.description).toBe("Write a path.");
+  });
+
+  test("rejects duplicate tool call IDs before checkpoint or execution", async () => {
+    let toolExecutions = 0;
+    const runner: ModelStreamRunner = {
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: "start" };
+        yield {
+          type: "tool-call",
+          toolCall: { id: "duplicate", name: "read-test", arguments: {} },
+        };
+        yield {
+          type: "tool-call",
+          toolCall: { id: "duplicate", name: "read-test", arguments: {} },
+        };
+        yield { type: "done", reason: "tool-call" };
+      },
+    };
+    const registry = new ToolRegistry();
+    registry.register({
+      approval: "never",
+      definition: {
+        name: "read-test",
+        description: "Counts executions.",
+        inputSchema: Type.Object({}, { additionalProperties: false }),
+      },
+      async execute() {
+        toolExecutions += 1;
+        return { content: "ok", isError: false };
+      },
+    });
+
+    const events = await collect(
+      new AgentLoop(runner, registry).stream({ model, messages: [] }),
+    );
+
+    expect(toolExecutions).toBe(0);
+    expect(events.some((event) => event.type === "message-checkpoint")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { message: expect.stringMatching(/duplicate.*tool call/i) },
+    });
+  });
 });
