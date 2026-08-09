@@ -11,7 +11,7 @@ llama.cpp runtime을 보존하면서 OpenAI-compatible endpoint와 ChatGPT Codex
 - Agent: retry, abort, 다단계 tool loop, 선택적 `maxToolBatches`
 - Tools: workspace 안의 read/write/edit와 제한된 bash
 - Approval: write/edit/bash의 once/session/deny 결정
-- Session: JSONL replay, branch leaf, approval 기록, context compaction
+- Session: JSONL replay, branch leaf, approval 기록, context compaction, 부분 turn 복구
 - CLI: 인증, Provider 선택, 세션 재개, EOF 정상 종료
 
 ## 설치와 검증
@@ -48,6 +48,32 @@ npm run cli -- chat --provider openai-codex --model gpt-5.5
 
 OAuth credential은 사용자 credential 파일에 저장하며 access/refresh token을 CLI
 상태 출력이나 Provider 오류에 포함하지 않는다.
+
+## 런타임 복구와 Bash 종료 범위
+
+세션은 사용자 메시지, assistant의 tool-call intent, tool result, 최종 assistant
+메시지를 append-only JSONL에 차례로 checkpoint한다. 따라서 도구가 실행된 뒤 모델 호출이나
+프로세스가 중단되어도 완료된 턴 전체를 기다리지 않고 기록된 지점부터 세션을 다시 열 수
+있다. 이는 도구 부작용을 트랜잭션으로 만들거나 rollback하는 기능은 아니다.
+
+결과가 기록되지 않은 tool-call intent를 세션 재개 시 발견하면, 런타임은 해당 호출을
+`outcome unknown` 오류 결과로 닫고 workspace 상태를 점검하라고 알린다. 도구를 자동으로
+재실행하지 않으므로, 재시도 여부는 사용자가 실제 상태를 확인한 뒤 결정해야 한다.
+
+ChatGPT Codex provider는 `store: false` 후속 요청에 필요한 provider 전용 replay state를
+assistant 메시지와 함께 JSONL에 저장한다. 같은 세션을 CLI 재시작 후 재개하거나 compaction
+뒤에도 보존된 assistant 메시지를 다시 사용할 때, encrypted reasoning item과 function-call
+item ID를 다음 Codex 요청에 replay한다. compaction summary 자체에는 이 opaque state를 넣지
+않는다.
+
+Bash는 timeout, 출력 한도 초과, `AbortSignal`에서 종료를 조정한다.
+
+- Windows에서는 supervisor가 Bash를 suspended 상태로 만들고 `KILL_ON_JOB_CLOSE` Job Object에
+  배정한 뒤 실행한다. supervisor가 종료되면 Job Object가 닫히며 그 Job Object가 관리하는
+  프로세스를 종료한다.
+- POSIX에서는 Bash가 생성한 process group에 `SIGTERM`을 보내고 짧은 grace period 뒤에도
+  남아 있으면 `SIGKILL`을 보낸다. `setsid`처럼 그 process group을 이탈한 descendant까지
+  종료한다고 보장하지 않는다.
 
 ## 통합 구조
 

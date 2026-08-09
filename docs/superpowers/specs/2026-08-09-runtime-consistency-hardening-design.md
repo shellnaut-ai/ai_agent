@@ -198,8 +198,9 @@ provider serialization 오류로 종료한다.
 - POSIX: bash를 별도 process group으로 생성하고 같은 group에 `SIGTERM`을 보낸다. 짧은
   grace period 뒤 살아 있으면 `SIGKILL`을 보낸다. 하위 프로세스가 스스로 `setsid` 등으로
   group을 이탈한 경우까지 종료한다고 보장하지 않는다.
-- Windows: 생성한 child PID를 정확히 지정해 `taskkill.exe /PID <pid> /T /F`를 숨김 창으로
-  실행하고 완료를 기다린다.
+- Windows: supervisor는 Bash를 suspended 상태로 만든 뒤 `KILL_ON_JOB_CLOSE` Job Object에
+  배정하고 그 뒤에만 실행한다. timeout, 출력 한도, abort에서는 supervisor를 종료하며,
+  supervisor 종료로 Job Object가 닫혀 그 Job Object가 관리하는 프로세스를 종료한다.
 - 이미 종료된 프로세스의 `ESRCH` 또는 taskkill의 not-found 결과는 성공적인 정리로 본다.
 - 종료 후 stdout/stderr listener와 AbortSignal listener를 제거한다.
 
@@ -243,5 +244,6 @@ provider serialization 오류로 종료한다.
 - 도구 실행 뒤 tool-result append가 실패한 재현에서는 다음 재개 시 unknown recovery가
   추가되고 도구가 자동 재실행되지 않는다.
 - Codex 재시작과 compaction 재현에서 reasoning item과 function-call item ID가 모두 보존된다.
-- Bash 종료 뒤 Windows에서는 child tree가, POSIX에서는 같은 process group이 남지 않는다.
+- Bash 종료 뒤 Windows에서는 Job Object가 관리하던 프로세스가, POSIX에서는 같은 process
+  group이 남지 않는다.
 - 기존 64개 테스트와 새 테스트, typecheck, build, CLI EOF smoke가 모두 통과한다.
