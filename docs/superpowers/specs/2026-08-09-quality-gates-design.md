@@ -37,8 +37,14 @@ npm update nanoid --package-lock-only --ignore-scripts
 ```
 
 PostCSS의 `^3.3.16` 범위 안 patch이므로 Vitest/Vite 버전과 제품 dependency graph는
-변경하지 않는다. diff에서 `nanoid` entry의 version, resolved, integrity만 바뀌는지
-검사하며 다른 package entry 변경은 허용하지 않는다.
+변경하지 않는다. 허용하는 dependency/config diff는 정확히 다음 네 범위다.
+
+1. `package.json` root `engines.node`
+2. `package-lock.json` root package의 `engines.node`
+3. `package-lock.json` nanoid entry의 version, resolved, integrity
+4. 새 `.github/workflows/ci.yml`
+
+그 밖의 package entry 변경은 허용하지 않는다.
 
 검증 명령은 다음과 같다.
 
