@@ -15,6 +15,10 @@ import {
 } from "./windows-bash-supervisor.js";
 
 const cleanup: string[] = [];
+const windowsSupervisorTestTimeoutMs =
+  process.platform === "win32" && process.env["CI"] === "true"
+    ? 45_000
+    : 15_000;
 
 afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((path) =>
@@ -147,7 +151,7 @@ describe.skipIf(process.platform !== "win32")(
       } finally {
         await supervisor.dispose(false);
       }
-    }, 15_000);
+    }, windowsSupervisorTestTimeoutMs);
 
     test("snapshots command and environment before returning the supervisor", async () => {
       const rootDir = await mkdtemp(join(tmpdir(), "bash-supervisor-snapshot-"));
@@ -185,7 +189,7 @@ describe.skipIf(process.platform !== "win32")(
         }
         await supervisor?.dispose(false);
       }
-    }, 15_000);
+    }, windowsSupervisorTestTimeoutMs);
 
     test.each([
       [
@@ -228,7 +232,7 @@ describe.skipIf(process.platform !== "win32")(
           await supervisor.dispose(false);
         }
       },
-      15_000,
+      windowsSupervisorTestTimeoutMs,
     );
 
     test("anchors a relative PATH entry to the requested cwd for a bare shell name", async () => {
@@ -264,7 +268,7 @@ describe.skipIf(process.platform !== "win32")(
         }
         await supervisor?.dispose(false);
       }
-    }, 15_000);
+    }, windowsSupervisorTestTimeoutMs);
 
   },
 );

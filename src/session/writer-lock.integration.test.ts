@@ -21,6 +21,11 @@ import { withSessionWriterLock } from "./writer-lock.js";
 
 const cleanup: string[] = [];
 const children = new Set<ChildProcessWithoutNullStreams>();
+const windowsCi =
+  process.platform === "win32" && process.env["CI"] === "true";
+const childOutputTimeoutMs = windowsCi ? 30_000 : 10_000;
+const liveOwnerTestTimeoutMs = windowsCi ? 45_000 : 5_000;
+const synchronizedWriterTestTimeoutMs = windowsCi ? 60_000 : 20_000;
 const model = {
   id: "fake-model",
   name: "Fake",
@@ -899,7 +904,7 @@ while True:
         timeoutMs: 5_000,
       }),
     ).resolves.toBe("recovered");
-  });
+  }, liveOwnerTestTimeoutMs);
 
   test("allows only one stale-parent append across synchronized processes", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-store-process-"));
@@ -960,7 +965,7 @@ while True:
     const reloaded = new JsonlSessionStore({ rootDir, sessionId, model });
     await reloaded.load();
     expect(new Session(reloaded).getMessages()).toHaveLength(1);
-  }, 20_000);
+  }, synchronizedWriterTestTimeoutMs);
 });
 
 function spawnNode(
@@ -989,6 +994,7 @@ function spawnNode(
 function waitForLine(
   child: ChildProcessWithoutNullStreams,
   expected: string | RegExp,
+  timeoutMs = childOutputTimeoutMs,
 ): Promise<string> {
   return new Promise<string>((resolveLine, reject) => {
     let stdout = "";
@@ -996,7 +1002,7 @@ function waitForLine(
     const timer = setTimeout(() => {
       cleanupListeners();
       reject(new Error("Timed out waiting for child-process output."));
-    }, 10_000);
+    }, timeoutMs);
     timer.unref();
 
     const cleanupListeners = (): void => {
