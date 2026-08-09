@@ -35,9 +35,11 @@
 
 ### 메시지 저장 시점
 
-`ChatSession.streamTurn()`은 새 사용자 메시지를 모델 호출 전에 저장한다. Agent는 모델의
-terminal event를 받은 뒤 완성된 assistant message를 만들고, 도구가 필요한 경우 그
-assistant message를 어떤 도구도 실행하기 전에 checkpoint event로 내보낸다.
+`ChatSession.streamTurn()`의 순서는 `recover → compact(pending user) → append user →
+Agent`로 고정한다. compaction은 아직 저장되지 않은 `pendingUserMessage`를 현재 계약대로
+한 번만 계산하고, 성공한 뒤 사용자 메시지를 저장한다. Agent는 모델의 terminal event를
+받은 뒤 완성된 assistant message를 만들고, 도구가 필요한 경우 그 assistant message를
+어떤 도구도 실행하기 전에 checkpoint event로 내보낸다.
 
 ```mermaid
 sequenceDiagram
@@ -46,7 +48,8 @@ sequenceDiagram
     participant A as AgentLoop
     participant T as Tool
 
-    C->>S: append user message
+    C->>C: recover and compact with pending user
+    C->>S: append user message once
     C->>A: stream active messages
     A-->>C: assistant-message checkpoint
     C->>S: append assistant tool-call intent
@@ -82,6 +85,27 @@ type AgentToolResultEvent = {
 기존 `done.newMessages`는 AgentLoop 직접 사용자의 호환성을 위해 유지하되 ChatSession은
 이를 다시 일괄 저장하지 않는다.
 
+### Session 단건 append 계약
+
+증분 journal은 완성 턴만 받는 기존 `appendMessages()`와 분리한다.
+
+```ts
+class Session {
+  appendMessage(message: Message): Promise<MessageEntry>;
+  recoverInterruptedToolCalls(): Promise<readonly ToolResultMessage[]>;
+}
+```
+
+`appendMessage()`는 현재 leaf를 parent로 하는 entry 하나를 append한 뒤 성공한 경우에만
+store의 leaf를 전진시킨다. user, assistant, tool result를 모두 받을 수 있지만 tool result는
+현재 branch에 존재하고 아직 결과가 없는 tool call ID만 허용한다. assistant tool call ID는
+현재 branch에서 중복될 수 없다. 기존 `appendMessages()`는 완성된 턴을 원자적으로 추가하는
+public API로 유지하고 새 journal 경로에서는 사용하지 않는다.
+
+compaction entry는 사용자 메시지를 저장하기 전에 기존 leaf에 추가된다. 이어지는 user
+entry는 compaction entry를 parent로 사용하므로 `buildActiveMessages()`에서 pending user가
+중복되지 않는다.
+
 ### 중단된 도구 호출 복구
 
 `Session.recoverInterruptedToolCalls()`는 현재 branch path를 순서대로 읽어 assistant의
@@ -93,9 +117,18 @@ Tool execution was interrupted before its result was recorded. The outcome is
 unknown. Inspect workspace state before retrying this operation.
 ```
 
-복구 결과는 `isError: true`이며 도구를 자동 재실행하지 않는다. `ChatSession`은 새 사용자
-메시지를 저장하기 전에 이 복구를 수행하고 `session-recovery` event로 복구된 call ID를
-CLI에 알린다. 복구 기록 저장이 실패하면 새 턴을 시작하지 않는다.
+복구 결과는 `isError: true`이며 도구를 자동 재실행하지 않는다. `ChatSession`은 compaction과
+새 사용자 메시지 저장 전에 이 복구를 수행하고 다음 event로 복구된 call ID를 CLI에 알린다.
+
+```ts
+type SessionRecoveryEvent = {
+  readonly type: "session-recovery";
+  readonly recoveredToolCallIds: readonly string[];
+};
+```
+
+CLI는 각 ID와 함께 outcome이 불명임을 출력한다. 복구 기록 저장이 실패하면 새 턴을
+시작하지 않는다.
 
 모델 호출 자체가 실패해 사용자 메시지만 남은 경우는 기록을 유지한다. 다음 입력은 연속된
 user message로 추가될 수 있으며, 이는 실패했던 요청을 숨기지 않는 의도적인 동작이다.
@@ -115,6 +148,8 @@ type JsonValue =
   | string
   | readonly JsonValue[]
   | { readonly [key: string]: JsonValue };
+
+type JsonObject = { readonly [key: string]: JsonValue };
 
 interface ProviderMessageState {
   readonly provider: ProviderId;
@@ -144,7 +179,8 @@ interface CodexAssistantState {
 }
 ```
 
-`OpenAICodexProvider`는 terminal event에서 이 값을 `done.providerState`로 내보낸다.
+`OpenAICodexProvider`는 terminal event에서 reasoning item과 function call item ID를 모두
+이 값에 넣어 `done.providerState`로 내보낸다.
 다음 요청을 직렬화할 때 각 assistant message의 state를 직접 읽으므로 Provider 인스턴스
 배열과 `messageIndex` 검색은 제거한다. CLI 재시작 시 JSONL에서 복원된 message state를
 사용하고, compaction은 보존하는 최근 message 객체와 state를 함께 이동한다. 요약 텍스트에는
@@ -158,8 +194,9 @@ provider serialization 오류로 종료한다.
 `BashTool`은 AbortSignal을 `spawn`에 직접 넘기지 않고 하나의 종료 coordinator가 timeout,
 출력 한도, abort를 직렬화한다. 중복 종료 요청은 같은 Promise를 재사용한다.
 
-- POSIX: bash를 별도 process group으로 생성하고 group에 `SIGTERM`을 보낸다. 짧은 grace
-  period 뒤 살아 있으면 `SIGKILL`을 보낸다.
+- POSIX: bash를 별도 process group으로 생성하고 같은 group에 `SIGTERM`을 보낸다. 짧은
+  grace period 뒤 살아 있으면 `SIGKILL`을 보낸다. 하위 프로세스가 스스로 `setsid` 등으로
+  group을 이탈한 경우까지 종료한다고 보장하지 않는다.
 - Windows: 생성한 child PID를 정확히 지정해 `taskkill.exe /PID <pid> /T /F`를 숨김 창으로
   실행하고 완료를 기다린다.
 - 이미 종료된 프로세스의 `ESRCH` 또는 taskkill의 not-found 결과는 성공적인 정리로 본다.
@@ -186,16 +223,24 @@ provider serialization 오류로 종료한다.
 3. 정상 tool turn이 user, assistant, tool result, final assistant 순서로 한 번씩 저장되는 test.
 4. Codex provider를 새 인스턴스로 교체하고 JSONL replay 후 reasoning item이 request에
    포함되는 test.
-5. compaction으로 message index가 바뀐 뒤에도 kept assistant state가 포함되는 test.
-6. malformed providerState JSONL을 line number와 함께 거부하는 test.
-7. timeout, output limit, AbortSignal에서 child tree가 종료되는 test.
-8. 기존 전체 `npm run check` 회귀 검사.
+5. 새 Provider 인스턴스와 JSONL replay에서 reasoning item과 function-call item `id`가 모두
+   request에 포함되는 test.
+6. compaction으로 message index가 바뀐 뒤에도 kept assistant의 reasoning과 function-call
+   item `id`가 포함되는 test.
+7. malformed providerState JSONL을 line number와 함께 거부하는 test.
+8. timeout, output limit, AbortSignal에서 Windows child tree 또는 POSIX process group이
+   종료되는 test.
+9. user append, assistant checkpoint, tool-result append, final assistant checkpoint 각각의
+   저장 실패가 이후 상태 전이를 중단하는 test.
+10. 기존 전체 `npm run check` 회귀 검사.
 
 ## 완료 기준
 
 - 위 테스트가 구현 전 정확한 이유로 실패하고 구현 후 통과한다.
-- 도구 실행 후 후속 모델 실패 재현에서 JSONL에 user, assistant intent, 결과 또는 unknown
-  recovery가 남는다.
-- Codex 재시작 재현에서 reasoning item 수가 0보다 크다.
-- Bash 종료 뒤 생성된 하위 프로세스가 남지 않는다.
+- 도구 실행은 성공하고 후속 Provider만 실패한 재현에서는 실제 tool result가 JSONL에 남고
+  unknown recovery가 추가되지 않는다.
+- 도구 실행 뒤 tool-result append가 실패한 재현에서는 다음 재개 시 unknown recovery가
+  추가되고 도구가 자동 재실행되지 않는다.
+- Codex 재시작과 compaction 재현에서 reasoning item과 function-call item ID가 모두 보존된다.
+- Bash 종료 뒤 Windows에서는 child tree가, POSIX에서는 같은 process group이 남지 않는다.
 - 기존 64개 테스트와 새 테스트, typecheck, build, CLI EOF smoke가 모두 통과한다.
