@@ -9,8 +9,11 @@ import { resolve } from "node:path";
 
 import type {
   AssistantMessage,
+  JsonValue,
   Message,
   Model,
+  ProviderId,
+  ProviderMessageState,
   ToolResultMessage,
   UserMessage,
 } from "../model/types.js";
@@ -40,6 +43,77 @@ interface EntryBaseFields {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isPlainJsonObject(
+  value: unknown,
+): value is Record<string, unknown> {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isProviderId(value: unknown): value is ProviderId {
+  return (
+    value === "codex" ||
+    value === "claude" ||
+    value === "llama" ||
+    value === "fake" ||
+    value === "openai-compatible" ||
+    value === "openai-codex"
+  );
+}
+
+function parseJsonValue(value: unknown): JsonValue {
+  if (
+    value === null ||
+    typeof value === "boolean" ||
+    typeof value === "string"
+  ) {
+    return value;
+  }
+
+  if (typeof value === "number") {
+    if (Number.isFinite(value)) {
+      return value;
+    }
+
+    throw new Error("Provider state must contain only finite numbers.");
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(parseJsonValue);
+  }
+
+  if (isPlainJsonObject(value)) {
+    const result: Record<string, JsonValue> = {};
+
+    for (const [key, item] of Object.entries(value)) {
+      result[key] = parseJsonValue(item);
+    }
+
+    return result;
+  }
+
+  throw new Error("Provider state must contain only JSON-compatible values.");
+}
+
+function parseProviderState(value: unknown): ProviderMessageState {
+  if (!isPlainJsonObject(value) || !isProviderId(value.provider)) {
+    throw new Error("Invalid provider state in session file.");
+  }
+
+  if (!("value" in value)) {
+    throw new Error("Invalid provider state in session file.");
+  }
+
+  return {
+    provider: value.provider,
+    value: parseJsonValue(value.value),
+  };
 }
 
 function isFileNotFound(error: unknown): boolean {
@@ -98,10 +172,15 @@ function parseMessage(value: unknown): Message {
     typeof value.content === "string" &&
     Array.isArray(value.toolCalls)
   ) {
+    const providerState =
+      "providerState" in value
+        ? parseProviderState(value.providerState)
+        : undefined;
     const message: AssistantMessage = {
       role: "assistant",
       content: value.content,
       toolCalls: value.toolCalls.map(parseToolCall),
+      ...(providerState === undefined ? {} : { providerState }),
     };
 
     return message;

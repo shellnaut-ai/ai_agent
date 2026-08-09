@@ -26,6 +26,104 @@ const model = {
 };
 
 describe("session compatibility", () => {
+  test("preserves JSON-safe provider state from a version-2 assistant record", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-session-"));
+    cleanup.push(rootDir);
+    const store = new JsonlSessionStore({
+      rootDir,
+      sessionId: "provider-state",
+      model,
+    });
+    await store.load();
+    await appendFile(
+      store.filePath,
+      `${JSON.stringify({
+        type: "message",
+        id: "assistant-1",
+        parentId: null,
+        timestamp: "2026-08-09T00:00:00.000Z",
+        message: {
+          role: "assistant",
+          content: "I considered the request.",
+          toolCalls: [],
+          providerState: {
+            provider: "openai-codex",
+            value: {
+              reasoningItems: [{ type: "reasoning", id: "rs_1" }],
+              functionItemIds: { "call-1": "fc_1" },
+            },
+          },
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    const loaded = await new JsonlSessionStore({
+      rootDir,
+      sessionId: "provider-state",
+      model,
+    }).load();
+
+    expect(loaded.entries).toEqual([
+      {
+        type: "message",
+        id: "assistant-1",
+        parentId: null,
+        timestamp: "2026-08-09T00:00:00.000Z",
+        message: {
+          role: "assistant",
+          content: "I considered the request.",
+          toolCalls: [],
+          providerState: {
+            provider: "openai-codex",
+            value: {
+              reasoningItems: [{ type: "reasoning", id: "rs_1" }],
+              functionItemIds: { "call-1": "fc_1" },
+            },
+          },
+        },
+      },
+    ]);
+  });
+
+  test("rejects non-finite provider state with its JSONL line number", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-session-"));
+    cleanup.push(rootDir);
+    const store = new JsonlSessionStore({
+      rootDir,
+      sessionId: "non-finite-provider-state",
+      model,
+    });
+    await store.load();
+    await appendFile(
+      store.filePath,
+      `${JSON.stringify({
+        type: "message",
+        id: "assistant-1",
+        parentId: null,
+        timestamp: "2026-08-09T00:00:00.000Z",
+        message: {
+          role: "assistant",
+          content: "I considered the request.",
+          toolCalls: [],
+          providerState: {
+            provider: "openai-codex",
+            value: 0,
+          },
+        },
+      }).replace('"value":0', '"value":1e999')}\n`,
+      "utf8",
+    );
+
+    await expect(
+      new JsonlSessionStore({
+        rootDir,
+        sessionId: "non-finite-provider-state",
+        model,
+      }).load(),
+    ).rejects.toThrow("line 2");
+  });
+
   test("rejects a structurally invalid JSONL record with its line number", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-session-"));
     cleanup.push(rootDir);
