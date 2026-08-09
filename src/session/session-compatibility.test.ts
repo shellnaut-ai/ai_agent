@@ -287,6 +287,17 @@ describe("session compatibility", () => {
     );
     expect(session.getMessages()).toEqual([]);
   });
+
+  test("does not advance the journal when single-message persistence fails", async () => {
+    const store = new FailingSessionStore();
+    const session = new Session(store);
+
+    await expect(
+      session.appendMessage({ role: "user", content: "hello" }),
+    ).rejects.toThrow("persistence failed");
+    expect(store.getLeafId()).toBeNull();
+    expect(session.getMessages()).toEqual([]);
+  });
 });
 
 class FailingSessionStore implements SessionStore {
