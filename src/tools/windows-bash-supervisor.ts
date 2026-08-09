@@ -32,9 +32,21 @@ export interface WindowsBashSupervisor {
   dispose(detach: boolean): Promise<void>;
 }
 
+export interface SpawnWindowsBashSupervisorOptions {
+  readonly shellPath: string;
+  readonly command: string;
+  readonly cwd: string;
+  readonly scratchRootDir?: string;
+  readonly startupDelayMs?: number;
+}
+
 const POWERSHELL_SUPERVISOR = `
 $ErrorActionPreference = 'Stop'
 try {
+  $startupDelay = [int]$env:PI_CLONE_BASH_STARTUP_DELAY_MS
+  if ($startupDelay -gt 0) {
+    Start-Sleep -Milliseconds $startupDelay
+  }
   Add-Type -Path $env:PI_CLONE_SUPERVISOR_SOURCE
   $command = [IO.File]::ReadAllText($env:PI_CLONE_BASH_COMMAND_PATH)
   $code = [PiCloneWindowsJobSupervisor]::Run(
@@ -287,6 +299,25 @@ public static class PiCloneWindowsJobSupervisor
         return job;
     }
 
+    private static void PublishExitStatus(string statusPath, uint exitCode)
+    {
+        string temporaryPath = statusPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            File.WriteAllText(
+                temporaryPath,
+                exitCode.ToString(CultureInfo.InvariantCulture));
+            File.Move(temporaryPath, statusPath);
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath))
+            {
+                File.Delete(temporaryPath);
+            }
+        }
+    }
+
     public static int Run(
         string shellPath,
         string command,
@@ -366,7 +397,7 @@ public static class PiCloneWindowsJobSupervisor
             {
                 ThrowLastError("GetExitCodeProcess");
             }
-            File.WriteAllText(statusPath, exitCode.ToString(CultureInfo.InvariantCulture));
+            PublishExitStatus(statusPath, exitCode);
             WaitForSingleObject(job, INFINITE);
             return unchecked((int)exitCode);
         }
@@ -414,13 +445,37 @@ function createWindowsEnvironmentBlock(environment: NodeJS.ProcessEnv): Buffer {
   return Buffer.from(`${entries.join("\0")}\0\0`, "utf16le");
 }
 
+export function parseWindowsBashExitStatus(raw: string): number {
+  if (!/^\d+$/u.test(raw)) {
+    throw new Error(`Invalid Windows Bash exit status: ${raw}`);
+  }
+
+  const exitCode = Number(raw);
+  if (
+    !Number.isSafeInteger(exitCode) ||
+    exitCode < 0 ||
+    exitCode > 0xffff_ffff
+  ) {
+    throw new Error(`Invalid Windows Bash exit status: ${raw}`);
+  }
+
+  return exitCode;
+}
+
+function observePromise<T>(promise: Promise<T>): Promise<T> {
+  void promise.catch(() => undefined);
+  return promise;
+}
+
 async function createPausedPipe(name: string): Promise<PausedPipe> {
   let resolveConnection: (socket: Socket) => void = () => undefined;
   let rejectConnection: (error: Error) => void = () => undefined;
-  const connection = new Promise<Socket>((resolve, reject) => {
-    resolveConnection = resolve;
-    rejectConnection = reject;
-  });
+  const connection = observePromise(
+    new Promise<Socket>((resolve, reject) => {
+      resolveConnection = resolve;
+      rejectConnection = reject;
+    }),
+  );
   const pipe: PausedPipe = {
     server: createServer({ pauseOnConnect: true }),
     connection,
@@ -491,14 +546,7 @@ function waitForRootExit(
 
       try {
         const raw = await readFile(statusPath, "utf8");
-        const exitCode = Number.parseInt(raw.trim(), 10);
-
-        if (!Number.isInteger(exitCode)) {
-          finish(() =>
-            reject(new Error(`Invalid Windows Bash exit status: ${raw}`)),
-          );
-          return;
-        }
+        const exitCode = parseWindowsBashExitStatus(raw);
 
         finish(() => resolve(exitCode));
       } catch (error: unknown) {
@@ -514,19 +562,17 @@ function waitForRootExit(
       }
     };
 
-    close.then(
-      async () => {
+    void close
+      .then(async () => {
         if (settled) {
           return;
         }
 
         try {
           const raw = await readFile(statusPath, "utf8");
-          const exitCode = Number.parseInt(raw.trim(), 10);
-          if (Number.isInteger(exitCode)) {
-            finish(() => resolve(exitCode));
-            return;
-          }
+          const exitCode = parseWindowsBashExitStatus(raw);
+          finish(() => resolve(exitCode));
+          return;
         } catch (error: unknown) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
             finish(() => reject(error));
@@ -536,22 +582,22 @@ function waitForRootExit(
 
         const message = await readSupervisorError(errorPath);
         finish(() => reject(new Error(message)));
-      },
-      (error: unknown) => finish(() => reject(error)),
-    );
+      })
+      .catch((error: unknown) => finish(() => reject(error)));
 
     void poll();
   });
 }
 
-export async function spawnWindowsBashSupervisor(options: {
-  readonly shellPath: string;
-  readonly command: string;
-  readonly cwd: string;
-}): Promise<WindowsBashSupervisor> {
+export async function spawnWindowsBashSupervisor(
+  options: SpawnWindowsBashSupervisorOptions,
+): Promise<WindowsBashSupervisor> {
   const id = randomUUID();
   const supervisorDir = await mkdtemp(
-    join(tmpdir(), "pi-clone-bash-supervisor-"),
+    join(
+      options.scratchRootDir ?? tmpdir(),
+      "pi-clone-bash-supervisor-",
+    ),
   );
   const sourcePath = join(supervisorDir, "supervisor.cs");
   const commandPath = join(supervisorDir, "command.txt");
@@ -594,6 +640,9 @@ export async function spawnWindowsBashSupervisor(options: {
           PI_CLONE_BASH_ENVIRONMENT: environmentPath,
           PI_CLONE_BASH_ERROR: errorPath,
           PI_CLONE_BASH_SHELL: options.shellPath,
+          PI_CLONE_BASH_STARTUP_DELAY_MS: String(
+            options.startupDelayMs ?? 0,
+          ),
           PI_CLONE_BASH_STATUS: statusPath,
           PI_CLONE_BASH_STDERR_PIPE: stderrName,
           PI_CLONE_BASH_STDOUT_PIPE: stdoutName,
@@ -604,23 +653,29 @@ export async function spawnWindowsBashSupervisor(options: {
       },
     );
 
-    const close = new Promise<SupervisorTerminal>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", (exitCode, signal) =>
-        resolve({ exitCode, signal }),
-      );
-    });
+    const close = observePromise(
+      new Promise<SupervisorTerminal>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", (exitCode, signal) =>
+          resolve({ exitCode, signal }),
+        );
+      }),
+    );
     const stdoutConnection = stdoutPipe.connection;
     const stderrConnection = stderrPipe.connection;
-    const output = Promise.race([
-      Promise.all([stdoutConnection, stderrConnection]).then(
-        ([stdout, stderr]) => ({ stdout, stderr }),
-      ),
-      close.then(async () => {
-        throw new Error(await readSupervisorError(errorPath));
-      }),
-    ]);
-    const rootExit = waitForRootExit(statusPath, errorPath, close);
+    const output = observePromise(
+      Promise.race([
+        Promise.all([stdoutConnection, stderrConnection]).then(
+          ([stdout, stderr]) => ({ stdout, stderr }),
+        ),
+        close.then(async () => {
+          throw new Error(await readSupervisorError(errorPath));
+        }),
+      ]),
+    );
+    const rootExit = observePromise(
+      waitForRootExit(statusPath, errorPath, close),
+    );
 
     return {
       child,

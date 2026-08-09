@@ -7,6 +7,7 @@ import { Type } from "typebox";
 import { terminateProcessTree } from "./process-tree.js";
 import {
   spawnWindowsBashSupervisor,
+  type SpawnWindowsBashSupervisorOptions,
   type WindowsBashSupervisor,
 } from "./windows-bash-supervisor.js";
 import type {
@@ -16,11 +17,16 @@ import type {
   ToolOutput,
 } from "./types.js";
 
+export type WindowsBashSupervisorFactory = (
+  options: SpawnWindowsBashSupervisorOptions,
+) => Promise<WindowsBashSupervisor>;
+
 export interface BashToolOptions {
   readonly rootDir: string;
   readonly shellPath?: string;
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
+  readonly windowsSupervisorFactory?: WindowsBashSupervisorFactory;
 }
 
 interface CapturedOutput {
@@ -128,12 +134,15 @@ export class BashTool implements Tool {
   private readonly shellPath: string;
   private readonly timeoutMs: number;
   private readonly maxOutputBytes: number;
+  private readonly windowsSupervisorFactory: WindowsBashSupervisorFactory;
 
   constructor(options: BashToolOptions) {
     this.rootDir = resolve(options.rootDir);
     this.shellPath = options.shellPath ?? "bash";
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.maxOutputBytes = options.maxOutputBytes ?? 64 * 1024;
+    this.windowsSupervisorFactory =
+      options.windowsSupervisorFactory ?? spawnWindowsBashSupervisor;
 
     if (this.shellPath.trim().length === 0) {
       throw new Error("BashTool shellPath must be a non-empty string.");
@@ -184,7 +193,7 @@ export class BashTool implements Tool {
       const rootRealPath = await realpath(this.rootDir);
       supervisor =
         process.platform === "win32"
-          ? await spawnWindowsBashSupervisor({
+          ? await this.windowsSupervisorFactory({
               shellPath: this.shellPath,
               command: commandValue,
               cwd: rootRealPath,
@@ -243,6 +252,7 @@ export class BashTool implements Tool {
         child.once("error", onChildError);
         child.once("close", onChildClose);
       });
+      void terminalPromise.catch(() => undefined);
 
       const requestTermination = (): Promise<void> => {
         terminationPromise ??= terminateProcessTree(child, process.platform);
@@ -295,34 +305,47 @@ export class BashTool implements Tool {
       timeout.unref();
 
       try {
-        const output =
-          supervisor === undefined
-            ? { stdout: child.stdout!, stderr: child.stderr! }
-            : await supervisor.output;
-        stdoutStream = output.stdout;
-        stderrStream = output.stderr;
+        let terminal: {
+          readonly exitCode: number | null;
+          readonly signal: NodeJS.Signals | null;
+        };
 
-        output.stdout.on("data", onStdoutData);
-        output.stderr.on("data", onStderrData);
-        stdoutEnd = watchStreamEnd(output.stdout);
-        stderrEnd = watchStreamEnd(output.stderr);
-        output.stdout.resume();
-        output.stderr.resume();
+        try {
+          const output =
+            supervisor === undefined
+              ? { stdout: child.stdout!, stderr: child.stderr! }
+              : await supervisor.output;
+          stdoutStream = output.stdout;
+          stderrStream = output.stderr;
 
-        const terminal =
-          supervisor === undefined
-            ? await terminalPromise
-            : await Promise.race([
-                Promise.all([
-                  supervisor.rootExit,
-                  stdoutEnd.promise,
-                  stderrEnd.promise,
-                ]).then(([exitCode]) => ({
-                  exitCode,
-                  signal: null,
-                })),
-                terminalPromise,
-              ]);
+          output.stdout.on("data", onStdoutData);
+          output.stderr.on("data", onStderrData);
+          stdoutEnd = watchStreamEnd(output.stdout);
+          stderrEnd = watchStreamEnd(output.stderr);
+          output.stdout.resume();
+          output.stderr.resume();
+
+          terminal =
+            supervisor === undefined
+              ? await terminalPromise
+              : await Promise.race([
+                  Promise.all([
+                    supervisor.rootExit,
+                    stdoutEnd.promise,
+                    stderrEnd.promise,
+                  ]).then(([exitCode]) => ({
+                    exitCode,
+                    signal: null,
+                  })),
+                  terminalPromise,
+                ]);
+        } catch (error: unknown) {
+          if (terminationPromise === undefined) {
+            throw error;
+          }
+
+          terminal = await terminalPromise;
+        }
 
         if (terminationPromise !== undefined) {
           await terminationPromise;

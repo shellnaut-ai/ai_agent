@@ -1,6 +1,12 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -316,6 +322,165 @@ async function cleanupBashFixture(
   if (errors.length > 0) {
     throw errors[0];
   }
+}
+
+interface ChildBashScenario {
+  readonly timeoutMs: number;
+  readonly startupDelayMs: number;
+  readonly abortAfterMs?: number;
+}
+
+interface ChildBashCompletion {
+  readonly exitCode: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+function startChildBashScenario(
+  rootDir: string,
+  supervisorPidPath: string,
+  scenario: ChildBashScenario,
+): {
+  readonly child: ReturnType<typeof spawn>;
+  readonly completion: Promise<ChildBashCompletion>;
+} {
+  const script = String.raw`
+import { writeFileSync } from "node:fs";
+import { BashTool } from "${new URL("./bash.ts", import.meta.url).href}";
+import { spawnWindowsBashSupervisor } from "${new URL("./windows-bash-supervisor.ts", import.meta.url).href}";
+
+const controller = new AbortController();
+const abortAfterMs = Number(process.env.PI_CLONE_CHILD_ABORT_AFTER_MS);
+const tool = new BashTool({
+  rootDir: process.env.PI_CLONE_CHILD_ROOT,
+  shellPath: process.env.PI_CLONE_CHILD_SHELL,
+  timeoutMs: Number(process.env.PI_CLONE_CHILD_TIMEOUT_MS),
+  windowsSupervisorFactory: async (options) => {
+    const supervisor = await spawnWindowsBashSupervisor({
+      ...options,
+      scratchRootDir: process.env.PI_CLONE_CHILD_ROOT,
+      startupDelayMs: Number(process.env.PI_CLONE_CHILD_STARTUP_DELAY_MS),
+    });
+    writeFileSync(
+      process.env.PI_CLONE_CHILD_SUPERVISOR_PID,
+      String(supervisor.child.pid),
+      "utf8",
+    );
+    return supervisor;
+  },
+});
+
+if (Number.isFinite(abortAfterMs)) {
+  setTimeout(() => controller.abort(), abortAfterMs);
+}
+
+try {
+  const result = await tool.execute(
+    { command: "printf ok" },
+    Number.isFinite(abortAfterMs) ? { signal: controller.signal } : undefined,
+  );
+  process.stdout.write(JSON.stringify({
+    kind: "result",
+    result: JSON.parse(result.content),
+  }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({
+    kind: "error",
+    name: error?.name,
+    code: error?.code,
+    message: error?.message,
+  }));
+}
+`;
+  const child = spawn(
+    process.execPath,
+    ["--import=tsx", "--input-type=module", "--eval", script],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        PI_CLONE_CHILD_ABORT_AFTER_MS:
+          scenario.abortAfterMs === undefined
+            ? "not-a-number"
+            : String(scenario.abortAfterMs),
+        PI_CLONE_CHILD_ROOT: rootDir,
+        PI_CLONE_CHILD_SHELL: bashPath(),
+        PI_CLONE_CHILD_STARTUP_DELAY_MS: String(
+          scenario.startupDelayMs,
+        ),
+        PI_CLONE_CHILD_SUPERVISOR_PID: supervisorPidPath,
+        PI_CLONE_CHILD_TIMEOUT_MS: String(scenario.timeoutMs),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    },
+  );
+  const completion = new Promise<ChildBashCompletion>((resolve, reject) => {
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.once("error", reject);
+    child.once("close", (exitCode) =>
+      resolve({
+        exitCode,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      }),
+    );
+  });
+
+  return { child, completion };
+}
+
+async function readPositivePid(path: string): Promise<number | undefined> {
+  try {
+    const raw = await readFile(path, "utf8");
+    const pid = Number(raw);
+    return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+
+    throw error;
+  }
+}
+
+async function cleanupChildBashScenario(
+  child: ReturnType<typeof spawn>,
+  supervisorPidPath: string,
+  completion: Promise<unknown>,
+): Promise<void> {
+  const supervisorPid = await readPositivePid(supervisorPidPath);
+  const errors: unknown[] = [];
+
+  for (const cleanupAction of [
+    async () => forceKillProcess(child.pid!),
+    async () =>
+      supervisorPid === undefined
+        ? undefined
+        : forceKillProcess(supervisorPid),
+    async () => completion.catch(() => undefined),
+  ]) {
+    try {
+      await cleanupAction();
+    } catch (error: unknown) {
+      errors.push(error);
+    }
+  }
+
+  if (errors.length > 0) {
+    throw errors[0];
+  }
+}
+
+async function expectNoSupervisorScratch(rootDir: string): Promise<void> {
+  expect(
+    (await readdir(rootDir)).filter((name) =>
+      name.startsWith("pi-clone-bash-supervisor-"),
+    ),
+  ).toEqual([]);
 }
 
 async function createBashTreeFixture(
@@ -725,5 +890,148 @@ describe("tool integration", () => {
       }
     },
     15_000,
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "bash short timeout during cold setup returns JSON without crashing",
+    async () => {
+      const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-bash-cold-"));
+      cleanup.push(rootDir);
+      const supervisorPidPath = join(rootDir, "supervisor.pid");
+      const scenario = startChildBashScenario(
+        rootDir,
+        supervisorPidPath,
+        { timeoutMs: 1, startupDelayMs: 0 },
+      );
+
+      try {
+        const completed = await withDeadline(
+          scenario.completion,
+          "Cold-start timeout child did not settle.",
+        );
+
+        expect(completed.exitCode).toBe(0);
+        expect(completed.stderr).toBe("");
+        expect(JSON.parse(completed.stdout)).toMatchObject({
+          kind: "result",
+          result: {
+            timedOut: true,
+            outputTruncated: false,
+          },
+        });
+        await expectNoSupervisorScratch(rootDir);
+      } finally {
+        await cleanupChildBashScenario(
+          scenario.child,
+          supervisorPidPath,
+          scenario.completion,
+        );
+      }
+    },
+    15_000,
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "bash deterministic startup timeout preserves timeout JSON",
+    async () => {
+      const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-bash-setup-"));
+      cleanup.push(rootDir);
+      const supervisorPidPath = join(rootDir, "supervisor.pid");
+      const scenario = startChildBashScenario(
+        rootDir,
+        supervisorPidPath,
+        { timeoutMs: 25, startupDelayMs: 1_000 },
+      );
+
+      try {
+        const completed = await withDeadline(
+          scenario.completion,
+          "Deterministic setup timeout child did not settle.",
+        );
+
+        expect(completed.exitCode).toBe(0);
+        expect(JSON.parse(completed.stdout)).toMatchObject({
+          kind: "result",
+          result: {
+            timedOut: true,
+            outputTruncated: false,
+          },
+        });
+        expect(completed.stderr).toBe("");
+        await expectNoSupervisorScratch(rootDir);
+      } finally {
+        await cleanupChildBashScenario(
+          scenario.child,
+          supervisorPidPath,
+          scenario.completion,
+        );
+      }
+    },
+    15_000,
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "bash deterministic startup abort preserves AbortError",
+    async () => {
+      const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-bash-abort-"));
+      cleanup.push(rootDir);
+      const supervisorPidPath = join(rootDir, "supervisor.pid");
+      const scenario = startChildBashScenario(
+        rootDir,
+        supervisorPidPath,
+        {
+          timeoutMs: 10_000,
+          startupDelayMs: 1_000,
+          abortAfterMs: 25,
+        },
+      );
+
+      try {
+        const completed = await withDeadline(
+          scenario.completion,
+          "Deterministic setup abort child did not settle.",
+        );
+
+        expect(completed.exitCode).toBe(0);
+        expect(JSON.parse(completed.stdout)).toMatchObject({
+          kind: "error",
+          name: "AbortError",
+          code: "ABORT_ERR",
+        });
+        expect(completed.stderr).toBe("");
+        await expectNoSupervisorScratch(rootDir);
+      } finally {
+        await cleanupChildBashScenario(
+          scenario.child,
+          supervisorPidPath,
+          scenario.completion,
+        );
+      }
+    },
+    15_000,
+  );
+
+  test.skipIf(process.platform !== "win32")(
+    "bash repeatedly reads complete root exit statuses",
+    async () => {
+      const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-bash-status-"));
+      cleanup.push(rootDir);
+      const tool = new BashTool({
+        rootDir,
+        shellPath: bashPath(),
+        timeoutMs: 5_000,
+      });
+
+      for (const exitCode of [1, 7, 42, 127]) {
+        const result = await tool.execute({ command: `exit ${exitCode}` });
+
+        expect(JSON.parse(result.content)).toMatchObject({
+          exitCode,
+          signal: null,
+          timedOut: false,
+        });
+      }
+    },
+    20_000,
   );
 });
