@@ -1,6 +1,13 @@
+import { createHash } from "node:crypto";
+
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import type { ModelRequest, StreamEvent } from "../model/types.js";
+import {
+  CONTINUATION_INSTRUCTION,
+  type Model,
+  type ModelRequest,
+  type StreamEvent,
+} from "../model/types.js";
 import { LlamaProvider } from "./llama/provider.js";
 import { OpenAICodexProvider } from "./openai-codex-provider.js";
 import { OpenAICompatibleProvider } from "./openai-compatible-provider.js";
@@ -167,3 +174,175 @@ describe("provider terminal contract", () => {
     assertIncompleteCallWasNotExposed(events);
   });
 });
+
+describe("provider continuation wire contract", () => {
+  test("llama.cpp adds the shared wire-only continuation instruction", async () => {
+    let captured: Request | undefined;
+    vi.stubGlobal("fetch", vi.fn<typeof globalThis.fetch>(async (input, init) => {
+      captured = new Request(input, init);
+      return sseResponse([
+        { choices: [{ delta: {}, finish_reason: "stop" }] },
+        "[DONE]",
+      ]);
+    }));
+    const provider = new LlamaProvider({
+      serverUrl: "http://127.0.0.1:8080",
+      modelId: "gemma",
+      contextWindow: 8192,
+      maxOutputTokens: 1024,
+    });
+    const model = (await provider.listModels())[0]!;
+
+    await collect(provider.stream(continuationRequest(model)));
+
+    const body = await captured?.json() as { messages?: unknown[] };
+    expect(body.messages?.at(-1)).toEqual({
+      role: "user",
+      content: CONTINUATION_INSTRUCTION,
+    });
+  });
+
+  test("OpenAI-compatible adds the shared wire-only continuation instruction", async () => {
+    let captured: Request | undefined;
+    const model = continuationModel("openai-compatible");
+    const provider = new OpenAICompatibleProvider({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model,
+      fetch: async (input, init) => {
+        captured = new Request(input, init);
+        return sseResponse([{
+          choices: [{ delta: {}, finish_reason: "stop" }],
+        }]);
+      },
+    });
+
+    await collect(provider.stream(continuationRequest(model)));
+
+    const body = await captured?.json() as { messages?: unknown[] };
+    expect(body.messages?.at(-1)).toEqual({
+      role: "user",
+      content: CONTINUATION_INSTRUCTION,
+    });
+  });
+
+  test("Codex replays encrypted state before the shared continuation instruction", async () => {
+    let captured: Request | undefined;
+    const model = continuationModel("openai-codex");
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: {
+        async resolve() {
+          return {
+            accessToken: "test-access",
+            refreshToken: "test-refresh",
+            expiresAt: 9_999_999,
+            accountId: "account-1",
+          };
+        },
+      },
+      fetch: async (input, init) => {
+        captured = new Request(input, init);
+        return sseResponse([{
+          type: "response.completed",
+          response: { status: "completed" },
+        }]);
+      },
+    });
+    const request = continuationRequest(model);
+    request.messages[1] = {
+      ...request.messages[1] as Extract<typeof request.messages[number], { role: "assistant" }>,
+      providerState: {
+        provider: "openai-codex",
+        value: {
+          reasoningItems: [{
+            type: "reasoning",
+            id: "rs_1",
+            summary: [],
+            encrypted_content: "encrypted",
+          }],
+          functionItemIds: {},
+        },
+      },
+    };
+
+    await collect(provider.stream(request));
+
+    const body = await captured?.json() as { input?: unknown[] };
+    expect(body.input).toContainEqual(expect.objectContaining({
+      type: "reasoning",
+      encrypted_content: "encrypted",
+    }));
+    expect(body.input?.at(-1)).toEqual({
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: CONTINUATION_INSTRUCTION }],
+    });
+  });
+
+  test("rejects a continuation whose last assistant segment has another logical ID", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const model = continuationModel("openai-compatible");
+    const provider = new OpenAICompatibleProvider({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model,
+      fetch,
+    });
+    const validRequest = continuationRequest(model);
+    const request: ModelRequest = {
+      ...validRequest,
+      continuation: {
+        ...validRequest.continuation!,
+        logicalMessageId: "another-logical-message",
+      },
+    };
+
+    const events = await collect(provider.stream(request));
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { message: expect.stringMatching(/continuation.*logical/i) },
+    });
+  });
+});
+
+function continuationModel(provider: Model["provider"]): Model {
+  return {
+    id: "continuation-model",
+    name: "Continuation",
+    provider,
+    contextWindow: 8192,
+    maxOutputTokens: 1024,
+  };
+}
+
+function continuationRequest(model: Model): ModelRequest {
+  const tailHash = createHash("sha256").update("partial", "utf8").digest("hex");
+  return {
+    model,
+    messages: [
+      { role: "user", content: "write" },
+      {
+        role: "assistant",
+        content: "partial",
+        toolCalls: [],
+        continuation: {
+          logicalMessageId: "logical-message",
+          segmentIndex: 0,
+          status: "partial",
+          resumeAllowed: true,
+          tailHash,
+          estimatedTotalOutputTokens: 4,
+        },
+      },
+    ],
+    tools: [],
+    continuation: {
+      kind: "assistant-output",
+      logicalMessageId: "logical-message",
+      segmentIndex: 1,
+      previousTail: "partial",
+      previousTailHash: tailHash,
+    },
+  };
+}

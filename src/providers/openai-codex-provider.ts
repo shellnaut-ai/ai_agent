@@ -11,6 +11,7 @@ import type {
 import type { ToolDefinition } from "../tools/types.js";
 import { serializeToolCallArguments } from "../tools/arguments.js";
 import { readSseData } from "./sse.js";
+import { continuationInstruction } from "./continuation.js";
 
 export interface CredentialResolver {
   resolve(signal?: AbortSignal): Promise<OAuthCredential>;
@@ -81,6 +82,7 @@ export class OpenAICodexProvider implements ModelProvider {
       const instructions = [this.#instructions, request.systemPrompt]
         .filter((value): value is string => value !== undefined)
         .join("\n\n");
+      const continuation = continuationInstruction(request);
       const body = JSON.stringify({
         model: request.model.id,
         ...(instructions === ""
@@ -88,7 +90,16 @@ export class OpenAICodexProvider implements ModelProvider {
           : { instructions }),
         max_output_tokens:
           request.maxOutputTokens ?? request.model.maxOutputTokens,
-        input: serializeMessages(request.messages),
+        input: [
+          ...serializeMessages(request.messages),
+          ...(continuation === undefined
+            ? []
+            : [{
+                type: "message",
+                role: "user",
+                content: [{ type: "input_text", text: continuation }],
+              }]),
+        ],
         tools: request.tools.map(serializeTool),
         tool_choice: "auto",
         parallel_tool_calls: true,

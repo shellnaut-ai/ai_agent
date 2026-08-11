@@ -8,6 +8,7 @@ import type {
 import type { ToolDefinition } from "../tools/types.js";
 import { serializeToolCallArguments } from "../tools/arguments.js";
 import { readSseData } from "./sse.js";
+import { continuationInstruction } from "./continuation.js";
 
 export interface OpenAICompatibleProviderOptions {
   readonly baseUrl: string;
@@ -76,6 +77,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
       const headers: Record<string, string> = {
         "content-type": "application/json",
       };
+      const instruction = continuationInstruction(request);
       if (this.apiKey !== undefined) {
         headers.authorization = `Bearer ${this.apiKey}`;
       }
@@ -91,6 +93,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
               ? []
               : [{ role: "system", content: request.systemPrompt }]),
             ...request.messages.map(serializeMessage),
+            ...(instruction === undefined
+              ? []
+              : [{ role: "user", content: instruction }]),
           ],
           tools: request.tools.map(serializeTool),
           max_tokens:

@@ -8,6 +8,7 @@ import type {
 } from "../../model/types.js";
 import { serializeToolCallArguments } from "../../tools/arguments.js";
 import { readSseData } from "./sse.js";
+import { continuationInstruction } from "../continuation.js";
 
 export interface LlamaProviderOptions {
   serverUrl: string;
@@ -153,6 +154,7 @@ function toLlamaMessage(message: Message): Record<string, unknown> {
 }
 
 function toLlamaMessages(request: ModelRequest): Record<string, unknown>[] {
+  const instruction = continuationInstruction(request);
   return [
     ...(request.systemPrompt
       ? [
@@ -163,6 +165,9 @@ function toLlamaMessages(request: ModelRequest): Record<string, unknown>[] {
         ]
       : []),
     ...request.messages.map(toLlamaMessage),
+    ...(instruction === undefined
+      ? []
+      : [{ role: "user", content: instruction }]),
   ];
 }
 
