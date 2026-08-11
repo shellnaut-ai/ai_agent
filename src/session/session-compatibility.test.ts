@@ -180,6 +180,47 @@ describe("session compatibility", () => {
     ).not.toHaveProperty("providerState");
   });
 
+  test.each([
+    ["negative-index", { segmentIndex: -1 }],
+    ["bad-hash", { tailHash: "not-hex" }],
+    ["terminal-resume", { status: "abandoned", resumeAllowed: true }],
+  ])("rejects invalid continuation metadata: %s", async (caseId, override) => {
+    const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-session-"));
+    cleanup.push(rootDir);
+    const store = new JsonlSessionStore({
+      rootDir,
+      sessionId: `invalid-continuation-${caseId}`,
+      model,
+    });
+    await store.load();
+    await appendFile(store.filePath, `${JSON.stringify({
+      type: "message",
+      id: "assistant-1",
+      parentId: null,
+      timestamp: "2026-08-09T00:00:00.000Z",
+      message: {
+        role: "assistant",
+        content: "partial",
+        toolCalls: [],
+        continuation: {
+          logicalMessageId: "logical-1",
+          segmentIndex: 0,
+          status: "partial",
+          resumeAllowed: true,
+          tailHash: "a".repeat(64),
+          estimatedTotalOutputTokens: 1,
+          ...override,
+        },
+      },
+    })}\n`, "utf8");
+
+    await expect(new JsonlSessionStore({
+      rootDir,
+      sessionId: `invalid-continuation-${caseId}`,
+      model,
+    }).load()).rejects.toThrow(/continuation.*line 2|line 2.*continuation/i);
+  });
+
   test("rejects an unsupported provider state provider with its JSONL line number", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-session-"));
     cleanup.push(rootDir);

@@ -10,6 +10,7 @@ import {
 import { resolve } from "node:path";
 
 import type {
+  AssistantContinuationSegment,
   AssistantMessage,
   JsonValue,
   Message,
@@ -169,6 +170,46 @@ function parseProviderState(value: unknown): ProviderMessageState {
   };
 }
 
+function parseAssistantContinuation(
+  value: unknown,
+): AssistantContinuationSegment {
+  if (
+    !isPlainJsonObject(value) ||
+    Object.keys(value).length !== 6 ||
+    typeof value.logicalMessageId !== "string" ||
+    value.logicalMessageId.length === 0 ||
+    !Number.isInteger(value.segmentIndex) ||
+    (value.segmentIndex as number) < 0 ||
+    (value.status !== "partial" &&
+      value.status !== "complete" &&
+      value.status !== "abandoned") ||
+    typeof value.resumeAllowed !== "boolean" ||
+    typeof value.tailHash !== "string" ||
+    !/^[a-f0-9]{64}$/.test(value.tailHash) ||
+    !Number.isInteger(value.estimatedTotalOutputTokens) ||
+    (value.estimatedTotalOutputTokens as number) < 0 ||
+    ![
+      "logicalMessageId",
+      "segmentIndex",
+      "status",
+      "resumeAllowed",
+      "tailHash",
+      "estimatedTotalOutputTokens",
+    ].every((key) => Object.hasOwn(value, key)) ||
+    (value.status !== "partial" && value.resumeAllowed)
+  ) {
+    throw new Error("Invalid assistant continuation metadata in session file.");
+  }
+  return {
+    logicalMessageId: value.logicalMessageId,
+    segmentIndex: value.segmentIndex as number,
+    status: value.status,
+    resumeAllowed: value.resumeAllowed,
+    tailHash: value.tailHash,
+    estimatedTotalOutputTokens: value.estimatedTotalOutputTokens as number,
+  };
+}
+
 function isFileNotFound(error: unknown): boolean {
   return (
     error instanceof Error &&
@@ -230,12 +271,26 @@ function parseMessage(value: unknown): Message {
       "providerState" in value
         ? parseProviderState(value.providerState)
         : undefined;
+    const continuation =
+      "continuation" in value
+        ? parseAssistantContinuation(value.continuation)
+        : undefined;
     const message: AssistantMessage = {
       role: "assistant",
       content: value.content,
       toolCalls: value.toolCalls.map(parseToolCall),
       ...(providerState === undefined ? {} : { providerState }),
+      ...(continuation === undefined ? {} : { continuation }),
     };
+
+    if (
+      continuation?.status === "abandoned" &&
+      (message.content !== "" ||
+        message.toolCalls.length > 0 ||
+        message.providerState !== undefined)
+    ) {
+      throw new Error("Invalid abandoned continuation tombstone in session file.");
+    }
 
     return message;
   }
@@ -451,6 +506,16 @@ function validateEntry(
 
   if (entry.type === "message") {
     parseMessage(entry.message);
+    if (
+      entry.message.role === "assistant" &&
+      entry.message.continuation !== undefined
+    ) {
+      validateContinuationTransition(
+        entry.message.continuation,
+        entriesById,
+        entry.parentId,
+      );
+    }
     return;
   }
 
@@ -492,6 +557,43 @@ function validateEntry(
     throw new Error(
       `Leaf entry "${entry.id}" points to an invalid target.`,
     );
+  }
+}
+
+function validateContinuationTransition(
+  continuation: AssistantContinuationSegment,
+  entriesById: ReadonlyMap<string, SessionEntry>,
+  parentId: string | null,
+): void {
+  let currentId = parentId;
+  let previous: AssistantContinuationSegment | undefined;
+  while (currentId !== null) {
+    const entry = entriesById.get(currentId);
+    if (entry === undefined) break;
+    if (
+      entry.type === "message" &&
+      entry.message.role === "assistant" &&
+      entry.message.continuation?.logicalMessageId ===
+        continuation.logicalMessageId
+    ) {
+      previous = entry.message.continuation;
+      break;
+    }
+    currentId = entry.parentId;
+  }
+  if (previous === undefined) {
+    if (continuation.segmentIndex !== 0) {
+      throw new Error("A continuation must begin at segment index 0.");
+    }
+    return;
+  }
+  if (
+    previous.status !== "partial" ||
+    continuation.segmentIndex !== previous.segmentIndex + 1 ||
+    continuation.estimatedTotalOutputTokens <
+      previous.estimatedTotalOutputTokens
+  ) {
+    throw new Error("Invalid assistant continuation status transition.");
   }
 }
 

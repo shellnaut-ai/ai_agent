@@ -44,11 +44,21 @@ export interface UserMessage {
   readonly content: string;
 }
 
+export interface AssistantContinuationSegment {
+  readonly logicalMessageId: string;
+  readonly segmentIndex: number;
+  readonly status: "partial" | "complete" | "abandoned";
+  readonly resumeAllowed: boolean;
+  readonly tailHash: string;
+  readonly estimatedTotalOutputTokens: number;
+}
+
 export interface AssistantMessage {
   readonly role: "assistant";
   readonly content: string;
   readonly toolCalls: readonly ToolCall[];
   readonly providerState?: ProviderMessageState;
+  readonly continuation?: AssistantContinuationSegment;
 }
 
 export interface ToolResultMessage {
