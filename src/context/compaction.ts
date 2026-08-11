@@ -9,6 +9,7 @@ import {
   formatFileDetails,
   serializeTurns,
 } from "./serialize.js";
+import { ContextBudgetCalculator } from "./budget.js";
 import { TokenEstimator } from "./token-estimator.js";
 import type {
   CompactionOptions,
@@ -80,10 +81,46 @@ function flattenTurns(turns: readonly CompactionTurn[]): Message[] {
   return turns.flatMap((turn) => [...turn.messages]);
 }
 
+function assertCompleteToolPairs(turns: readonly CompactionTurn[]): void {
+  for (const turn of turns) {
+    const pending = new Set<string>();
+    for (const message of turn.messages) {
+      if (message.role === "assistant") {
+        for (const call of message.toolCalls) {
+          if (pending.has(call.id)) {
+            throw new Error(
+              `Compaction turn "${turn.firstEntryId}" repeats tool call ` +
+                `"${call.id}".`,
+            );
+          }
+          pending.add(call.id);
+        }
+        continue;
+      }
+      if (message.role === "tool") {
+        if (!pending.delete(message.toolCallId)) {
+          throw new Error(
+            `Compaction turn "${turn.firstEntryId}" has tool result ` +
+              `"${message.toolCallId}" without a matching call.`,
+          );
+        }
+      }
+    }
+    const firstPending = pending.values().next().value as string | undefined;
+    if (firstPending !== undefined) {
+      throw new Error(
+        `Compaction cannot summarize incomplete tool call ` +
+          `"${firstPending}" in turn "${turn.firstEntryId}".`,
+      );
+    }
+  }
+}
+
 export class CompactionService {
   private readonly runner: ModelStreamRunner;
   private readonly settings: CompactionSettings;
   private readonly estimator: TokenEstimator;
+  private readonly budgetCalculator: ContextBudgetCalculator;
 
   constructor(runner: ModelStreamRunner, settings: CompactionSettings) {
     if (
@@ -125,18 +162,10 @@ export class CompactionService {
     this.runner = runner;
     this.settings = settings;
     this.estimator = new TokenEstimator(settings.charsPerToken);
+    this.budgetCalculator = new ContextBudgetCalculator(this.estimator);
   }
 
   prepare(request: CompactionRequest): CompactionPreparation | undefined {
-    const inputBudget =
-      request.model.contextWindow - this.settings.reserveTokens;
-
-    if (inputBudget <= 0) {
-      throw new Error(
-        "Compaction reserveTokens must be smaller than the context window.",
-      );
-    }
-
     let activeTurns = [...request.turns];
 
     if (request.previousCompaction) {
@@ -167,13 +196,20 @@ export class CompactionService {
           ]
         : []),
       ...flattenTurns(activeTurns),
-      request.pendingUserMessage,
+      ...(request.pendingUserMessage === undefined
+        ? []
+        : [request.pendingUserMessage]),
     ];
-    const tokensBefore = this.estimator.estimateRequest({
+    const budget = this.budgetCalculator.calculate({
       model: request.model,
       messages: activeMessages,
       tools: request.toolDefinitions,
+      ...(request.maxOutputTokens === undefined
+        ? {}
+        : { maxOutputTokens: request.maxOutputTokens }),
     });
+    const tokensBefore = budget.estimatedInputTokens;
+    const inputBudget = budget.inputBudget;
 
     if (tokensBefore <= inputBudget) {
       return undefined;
@@ -221,6 +257,8 @@ export class CompactionService {
       );
     }
 
+    assertCompleteToolPairs(turnsToSummarize);
+
     return {
       model: request.model,
       previousSummary: request.previousCompaction?.summary,
@@ -246,78 +284,46 @@ export class CompactionService {
       throw new Error("Compaction aborted.");
     }
 
-    const conversation = serializeTurns(
-      preparation.turnsToSummarize,
-      this.settings.toolResultMaxChars,
-    );
-    let prompt =
-      `<conversation>\n${conversation}\n</conversation>\n\n`;
+    let summary = preparation.previousSummary;
+    let batch: CompactionTurn[] = [];
 
-    if (preparation.previousSummary !== undefined) {
-      prompt +=
-        `<previous-summary>\n${preparation.previousSummary}\n` +
-        `</previous-summary>\n\n${UPDATE_SUMMARY_PROMPT}`;
-    } else {
-      prompt += INITIAL_SUMMARY_PROMPT;
-    }
-
-    const summaryRequest: ModelRequest = {
-      model: preparation.model,
-      systemPrompt: SUMMARY_SYSTEM_PROMPT,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      tools: [],
-      maxOutputTokens: this.settings.maxSummaryOutputTokens,
-    };
-    let summary = "";
-    let terminalSeen = false;
-
-    for await (const event of this.runner.stream(summaryRequest, {
-      signal: options?.signal,
-    })) {
-      if (event.type === "text-delta") {
-        summary += event.delta;
+    for (const turn of preparation.turnsToSummarize) {
+      const candidate = [...batch, turn];
+      if (this.summaryRequestFits(preparation.model, candidate, summary)) {
+        batch = candidate;
         continue;
       }
-
-      if (event.type === "tool-call") {
+      if (batch.length === 0) {
         throw new Error(
-          "Compaction model returned a ToolCall even though no tools " +
-            "were provided.",
+          `Compaction turn "${turn.firstEntryId}" exceeds the summarizer ` +
+            "input budget.",
         );
       }
-
-      if (event.type === "error") {
-        throw event.error;
-      }
-
-      if (event.type === "done") {
-        terminalSeen = true;
-
-        if (event.reason === "length") {
-          throw new Error(
-            "Compaction summary reached the output token limit.",
-          );
-        }
-
-        break;
+      summary = await this.summarizeBatch(
+        preparation.model,
+        batch,
+        summary,
+        options?.signal,
+      );
+      batch = [turn];
+      if (!this.summaryRequestFits(preparation.model, batch, summary)) {
+        throw new Error(
+          `Compaction turn "${turn.firstEntryId}" exceeds the summarizer ` +
+            "input budget.",
+        );
       }
     }
 
-    if (!terminalSeen) {
-      throw new Error(
-        "Compaction model stream ended without a terminal event.",
+    if (batch.length > 0) {
+      summary = await this.summarizeBatch(
+        preparation.model,
+        batch,
+        summary,
+        options?.signal,
       );
     }
-
-    summary = summary.trim();
-
-    if (summary.length === 0) {
-      throw new Error("Compaction model returned an empty summary.");
+    if (summary === undefined) {
+      throw new Error("Compaction had no turns to summarize.");
     }
 
     summary += formatFileDetails(preparation.details);
@@ -325,7 +331,9 @@ export class CompactionService {
     const compactedMessages: Message[] = [
       createCompactionSummaryMessage(summary),
       ...flattenTurns(preparation.keptTurns),
-      preparation.pendingUserMessage,
+      ...(preparation.pendingUserMessage === undefined
+        ? []
+        : [preparation.pendingUserMessage]),
     ];
     const tokensAfter = this.estimator.estimateRequest({
       model: preparation.model,
@@ -346,5 +354,84 @@ export class CompactionService {
       tokensAfter,
       details: preparation.details,
     };
+  }
+
+  private createSummaryRequest(
+    model: CompactionPreparation["model"],
+    turns: readonly CompactionTurn[],
+    previousSummary: string | undefined,
+  ): ModelRequest {
+    const conversation = serializeTurns(
+      turns,
+      this.settings.toolResultMaxChars,
+    );
+    let prompt = `<conversation>\n${conversation}\n</conversation>\n\n`;
+    if (previousSummary !== undefined) {
+      prompt +=
+        `<previous-summary>\n${previousSummary}\n` +
+        `</previous-summary>\n\n${UPDATE_SUMMARY_PROMPT}`;
+    } else {
+      prompt += INITIAL_SUMMARY_PROMPT;
+    }
+    return {
+      model,
+      systemPrompt: SUMMARY_SYSTEM_PROMPT,
+      messages: [{ role: "user", content: prompt }],
+      tools: [],
+      maxOutputTokens: this.settings.maxSummaryOutputTokens,
+    };
+  }
+
+  private summaryRequestFits(
+    model: CompactionPreparation["model"],
+    turns: readonly CompactionTurn[],
+    previousSummary: string | undefined,
+  ): boolean {
+    return this.budgetCalculator.calculate(
+      this.createSummaryRequest(model, turns, previousSummary),
+    ).remainingInputTokens >= 0;
+  }
+
+  private async summarizeBatch(
+    model: CompactionPreparation["model"],
+    turns: readonly CompactionTurn[],
+    previousSummary: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    if (signal?.aborted) throw new Error("Compaction aborted.");
+    const request = this.createSummaryRequest(model, turns, previousSummary);
+    this.budgetCalculator.assertFits(request);
+    let summary = "";
+    let terminalSeen = false;
+    for await (const event of this.runner.stream(request, { signal })) {
+      if (event.type === "text-delta") {
+        summary += event.delta;
+        continue;
+      }
+      if (event.type === "tool-call") {
+        throw new Error(
+          "Compaction model returned a ToolCall even though no tools were provided.",
+        );
+      }
+      if (event.type === "error") throw event.error;
+      if (event.type === "done") {
+        terminalSeen = true;
+        if (event.reason === "length") {
+          throw new Error("Compaction summary reached the output token limit.");
+        }
+        if (event.reason !== "stop") {
+          throw new Error("Compaction model returned an invalid stop reason.");
+        }
+        break;
+      }
+    }
+    if (!terminalSeen) {
+      throw new Error("Compaction model stream ended without a terminal event.");
+    }
+    summary = summary.trim();
+    if (summary.length === 0) {
+      throw new Error("Compaction model returned an empty summary.");
+    }
+    return summary;
   }
 }

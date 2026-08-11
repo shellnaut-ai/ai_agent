@@ -38,6 +38,15 @@ export type AgentEvent =
       error: Error;
     }
   | {
+      type: "compaction-start";
+      tokensBefore: number;
+    }
+  | {
+      type: "compaction-done";
+      tokensBefore: number;
+      tokensAfter: number;
+    }
+  | {
       type: "text-delta";
       delta: string;
     }

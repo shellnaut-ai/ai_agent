@@ -2,6 +2,7 @@ import { Type } from "typebox";
 import { describe, expect, test } from "vitest";
 
 import type { ToolApprovalHandler } from "../approval/types.js";
+import type { ContextCoordinator } from "../context/coordinator.js";
 import type { ModelStreamRunner } from "../model/runtime.js";
 import type {
   ModelRequest,
@@ -695,5 +696,68 @@ describe("AgentLoop integration policies", () => {
       type: "error",
       error: { message: expect.stringMatching(/duplicate.*tool call/i) },
     });
+  });
+
+  test("prepares every provider request through the common context coordinator", async () => {
+    let coordinatorCalls = 0;
+    const seenSystemPrompts: Array<string | undefined> = [];
+    const coordinator: ContextCoordinator = {
+      async *prepareModelRequest(request) {
+        coordinatorCalls += 1;
+        yield {
+          type: "model-input-ready",
+          request: {
+            ...structuredClone(request),
+            systemPrompt: `prepared-${coordinatorCalls}`,
+          },
+          budget: {
+            requestedMaxOutputTokens: 1024,
+            safetyMarginTokens: 256,
+            inputBudget: 2816,
+            estimatedInputTokens: 100,
+            remainingInputTokens: 2716,
+          },
+        };
+      },
+    };
+    let providerCalls = 0;
+    const runner: ModelStreamRunner = {
+      async *stream(request): AsyncIterable<StreamEvent> {
+        providerCalls += 1;
+        seenSystemPrompts.push(request.systemPrompt);
+        yield { type: "start" };
+        if (providerCalls === 1) {
+          yield {
+            type: "tool-call",
+            toolCall: { id: "call-1", name: "read-test", arguments: {} },
+          };
+          yield { type: "done", reason: "tool-call" };
+          return;
+        }
+        yield { type: "done", reason: "stop" };
+      },
+    };
+    const registry = new ToolRegistry();
+    registry.register({
+      approval: "never",
+      definition: {
+        name: "read-test",
+        description: "Return a result.",
+        inputSchema: Type.Object({}, { additionalProperties: false }),
+      },
+      async execute() {
+        return { content: "ok", isError: false };
+      },
+    });
+
+    await collect(
+      new AgentLoop(runner, registry, undefined, coordinator).stream({
+        model,
+        messages: [{ role: "user", content: "inspect" }],
+      }),
+    );
+
+    expect(coordinatorCalls).toBe(2);
+    expect(seenSystemPrompts).toEqual(["prepared-1", "prepared-2"]);
   });
 });

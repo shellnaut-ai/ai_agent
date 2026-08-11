@@ -6,6 +6,7 @@ import type {
 import type { ToolDefinition } from "../tools/types.js";
 
 export interface CompactionSettings {
+  /** @deprecated Input budget is derived from the model and request. */
   readonly reserveTokens: number;
   readonly keepRecentTokens: number;
   readonly charsPerToken: number;
@@ -33,8 +34,9 @@ export interface CompactionRequest {
   readonly model: Model;
   readonly turns: readonly CompactionTurn[];
   readonly previousCompaction?: PreviousCompaction;
-  readonly pendingUserMessage: UserMessage;
+  readonly pendingUserMessage?: UserMessage;
   readonly toolDefinitions: readonly ToolDefinition[];
+  readonly maxOutputTokens?: number;
 }
 
 export interface CompactionPreparation {
@@ -42,7 +44,7 @@ export interface CompactionPreparation {
   readonly previousSummary?: string;
   readonly turnsToSummarize: readonly CompactionTurn[];
   readonly keptTurns: readonly CompactionTurn[];
-  readonly pendingUserMessage: UserMessage;
+  readonly pendingUserMessage?: UserMessage;
   readonly toolDefinitions: readonly ToolDefinition[];
   readonly firstKeptEntryId: string;
   readonly tokensBefore: number;

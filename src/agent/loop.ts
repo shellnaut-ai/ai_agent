@@ -1,4 +1,5 @@
 import type { ToolApprovalHandler } from "../approval/types.js";
+import type { ContextCoordinator } from "../context/coordinator.js";
 import type { ModelStreamRunner } from "../model/runtime.js";
 import type {
   AssistantMessage,
@@ -17,15 +18,18 @@ export class AgentLoop {
   private readonly runtime: ModelStreamRunner;
   private readonly toolRegistry: ToolRegistry;
   private readonly approvalHandler: ToolApprovalHandler | undefined;
+  private readonly contextCoordinator: ContextCoordinator | undefined;
 
   constructor(
     runtime: ModelStreamRunner,
     toolRegistry: ToolRegistry,
     approvalHandler?: ToolApprovalHandler,
+    contextCoordinator?: ContextCoordinator,
   ) {
     this.runtime = runtime;
     this.toolRegistry = toolRegistry;
     this.approvalHandler = approvalHandler;
+    this.contextCoordinator = contextCoordinator;
   }
 
   async *stream(
@@ -101,11 +105,37 @@ export class AgentLoop {
 
     try {
       for (let step = 0; step < maxSteps; step += 1) {
-        const modelRequest: ModelRequest = {
+        let modelRequest: ModelRequest = {
           model: request.model,
           messages: structuredClone(workingMessages),
           tools: this.toolRegistry.listDefinitions(),
         };
+
+        if (this.contextCoordinator !== undefined) {
+          let preparedRequest: ModelRequest | undefined;
+          for await (const event of this.contextCoordinator.prepareModelRequest(
+            modelRequest,
+            { signal: options?.signal },
+          )) {
+            if (event.type === "compaction-start") {
+              yield event;
+              continue;
+            }
+            if (event.type === "compaction-done") {
+              yield event;
+              continue;
+            }
+            if (event.type === "model-input-ready") {
+              preparedRequest = structuredClone(event.request);
+            }
+          }
+          if (preparedRequest === undefined) {
+            throw new Error(
+              "Context coordinator ended without a model-input-ready event.",
+            );
+          }
+          modelRequest = preparedRequest;
+        }
 
         let assistantContent = "";
         const toolCalls: ToolCall[] = [];
