@@ -6,6 +6,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { AgentLoop } from "../agent/loop.js";
+import { continuationTailHash } from "../agent/output-continuation.js";
 import type { ModelStreamRunner } from "../model/runtime.js";
 import type {
   Message,
@@ -153,6 +154,63 @@ function createToolThenRunner(
 }
 
 describe("ChatSession incremental journal", () => {
+  test("requires explicit recovery before resuming a durable partial", async () => {
+    const { store } = await createStore("continuation-recovery");
+    const session = new Session(store);
+    await session.appendMessage({ role: "user", content: "write" });
+    await session.appendMessage({
+      role: "assistant",
+      content: "durable partial",
+      toolCalls: [],
+      continuation: {
+        logicalMessageId: "recover-logical",
+        segmentIndex: 0,
+        status: "partial",
+        resumeAllowed: true,
+        tailHash: continuationTailHash("durable partial"),
+        estimatedTotalOutputTokens: 8,
+      },
+    });
+    let providerCalls = 0;
+    const runner: ModelStreamRunner = {
+      async *stream(request): AsyncIterable<StreamEvent> {
+        providerCalls += 1;
+        expect(request.continuation).toMatchObject({
+          logicalMessageId: "recover-logical",
+          segmentIndex: 1,
+        });
+        yield { type: "text-delta", delta: " final" };
+        yield { type: "done", reason: "stop" };
+      },
+    };
+    const chat = new ChatSession(
+      new AgentLoop(runner, new ToolRegistry()),
+      model,
+      { session },
+    );
+
+    await expect(collect(chat.streamTurn("must not append"))).resolves.toEqual([
+      {
+        type: "continuation-recovery-required",
+        continuation: expect.objectContaining({ logicalMessageId: "recover-logical" }),
+      },
+    ]);
+    expect(providerCalls).toBe(0);
+    expect(session.getMessages()).not.toContainEqual({
+      role: "user",
+      content: "must not append",
+    });
+
+    const events = await collect(chat.streamContinuation());
+    expect(providerCalls).toBe(1);
+    expect(events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+    expect(session.buildDisplayMessages().at(-1)).toMatchObject({
+      role: "assistant",
+      content: "durable partial final",
+      continuation: { status: "complete" },
+    });
+  });
+
   test("persists every automatic continuation segment before the next call", async () => {
     const { rootDir, store } = await createStore("automatic-continuation");
     const requests: ModelRequest[] = [];

@@ -27,11 +27,15 @@ export class SessionContextCoordinator implements ContextCoordinator {
     options?: { readonly signal?: AbortSignal },
   ): AsyncIterable<ContextCoordinatorEvent> {
     if (options?.signal?.aborted) throw new Error("Context preparation aborted.");
-    const initialBudget = this.#calculator.calculate(request);
+    const canonicalRequest: ModelRequest = {
+      ...structuredClone(request),
+      messages: [...this.#session.buildActiveMessages()],
+    };
+    const initialBudget = this.#calculator.calculate(canonicalRequest);
     if (initialBudget.remainingInputTokens >= 0) {
       yield {
         type: "model-input-ready",
-        request: structuredClone(request),
+        request: canonicalRequest,
         budget: initialBudget,
       };
       return;
@@ -47,7 +51,7 @@ export class SessionContextCoordinator implements ContextCoordinator {
         : { maxOutputTokens: request.maxOutputTokens }),
     });
     if (preparation === undefined) {
-      this.#calculator.assertFits(request);
+      this.#calculator.assertFits(canonicalRequest);
       throw new Error("Unreachable context preparation state.");
     }
 
@@ -67,7 +71,7 @@ export class SessionContextCoordinator implements ContextCoordinator {
     };
 
     const preparedRequest: ModelRequest = {
-      ...structuredClone(request),
+      ...canonicalRequest,
       messages: [...this.#session.buildActiveMessages()],
     };
     yield {
@@ -82,7 +86,10 @@ export class SessionContextCoordinator implements ContextCoordinator {
     options?: { readonly signal?: AbortSignal },
   ): AsyncIterable<ContextCoordinatorEvent> {
     if (options?.signal?.aborted) throw new Error("Context preparation aborted.");
-    let preparedRequest = structuredClone(request);
+    let preparedRequest: ModelRequest = {
+      ...structuredClone(request),
+      messages: [...this.#session.buildActiveMessages()],
+    };
     let budget = this.#calculator.calculateToolResultBudget(preparedRequest);
     if (budget.maxTokens < 128) {
       const requestedOutput =

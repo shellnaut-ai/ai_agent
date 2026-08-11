@@ -7,6 +7,9 @@ import { parseSessionId } from "./cli/arguments.js";
 import { runChat } from "./cli/chat.js";
 import { CliIO } from "./cli/io.js";
 import { CompactionService } from "./context/compaction.js";
+import { ContextBudgetCalculator } from "./context/budget.js";
+import { TokenEstimator } from "./context/token-estimator.js";
+import { createOutputContinuationPolicy } from "./agent/output-continuation.js";
 import { ProviderRegistry } from "./model/registry.js";
 import { RetryingModelRuntime } from "./model/retry.js";
 import { ModelRuntime } from "./model/runtime.js";
@@ -14,9 +17,11 @@ import { LlamaProvider } from "./providers/llama/provider.js";
 import { ChatSession } from "./session/chat-session.js";
 import { JsonlSessionStore } from "./session/jsonl-store.js";
 import { Session } from "./session/session.js";
+import { SessionContextCoordinator } from "./session/session-context-coordinator.js";
 import { BashTool } from "./tools/bash.js";
 import { EditTool } from "./tools/edit.js";
 import { ReadTool } from "./tools/read.js";
+import { FileReadCursorKeyStore } from "./tools/read-cursor.js";
 import { ToolRegistry } from "./tools/registry.js";
 import { WriteTool } from "./tools/write.js";
 
@@ -57,10 +62,13 @@ async function main(): Promise<void> {
     cli.write("Press Esc to cancel the current turn.\n");
 
     const toolRegistry = new ToolRegistry();
+    const cursorKey = await new FileReadCursorKeyStore(process.cwd())
+      .loadOrCreate();
 
     toolRegistry.register(
       new ReadTool({
         rootDir: process.cwd(),
+        cursorKey,
       }),
     );
 
@@ -101,15 +109,20 @@ async function main(): Promise<void> {
       store: sessionStore,
       initialApprovalKeys: loadedSession.approvalKeys,
     });
+    const coordinator = new SessionContextCoordinator(
+      session,
+      compactionService,
+      new ContextBudgetCalculator(new TokenEstimator(2)),
+    );
     const agentLoop = new AgentLoop(
       retryingRuntime,
       toolRegistry,
       approvalHandler,
+      coordinator,
+      createOutputContinuationPolicy(resolved.model),
     );
     const chatSession = new ChatSession(agentLoop, resolved.model, {
       session,
-      compactionService,
-      toolDefinitions: toolRegistry.listDefinitions(),
     });
 
     await runChat(chatSession, cli);

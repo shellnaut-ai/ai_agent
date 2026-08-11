@@ -3,6 +3,7 @@ import type {
   ErrorReason,
   Message,
   Model,
+  ModelContinuation,
   StopReason,
   ToolResultMessage,
 } from "../model/types.js";
@@ -11,6 +12,8 @@ import type { ToolCall, ToolResult } from "../tools/types.js";
 export interface AgentRequest {
   readonly model: Model;
   readonly messages: readonly Message[];
+  readonly maxOutputTokens?: number;
+  readonly continuation?: ModelContinuation;
 }
 
 export interface AgentExecutionPolicy {

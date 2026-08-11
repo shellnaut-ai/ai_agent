@@ -6,6 +6,9 @@ import { OpenAICodexOAuth } from "../auth/openai-codex-oauth.js";
 import { OAuthResolver } from "../auth/oauth-resolver.js";
 import { SessionToolApprovalHandler } from "../approval/session.js";
 import { CompactionService } from "../context/compaction.js";
+import { ContextBudgetCalculator } from "../context/budget.js";
+import { TokenEstimator } from "../context/token-estimator.js";
+import { createOutputContinuationPolicy } from "../agent/output-continuation.js";
 import type { Model, ProviderId } from "../model/types.js";
 import { ProviderRegistry } from "../model/registry.js";
 import { RetryingModelRuntime } from "../model/retry.js";
@@ -16,9 +19,11 @@ import { LlamaProvider } from "../providers/llama/provider.js";
 import { ChatSession } from "../session/chat-session.js";
 import { JsonlSessionStore } from "../session/jsonl-store.js";
 import { Session } from "../session/session.js";
+import { SessionContextCoordinator } from "../session/session-context-coordinator.js";
 import { BashTool } from "../tools/bash.js";
 import { EditTool } from "../tools/edit.js";
 import { ReadTool } from "../tools/read.js";
+import { FileReadCursorKeyStore } from "../tools/read-cursor.js";
 import { ToolRegistry } from "../tools/registry.js";
 import { WriteTool } from "../tools/write.js";
 import { CliToolApprovalHandler } from "./approval.js";
@@ -162,7 +167,8 @@ async function runConfiguredChat(
     model: resolved.model,
   });
   const loadedSession = await sessionStore.load();
-  const tools = createTools(process.cwd());
+  const cursorKey = await new FileReadCursorKeyStore(process.cwd()).loadOrCreate();
+  const tools = createTools(process.cwd(), cursorKey);
   const runtime = new RetryingModelRuntime(new ModelRuntime(registry), {
     maxRetries: 2,
     initialDelayMs: 500,
@@ -172,7 +178,6 @@ async function runConfiguredChat(
     store: sessionStore,
     initialApprovalKeys: loadedSession.approvalKeys,
   });
-  const agent = new AgentLoop(runtime, tools, approval);
   const compaction = new CompactionService(runtime, {
     reserveTokens: 1280,
     keepRecentTokens: 1024,
@@ -180,10 +185,21 @@ async function runConfiguredChat(
     maxSummaryOutputTokens: 1024,
     toolResultMaxChars: 2000,
   });
+  const session = new Session(sessionStore);
+  const coordinator = new SessionContextCoordinator(
+    session,
+    compaction,
+    new ContextBudgetCalculator(new TokenEstimator(2)),
+  );
+  const agent = new AgentLoop(
+    runtime,
+    tools,
+    approval,
+    coordinator,
+    createOutputContinuationPolicy(resolved.model),
+  );
   const chat = new ChatSession(agent, resolved.model, {
-    session: new Session(sessionStore),
-    compactionService: compaction,
-    toolDefinitions: tools.listDefinitions(),
+    session,
   });
 
   cli.write(`Provider: ${options.provider}\n`);
@@ -204,9 +220,9 @@ function createModel(provider: ChatProvider, id: string): Model {
   };
 }
 
-function createTools(rootDir: string): ToolRegistry {
+function createTools(rootDir: string, cursorKey: Uint8Array): ToolRegistry {
   const tools = new ToolRegistry();
-  tools.register(new ReadTool({ rootDir }));
+  tools.register(new ReadTool({ rootDir, cursorKey }));
   tools.register(new WriteTool({ rootDir }));
   tools.register(new EditTool({ rootDir }));
   tools.register(new BashTool({

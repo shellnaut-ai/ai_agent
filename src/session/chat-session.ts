@@ -1,5 +1,9 @@
 import { AgentLoop } from "../agent/loop.js";
 import type { AgentLoopOptions } from "../agent/types.js";
+import {
+  continuationTail,
+  continuationTailHash,
+} from "../agent/output-continuation.js";
 import { CompactionService } from "../context/compaction.js";
 import type { Message, Model, UserMessage } from "../model/types.js";
 import type { ToolDefinition } from "../tools/types.js";
@@ -34,6 +38,72 @@ export class ChatSession {
 
   public getMessages(): readonly Message[] {
     return this.session.getMessages();
+  }
+
+  public getPendingContinuation() {
+    return this.session.getPendingContinuation();
+  }
+
+  public async abandonPendingContinuation(): Promise<void> {
+    if (this.turnActive) throw new Error("ChatSession already has an active turn.");
+    await this.session.appendContinuationAbandoned();
+  }
+
+  public async *streamContinuation(
+    options?: AgentLoopOptions,
+  ): AsyncIterable<ChatEvent> {
+    if (this.turnActive) {
+      yield {
+        type: "error",
+        reason: "error",
+        error: new Error("ChatSession already has an active turn."),
+      };
+      return;
+    }
+    this.turnActive = true;
+    try {
+      const pending = this.session.getPendingContinuation();
+      if (pending === undefined || !pending.resumeAllowed) {
+        yield {
+          type: "error",
+          reason: "error",
+          error: new Error("The pending continuation cannot be resumed."),
+        };
+        return;
+      }
+      const messages = [...this.session.buildActiveMessages()];
+      const logicalContent = messages
+        .filter((message) =>
+          message.role === "assistant" &&
+          message.continuation?.logicalMessageId === pending.logicalMessageId
+        )
+        .map((message) => message.content)
+        .join("");
+      const previousTail = continuationTail(logicalContent, 1024);
+      const previousTailHash = continuationTailHash(previousTail);
+      if (previousTailHash !== pending.tailHash) {
+        throw new Error("The pending continuation output tail has changed.");
+      }
+      yield* this.streamAgent({
+        model: this.model,
+        messages,
+        continuation: {
+          kind: "assistant-output",
+          logicalMessageId: pending.logicalMessageId,
+          segmentIndex: pending.segmentIndex + 1,
+          previousTail,
+          previousTailHash,
+        },
+      }, options);
+    } catch (error: unknown) {
+      yield {
+        type: "error",
+        reason: options?.signal?.aborted ? "aborted" : "error",
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+    } finally {
+      this.turnActive = false;
+    }
   }
 
   public async *streamTurn(
@@ -100,6 +170,15 @@ export class ChatSession {
             : error instanceof Error
               ? error
               : new Error(String(error)),
+      };
+      return;
+    }
+
+    const pendingContinuation = this.session.getPendingContinuation();
+    if (pendingContinuation !== undefined) {
+      yield {
+        type: "continuation-recovery-required",
+        continuation: pendingContinuation,
       };
       return;
     }
@@ -174,6 +253,13 @@ export class ChatSession {
       messages: [...this.session.buildActiveMessages()],
     };
 
+    yield* this.streamAgent(request, options);
+  }
+
+  private async *streamAgent(
+    request: Parameters<AgentLoop["stream"]>[0],
+    options?: AgentLoopOptions,
+  ): AsyncIterable<ChatEvent> {
     for await (const event of this.agentLoop.stream(request, options)) {
       if (event.type === "message-checkpoint") {
         try {

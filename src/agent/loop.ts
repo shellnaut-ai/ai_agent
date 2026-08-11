@@ -110,7 +110,10 @@ export class AgentLoop {
 
     const newMessages: Message[] = [];
     let completedToolBatches = 0;
-    let activeContinuation: ActiveContinuation | undefined;
+    let activeContinuation = restoreActiveContinuation(
+      request,
+      continuationPolicy,
+    );
     const seenToolCallIds = new Set<string>();
 
     for (const message of request.messages) {
@@ -143,6 +146,9 @@ export class AgentLoop {
           model: request.model,
           messages: structuredClone(workingMessages),
           tools: this.toolRegistry.listDefinitions(),
+          ...(continuationRequest === undefined && request.maxOutputTokens !== undefined
+            ? { maxOutputTokens: request.maxOutputTokens }
+            : {}),
           ...(continuationRequest === undefined
             ? {}
             : {
@@ -666,5 +672,46 @@ function createContinuationSegment(input: {
         (input.active?.continuationsUsed ?? 0) +
         (input.active === undefined ? 0 : 1),
     },
+  };
+}
+
+function restoreActiveContinuation(
+  request: AgentRequest,
+  policy: OutputContinuationPolicy,
+): ActiveContinuation | undefined {
+  if (request.continuation === undefined) return undefined;
+  const segments = request.messages.filter((message): message is AssistantMessage =>
+    message.role === "assistant" &&
+    message.continuation?.logicalMessageId ===
+      request.continuation!.logicalMessageId
+  );
+  const last = segments.at(-1);
+  if (
+    last?.continuation === undefined ||
+    last.continuation.status !== "partial" ||
+    !last.continuation.resumeAllowed ||
+    last.continuation.segmentIndex + 1 !== request.continuation.segmentIndex
+  ) {
+    throw new Error("Cannot resume an invalid or non-resumable continuation.");
+  }
+  const totalContent = segments.map((message) => message.content).join("");
+  const previousTail = continuationTail(totalContent, policy.overlapWindowChars);
+  const previousTailHash = continuationTailHash(previousTail);
+  if (
+    previousTail !== request.continuation.previousTail ||
+    previousTailHash !== request.continuation.previousTailHash ||
+    previousTailHash !== last.continuation.tailHash
+  ) {
+    throw new Error("Cannot resume continuation because its output tail changed.");
+  }
+  return {
+    logicalMessageId: request.continuation.logicalMessageId,
+    nextSegmentIndex: request.continuation.segmentIndex,
+    totalContent,
+    estimatedTotalOutputTokens: last.continuation.estimatedTotalOutputTokens,
+    previousTail,
+    previousTailHash,
+    tailHashes: new Set(segments.map((message) => message.continuation!.tailHash)),
+    continuationsUsed: Math.max(0, segments.length - 1),
   };
 }
