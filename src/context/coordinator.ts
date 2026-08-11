@@ -23,6 +23,11 @@ export interface ContextCoordinator {
     request: ModelRequest,
     options?: { readonly signal?: AbortSignal },
   ): AsyncIterable<ContextCoordinatorEvent>;
+
+  reserveToolResult(
+    request: ModelRequest,
+    options?: { readonly signal?: AbortSignal },
+  ): AsyncIterable<ContextCoordinatorEvent>;
 }
 
 export class BudgetOnlyContextCoordinator implements ContextCoordinator {
@@ -39,6 +44,15 @@ export class BudgetOnlyContextCoordinator implements ContextCoordinator {
       type: "model-input-ready",
       request: structuredClone(request),
       budget: this.#calculator.assertFits(request),
+    };
+  }
+
+  async *reserveToolResult(
+    request: ModelRequest,
+  ): AsyncIterable<ContextCoordinatorEvent> {
+    yield {
+      type: "tool-result-budget-ready",
+      budget: this.#calculator.calculateToolResultBudget(request),
     };
   }
 }

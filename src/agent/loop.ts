@@ -10,6 +10,7 @@ import type {
   ToolResultMessage,
 } from "../model/types.js";
 import type { ToolRegistry } from "../tools/registry.js";
+import type { ToolResultBudget } from "../context/budget.js";
 import type { ToolCall, ToolResult } from "../tools/types.js";
 import { cloneToolDefinition } from "../tools/definition.js";
 import type { AgentEvent, AgentLoopOptions, AgentRequest } from "./types.js";
@@ -293,11 +294,51 @@ export class AgentLoop {
         completedToolBatches += 1;
 
         for (const toolCall of toolCalls) {
+          let resultBudget: ToolResultBudget | undefined;
+          if (this.contextCoordinator !== undefined) {
+            const reservationRequest: ModelRequest = {
+              model: request.model,
+              messages: structuredClone(workingMessages),
+              tools: this.toolRegistry.listDefinitions(),
+            };
+            for await (const event of this.contextCoordinator.reserveToolResult(
+              reservationRequest,
+              { signal: options?.signal },
+            )) {
+              if (event.type === "compaction-start") {
+                yield event;
+                continue;
+              }
+              if (event.type === "compaction-done") {
+                yield event;
+                continue;
+              }
+              if (event.type === "tool-result-budget-ready") {
+                resultBudget = event.budget;
+              }
+            }
+            if (resultBudget === undefined) {
+              throw new Error(
+                "Context coordinator ended without a tool-result-budget-ready event.",
+              );
+            }
+          }
+
           const preparation = this.toolRegistry.prepare(toolCall);
           let result: ToolResult;
 
-          if (!preparation.ok) {
-            result = preparation.result;
+          if (resultBudget !== undefined && resultBudget.maxTokens < 128) {
+            result = {
+              toolCallId: toolCall.id,
+              content:
+                "Insufficient tool result budget: at least 128 tokens are required.",
+              isError: true,
+            };
+          } else if (!preparation.ok) {
+            result = this.toolRegistry.boundResult(
+              preparation.result,
+              resultBudget,
+            );
           } else if (preparation.tool.approval === "always") {
             const decision = this.approvalHandler
               ? await this.approvalHandler.requestApproval(
@@ -317,15 +358,17 @@ export class AgentLoop {
               decision !== "deny"
                 ? await this.toolRegistry.executePrepared(preparation, {
                     signal: options?.signal,
+                    ...(resultBudget === undefined ? {} : { resultBudget }),
                   })
-                : {
+                : this.toolRegistry.boundResult({
                     toolCallId: toolCall.id,
                     content: `Tool "${toolCall.name}" was denied by the user.`,
                     isError: true,
-                  };
+                  }, resultBudget);
           } else {
             result = await this.toolRegistry.executePrepared(preparation, {
               signal: options?.signal,
+              ...(resultBudget === undefined ? {} : { resultBudget }),
             });
           }
 

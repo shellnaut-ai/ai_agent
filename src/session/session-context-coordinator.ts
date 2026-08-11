@@ -76,4 +76,48 @@ export class SessionContextCoordinator implements ContextCoordinator {
       budget: this.#calculator.assertFits(preparedRequest),
     };
   }
+
+  async *reserveToolResult(
+    request: ModelRequest,
+    options?: { readonly signal?: AbortSignal },
+  ): AsyncIterable<ContextCoordinatorEvent> {
+    if (options?.signal?.aborted) throw new Error("Context preparation aborted.");
+    let preparedRequest = structuredClone(request);
+    let budget = this.#calculator.calculateToolResultBudget(preparedRequest);
+    if (budget.maxTokens < 128) {
+      const requestedOutput =
+        request.maxOutputTokens ?? request.model.maxOutputTokens;
+      const preparation = this.#compaction.prepare({
+        model: request.model,
+        turns: this.#session.buildCompactionTurns(),
+        previousCompaction: this.#session.getPreviousCompaction(),
+        toolDefinitions: request.tools,
+        maxOutputTokens: requestedOutput + 128,
+      });
+      if (preparation !== undefined) {
+        yield {
+          type: "compaction-start",
+          tokensBefore: preparation.tokensBefore,
+        };
+        const result = await this.#compaction.compact(preparation, {
+          signal: options?.signal,
+        });
+        if (options?.signal?.aborted) {
+          throw new Error("Context preparation aborted.");
+        }
+        await this.#session.appendCompaction(result);
+        yield {
+          type: "compaction-done",
+          tokensBefore: result.tokensBefore,
+          tokensAfter: result.tokensAfter,
+        };
+        preparedRequest = {
+          ...structuredClone(request),
+          messages: [...this.#session.buildActiveMessages()],
+        };
+        budget = this.#calculator.calculateToolResultBudget(preparedRequest);
+      }
+    }
+    yield { type: "tool-result-budget-ready", budget };
+  }
 }
