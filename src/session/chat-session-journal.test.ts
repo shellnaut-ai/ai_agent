@@ -153,6 +153,51 @@ function createToolThenRunner(
 }
 
 describe("ChatSession incremental journal", () => {
+  test("persists every automatic continuation segment before the next call", async () => {
+    const { rootDir, store } = await createStore("automatic-continuation");
+    const requests: ModelRequest[] = [];
+    const runner: ModelStreamRunner = {
+      async *stream(request): AsyncIterable<StreamEvent> {
+        requests.push(structuredClone(request));
+        yield { type: "text-delta", delta: requests.length === 1 ? "part one " : "part two" };
+        yield {
+          type: "done",
+          reason: requests.length === 1 ? "length" : "stop",
+          providerState: {
+            provider: "fake",
+            value: { segment: requests.length },
+          },
+        };
+      },
+    };
+    const chat = new ChatSession(
+      new AgentLoop(runner, new ToolRegistry()),
+      model,
+      { session: new Session(store) },
+    );
+
+    const events = await collect(chat.streamTurn("continue it"));
+    const reloaded = await reloadSession(rootDir, "automatic-continuation");
+    const activeAssistants = reloaded.session.buildActiveMessages()
+      .filter((message) => message.role === "assistant");
+
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: "part one ",
+      continuation: { status: "partial" },
+      providerState: { value: { segment: 1 } },
+    });
+    expect(activeAssistants.map((message) => message.content))
+      .toEqual(["part one ", "part two"]);
+    expect(reloaded.session.buildDisplayMessages().at(-1)).toMatchObject({
+      role: "assistant",
+      content: "part one part two",
+      continuation: { status: "complete" },
+    });
+    expect(events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+  });
+
   test("rejects a concurrent turn until the active consumer returns", async () => {
     const { store } = await createStore("single-flight");
     let providerCalls = 0;
