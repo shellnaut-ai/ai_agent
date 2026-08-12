@@ -84,6 +84,7 @@ export class ReadTool implements Tool {
   readonly #cursorTtlMs: number;
   readonly #now: () => number;
   readonly #keyStore: FileReadCursorKeyStore;
+  #realRootPromise: Promise<string> | undefined;
   #codecPromise: Promise<{ codec: ReadCursorCodec; realRoot: string }> | undefined;
 
   constructor(options: ReadToolOptions) {
@@ -117,10 +118,13 @@ export class ReadTool implements Tool {
     if (!parsed.ok) return { content: parsed.message, isError: true };
 
     try {
-      const { codec, realRoot } = await this.#getCodec();
+      const realRoot = await this.#getRealRoot();
       assertNotAborted(options?.signal);
+      const codec = "cursor" in parsed.input
+        ? (await this.#getCodec()).codec
+        : undefined;
       const cursorPayload = "cursor" in parsed.input
-        ? codec.decode(parsed.input.cursor)
+        ? codec!.decode(parsed.input.cursor)
         : undefined;
       const requestedPath = cursorPayload?.relativePath ??
         ("path" in parsed.input ? parsed.input.path : undefined);
@@ -162,7 +166,7 @@ export class ReadTool implements Tool {
     targetRealPath: string,
     relativePath: string,
     cursorPayload: ReadCursorPayload | undefined,
-    codec: ReadCursorCodec,
+    codec: ReadCursorCodec | undefined,
     rootHash: string,
     options?: ToolExecutionOptions,
   ): Promise<ToolOutput> {
@@ -178,6 +182,7 @@ export class ReadTool implements Tool {
       const startByte = cursorPayload?.offsetBytes ?? 0;
       if (startByte > totalBytes) throw new Error("Stale read cursor.");
       const outputLimit = resultByteLimit(this.#maxBytes, options?.resultBudget);
+      const fitsResult = options?.resultBudget?.fits ?? (() => true);
 
       if (cursorPayload === undefined && totalBytes <= outputLimit) {
         const buffer = Buffer.alloc(totalBytes);
@@ -190,13 +195,16 @@ export class ReadTool implements Tool {
         if (!sameIdentity(identity, fileIdentity(after))) {
           throw new Error("Stale read cursor.");
         }
-        return { content, isError: false };
+        if (fitsResult(content, false)) {
+          return { content, isError: false };
+        }
       }
 
       const remaining = totalBytes - startByte;
       if (remaining === 0) {
         throw new Error("Stale read cursor.");
       }
+      const pagingCodec = codec ?? (await this.#getCodec()).codec;
       const buffer = Buffer.alloc(Math.min(remaining, outputLimit));
       const { bytesRead } = await handle.read(
         buffer,
@@ -213,9 +221,10 @@ export class ReadTool implements Tool {
         relativePath,
         targetRealPath,
         identity,
-        codec,
+        codec: pagingCodec,
         rootHash,
         outputLimit,
+        fitsResult,
       });
       const after = await handle.stat({ bigint: true });
       assertNotAborted(options?.signal);
@@ -238,6 +247,7 @@ export class ReadTool implements Tool {
     readonly codec: ReadCursorCodec;
     readonly rootHash: string;
     readonly outputLimit: number;
+    readonly fitsResult: (content: string, isError: boolean) => boolean;
   }): string {
     let candidateBytes = input.bytes.byteLength;
     while (candidateBytes > 0) {
@@ -268,8 +278,10 @@ export class ReadTool implements Tool {
       };
       const output = `${decoded.text}\n\n<read-page>${JSON.stringify(metadata)}</read-page>`;
       const overflow = Buffer.byteLength(output, "utf8") - input.outputLimit;
-      if (overflow <= 0) return output;
-      candidateBytes = decoded.bytes - overflow;
+      if (overflow <= 0 && input.fitsResult(output, false)) return output;
+      candidateBytes = overflow > 0
+        ? decoded.bytes - overflow
+        : Math.floor(decoded.bytes * 0.75);
     }
     throw new Error(
       `Read result budget of ${input.outputLimit} bytes is too small for page metadata.`,
@@ -279,7 +291,7 @@ export class ReadTool implements Tool {
   async #getCodec(): Promise<{ codec: ReadCursorCodec; realRoot: string }> {
     this.#codecPromise ??= (async () => {
       const [realRoot, key] = await Promise.all([
-        realpath(this.#rootDir),
+        this.#getRealRoot(),
         this.#cursorKey === undefined
           ? this.#keyStore.loadOrCreate()
           : Promise.resolve(Buffer.from(this.#cursorKey)),
@@ -294,6 +306,11 @@ export class ReadTool implements Tool {
       };
     })();
     return await this.#codecPromise;
+  }
+
+  async #getRealRoot(): Promise<string> {
+    this.#realRootPromise ??= realpath(this.#rootDir);
+    return await this.#realRootPromise;
   }
 }
 

@@ -1,6 +1,7 @@
 import type {
   Message,
   Model,
+  ModelContinuation,
   UserMessage,
 } from "../model/types.js";
 import type { ToolDefinition } from "../tools/types.js";
@@ -36,7 +37,9 @@ export interface CompactionRequest {
   readonly previousCompaction?: PreviousCompaction;
   readonly pendingUserMessage?: UserMessage;
   readonly toolDefinitions: readonly ToolDefinition[];
+  readonly systemPrompt?: string;
   readonly maxOutputTokens?: number;
+  readonly continuation?: ModelContinuation;
 }
 
 export interface CompactionPreparation {
@@ -46,6 +49,9 @@ export interface CompactionPreparation {
   readonly keptTurns: readonly CompactionTurn[];
   readonly pendingUserMessage?: UserMessage;
   readonly toolDefinitions: readonly ToolDefinition[];
+  readonly systemPrompt?: string;
+  readonly maxOutputTokens?: number;
+  readonly continuation?: ModelContinuation;
   readonly firstKeptEntryId: string;
   readonly tokensBefore: number;
   readonly inputBudget: number;

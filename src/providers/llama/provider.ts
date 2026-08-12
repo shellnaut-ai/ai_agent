@@ -1,10 +1,11 @@
 import type { ModelProvider, StreamOptions } from "../../model/provider.js";
-import type {
-  Message,
-  Model,
-  ModelRequest,
-  ProviderId,
-  StreamEvent,
+import {
+  combineSystemPrompts,
+  type Message,
+  type Model,
+  type ModelRequest,
+  type ProviderId,
+  type StreamEvent,
 } from "../../model/types.js";
 import { serializeToolCallArguments } from "../../tools/arguments.js";
 import { readSseData } from "./sse.js";
@@ -155,12 +156,16 @@ function toLlamaMessage(message: Message): Record<string, unknown> {
 
 function toLlamaMessages(request: ModelRequest): Record<string, unknown>[] {
   const instruction = continuationInstruction(request);
+  const systemPrompt = combineSystemPrompts(
+    request.model.systemPrompt,
+    request.systemPrompt,
+  );
   return [
-    ...(request.systemPrompt
+    ...(systemPrompt
       ? [
           {
             role: "system",
-            content: request.systemPrompt,
+            content: systemPrompt,
           },
         ]
       : []),

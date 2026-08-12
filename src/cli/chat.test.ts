@@ -171,4 +171,49 @@ describe("runChat", () => {
     expect(output.join("")).toContain("Cancelling current turn");
     expect(output.join("")).toContain("Turn cancelled");
   });
+
+  test("routes Escape to a resumed continuation abort signal", async () => {
+    const output: string[] = [];
+    const inputs = ["r", "/exit"];
+    let pending = true;
+    let escape: (() => void) | undefined;
+    const io = {
+      async question(): Promise<string | undefined> {
+        return inputs.shift();
+      },
+      write(content: string): void { output.push(content); },
+      writeError(content: string): void { output.push(content); },
+      onEscape(listener: () => void): () => void {
+        escape = listener;
+        return () => { escape = undefined; };
+      },
+      onInterrupt(): () => void { return () => undefined; },
+    };
+    const session: ChatSessionLike = {
+      getPendingContinuation() {
+        return pending ? {
+          logicalMessageId: "logical",
+          segmentIndex: 0,
+          status: "partial",
+          resumeAllowed: true,
+          tailHash: "a".repeat(64),
+          estimatedTotalOutputTokens: 2,
+        } : undefined;
+      },
+      async *streamContinuation(options): AsyncIterable<ChatEvent> {
+        pending = false;
+        escape?.();
+        expect(options?.signal?.aborted).toBe(true);
+        yield { type: "error", reason: "aborted", error: new Error("aborted") };
+      },
+      async *streamTurn(): AsyncIterable<ChatEvent> {
+        throw new Error("must not start a turn");
+      },
+    };
+
+    await runChat(session, io);
+
+    expect(output.join("")).toContain("Cancelling current turn");
+    expect(output.join("")).toContain("Turn cancelled");
+  });
 });

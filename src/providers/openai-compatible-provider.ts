@@ -1,9 +1,10 @@
 import type { ModelProvider, StreamOptions } from "../model/provider.js";
-import type {
-  Message,
-  Model,
-  ModelRequest,
-  StreamEvent,
+import {
+  combineSystemPrompts,
+  type Message,
+  type Model,
+  type ModelRequest,
+  type StreamEvent,
 } from "../model/types.js";
 import type { ToolDefinition } from "../tools/types.js";
 import { serializeToolCallArguments } from "../tools/arguments.js";
@@ -78,6 +79,10 @@ export class OpenAICompatibleProvider implements ModelProvider {
         "content-type": "application/json",
       };
       const instruction = continuationInstruction(request);
+      const systemPrompt = combineSystemPrompts(
+        request.model.systemPrompt,
+        request.systemPrompt,
+      );
       if (this.apiKey !== undefined) {
         headers.authorization = `Bearer ${this.apiKey}`;
       }
@@ -89,9 +94,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
           model: request.model.id,
           stream: true,
           messages: [
-            ...(request.systemPrompt === undefined
+            ...(systemPrompt === undefined
               ? []
-              : [{ role: "system", content: request.systemPrompt }]),
+              : [{ role: "system", content: systemPrompt }]),
             ...request.messages.map(serializeMessage),
             ...(instruction === undefined
               ? []

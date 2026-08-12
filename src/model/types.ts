@@ -35,6 +35,8 @@ export interface Model {
   contextWindow: number;
   // 최대 출력을 얼마로 요청할 것인가?
   maxOutputTokens: number;
+  // Provider wire에 포함되며 공통 context budget에도 계산되는 기본 지침.
+  systemPrompt?: string;
 }
 
 // 사용자의 질문과 이전 모델 답변
@@ -89,6 +91,15 @@ export interface ModelRequest {
   readonly tools: readonly ToolDefinition[];
   readonly maxOutputTokens?: number;
   readonly continuation?: ModelContinuation;
+}
+
+export function combineSystemPrompts(
+  ...values: readonly (string | undefined)[]
+): string | undefined {
+  const combined = values
+    .filter((value): value is string => value !== undefined && value.length > 0)
+    .join("\n\n");
+  return combined.length === 0 ? undefined : combined;
 }
 
 export type StopReason = "stop" | "length" | "tool-call";

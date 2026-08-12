@@ -1,5 +1,6 @@
 import {
   CONTINUATION_INSTRUCTION,
+  combineSystemPrompts,
   type Message,
   type ModelRequest,
 } from "../model/types.js";
@@ -29,10 +30,14 @@ export class TokenEstimator {
   }
 
   estimateRequest(request: ModelRequest): number {
+    const systemPrompt = combineSystemPrompts(
+      request.model.systemPrompt,
+      request.systemPrompt,
+    );
     return this.estimateValue({
-      ...(request.systemPrompt === undefined
+      ...(systemPrompt === undefined
         ? {}
-        : { systemPrompt: request.systemPrompt }),
+        : { systemPrompt }),
       messages: request.messages,
       tools: request.tools,
       ...(request.continuation === undefined

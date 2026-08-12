@@ -11,6 +11,7 @@ import type { ToolCall, ToolResult } from "../tools/types.js";
 
 export interface AgentRequest {
   readonly model: Model;
+  readonly systemPrompt?: string;
   readonly messages: readonly Message[];
   readonly maxOutputTokens?: number;
   readonly continuation?: ModelContinuation;

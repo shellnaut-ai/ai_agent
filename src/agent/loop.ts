@@ -136,6 +136,16 @@ export class AgentLoop {
     }
 
     try {
+      if (activeContinuation !== undefined) {
+        const restoredLimitError = continuationLimitError(
+          activeContinuation,
+          "",
+          continuationPolicy,
+          false,
+        );
+        if (restoredLimitError !== undefined) throw restoredLimitError;
+      }
+
       for (let step = 0; step < maxSteps; step += 1) {
         const continuationRequest = activeContinuation;
         const remainingOutputTokens = continuationRequest === undefined
@@ -144,6 +154,9 @@ export class AgentLoop {
             continuationRequest.estimatedTotalOutputTokens;
         let modelRequest: ModelRequest = {
           model: request.model,
+          ...(request.systemPrompt === undefined
+            ? {}
+            : { systemPrompt: request.systemPrompt }),
           messages: structuredClone(workingMessages),
           tools: this.toolRegistry.listDefinitions(),
           ...(continuationRequest === undefined && request.maxOutputTokens !== undefined
@@ -190,6 +203,11 @@ export class AgentLoop {
             );
           }
           modelRequest = preparedRequest;
+          workingMessages.splice(
+            0,
+            workingMessages.length,
+            ...structuredClone(preparedRequest.messages),
+          );
         }
 
         let assistantContent = "";
@@ -338,7 +356,7 @@ export class AgentLoop {
         }
 
         if (terminalReason === "length" && terminalIncompleteToolCall) {
-          if (assistantContent.length > 0) {
+          if (assistantContent.length > 0 || terminalProviderState !== undefined) {
             const checkpoint = createContinuationSegment({
               active: continuationRequest,
               content: assistantContent,
@@ -411,6 +429,23 @@ export class AgentLoop {
           (terminalReason === "length" ||
             (continuationRequest !== undefined && toolCalls.length === 0))
         ) {
+          if (terminalProviderState !== undefined) {
+            const checkpoint = createContinuationSegment({
+              active: continuationRequest,
+              content: "",
+              providerState: terminalProviderState,
+              toolCalls: [],
+              status: "partial",
+              resumeAllowed: false,
+              policy: continuationPolicy,
+            });
+            yield {
+              type: "message-checkpoint",
+              message: structuredClone(checkpoint.message),
+            };
+            workingMessages.push(checkpoint.message);
+            newMessages.push(checkpoint.message);
+          }
           yield {
             type: "error",
             reason: "error",
@@ -419,6 +454,14 @@ export class AgentLoop {
           return;
         }
 
+        const continuationError = terminalReason === "length"
+          ? continuationLimitError(
+              continuationRequest,
+              assistantContent,
+              continuationPolicy,
+              true,
+            )
+          : undefined;
         const segment =
           terminalReason === "length" || continuationRequest !== undefined
             ? createContinuationSegment({
@@ -427,7 +470,8 @@ export class AgentLoop {
                 providerState: terminalProviderState,
                 toolCalls,
                 status: terminalReason === "length" ? "partial" : "complete",
-                resumeAllowed: terminalReason === "length",
+                resumeAllowed:
+                  terminalReason === "length" && continuationError === undefined,
                 policy: continuationPolicy,
               })
             : undefined;
@@ -453,37 +497,12 @@ export class AgentLoop {
           if (segment === undefined || segment.next === undefined) {
             throw new Error("Continuation state was not created for a partial segment.");
           }
-          const repeatedTail = continuationRequest?.tailHashes.has(
-            segment.message.continuation!.tailHash,
-          ) === true;
           activeContinuation = segment.next;
-          if (repeatedTail) {
+          if (continuationError !== undefined) {
             yield {
               type: "error",
               reason: "error",
-              error: new Error("Continuation repeated a previous output tail."),
-            };
-            return;
-          }
-          if (
-            activeContinuation.estimatedTotalOutputTokens >=
-            continuationPolicy.maxTotalOutputTokens
-          ) {
-            yield {
-              type: "error",
-              reason: "error",
-              error: new Error("Continuation exhausted the total output token limit."),
-            };
-            return;
-          }
-          if (
-            activeContinuation.continuationsUsed >=
-            continuationPolicy.maxContinuations
-          ) {
-            yield {
-              type: "error",
-              reason: "error",
-              error: new Error("Continuation reached the maximum continuation count."),
+              error: continuationError,
             };
             return;
           }
@@ -509,12 +528,18 @@ export class AgentLoop {
           if (this.contextCoordinator !== undefined) {
             const reservationRequest: ModelRequest = {
               model: request.model,
+              ...(request.systemPrompt === undefined
+                ? {}
+                : { systemPrompt: request.systemPrompt }),
               messages: structuredClone(workingMessages),
               tools: this.toolRegistry.listDefinitions(),
+              ...(request.maxOutputTokens === undefined
+                ? {}
+                : { maxOutputTokens: request.maxOutputTokens }),
             };
             for await (const event of this.contextCoordinator.reserveToolResult(
               reservationRequest,
-              { signal: options?.signal },
+              { signal: options?.signal, toolCallId: toolCall.id },
             )) {
               if (event.type === "compaction-start") {
                 yield event;
@@ -526,6 +551,13 @@ export class AgentLoop {
               }
               if (event.type === "tool-result-budget-ready") {
                 resultBudget = event.budget;
+                if (event.request !== undefined) {
+                  workingMessages.splice(
+                    0,
+                    workingMessages.length,
+                    ...structuredClone(event.request.messages),
+                  );
+                }
               }
             }
             if (resultBudget === undefined) {
@@ -539,12 +571,23 @@ export class AgentLoop {
           let result: ToolResult;
 
           if (resultBudget !== undefined && resultBudget.maxTokens < 128) {
-            result = {
+            const insufficient = this.toolRegistry.boundResult({
               toolCallId: toolCall.id,
               content:
                 "Insufficient tool result budget: at least 128 tokens are required.",
               isError: true,
-            };
+            }, resultBudget);
+            if (resultBudget.fits?.(insufficient.content, true) === false) {
+              yield {
+                type: "error",
+                reason: "error",
+                error: new Error(
+                  "Insufficient context budget for a matched tool result.",
+                ),
+              };
+              return;
+            }
+            result = insufficient;
           } else if (!preparation.ok) {
             result = this.toolRegistry.boundResult(
               preparation.result,
@@ -617,6 +660,30 @@ export class AgentLoop {
       };
     }
   }
+}
+
+function continuationLimitError(
+  active: ActiveContinuation | undefined,
+  content: string,
+  policy: OutputContinuationPolicy,
+  includeNewContinuation: boolean,
+): Error | undefined {
+  const totalContent = (active?.totalContent ?? "") + content;
+  const tailHash = continuationTailHash(
+    continuationTail(totalContent, policy.overlapWindowChars),
+  );
+  if (includeNewContinuation && active?.tailHashes.has(tailHash) === true) {
+    return new Error("Continuation repeated a previous output tail.");
+  }
+  if (estimateOutputTokens(totalContent) >= policy.maxTotalOutputTokens) {
+    return new Error("Continuation exhausted the total output token limit.");
+  }
+  const continuationsUsed = (active?.continuationsUsed ?? 0) +
+    (includeNewContinuation && active !== undefined ? 1 : 0);
+  if (continuationsUsed >= policy.maxContinuations) {
+    return new Error("Continuation reached the maximum continuation count.");
+  }
+  return undefined;
 }
 
 function createContinuationSegment(input: {
@@ -697,6 +764,10 @@ function restoreActiveContinuation(
   const totalContent = segments.map((message) => message.content).join("");
   const previousTail = continuationTail(totalContent, policy.overlapWindowChars);
   const previousTailHash = continuationTailHash(previousTail);
+  if (new Set(segments.map((message) => message.continuation!.tailHash)).size !==
+    segments.length) {
+    throw new Error("Cannot resume continuation because it repeated an output tail.");
+  }
   if (
     previousTail !== request.continuation.previousTail ||
     previousTailHash !== request.continuation.previousTailHash ||

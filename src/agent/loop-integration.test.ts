@@ -701,6 +701,7 @@ describe("AgentLoop integration policies", () => {
   test("prepares every provider request through the common context coordinator", async () => {
     let coordinatorCalls = 0;
     let reserveCalls = 0;
+    let reservationMaxOutputTokens: number | undefined;
     let seenToolResultBudget: { maxBytes: number; maxTokens: number } | undefined;
     const seenSystemPrompts: Array<string | undefined> = [];
     const coordinator: ContextCoordinator = {
@@ -721,11 +722,19 @@ describe("AgentLoop integration policies", () => {
           },
         };
       },
-      async *reserveToolResult() {
+      async *reserveToolResult(request) {
         reserveCalls += 1;
+        reservationMaxOutputTokens = request.maxOutputTokens;
         yield {
           type: "tool-result-budget-ready",
           budget: { maxBytes: 512, maxTokens: 128 },
+          request: {
+            ...structuredClone(request),
+            messages: [
+              { role: "user", content: "compacted projection" },
+              ...structuredClone(request.messages),
+            ],
+          },
         };
       },
     };
@@ -764,13 +773,34 @@ describe("AgentLoop integration policies", () => {
       new AgentLoop(runner, registry, undefined, coordinator).stream({
         model,
         messages: [{ role: "user", content: "inspect" }],
+        maxOutputTokens: 777,
       }),
     );
 
     expect(coordinatorCalls).toBe(2);
     expect(reserveCalls).toBe(1);
+    expect(reservationMaxOutputTokens).toBe(777);
     expect(seenToolResultBudget).toEqual({ maxBytes: 512, maxTokens: 128 });
     expect(seenSystemPrompts).toEqual(["prepared-1", "prepared-2"]);
+  });
+
+  test("carries the common system prompt into the budgeted Provider request", async () => {
+    let seenSystemPrompt: string | undefined;
+    const runner: ModelStreamRunner = {
+      async *stream(request): AsyncIterable<StreamEvent> {
+        seenSystemPrompt = request.systemPrompt;
+        yield { type: "done", reason: "stop" };
+      },
+    };
+    const request = {
+      model,
+      messages: [],
+      systemPrompt: "Budget this instruction.",
+    } as Parameters<AgentLoop["stream"]>[0] & { systemPrompt: string };
+
+    await collect(new AgentLoop(runner, new ToolRegistry()).stream(request));
+
+    expect(seenSystemPrompt).toBe("Budget this instruction.");
   });
 
   test("fails a tool call closed when less than 128 result tokens remain", async () => {

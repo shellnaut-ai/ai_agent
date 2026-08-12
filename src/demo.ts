@@ -21,7 +21,6 @@ import { SessionContextCoordinator } from "./session/session-context-coordinator
 import { BashTool } from "./tools/bash.js";
 import { EditTool } from "./tools/edit.js";
 import { ReadTool } from "./tools/read.js";
-import { FileReadCursorKeyStore } from "./tools/read-cursor.js";
 import { ToolRegistry } from "./tools/registry.js";
 import { WriteTool } from "./tools/write.js";
 
@@ -62,13 +61,9 @@ async function main(): Promise<void> {
     cli.write("Press Esc to cancel the current turn.\n");
 
     const toolRegistry = new ToolRegistry();
-    const cursorKey = await new FileReadCursorKeyStore(process.cwd())
-      .loadOrCreate();
-
     toolRegistry.register(
       new ReadTool({
         rootDir: process.cwd(),
-        cursorKey,
       }),
     );
 
@@ -123,6 +118,8 @@ async function main(): Promise<void> {
     );
     const chatSession = new ChatSession(agentLoop, resolved.model, {
       session,
+      contextCoordinator: coordinator,
+      toolDefinitions: toolRegistry.listDefinitions(),
     });
 
     await runChat(chatSession, cli);

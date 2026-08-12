@@ -138,10 +138,14 @@ export class ToolRegistry {
         throw error;
       }
 
-      return {
-        toolCallId: prepared.originalCall.id,
+      const boundedOutput = boundToolOutput({
         content: error instanceof Error ? error.message : String(error),
         isError: true,
+      }, options?.resultBudget);
+      return {
+        toolCallId: prepared.originalCall.id,
+        content: boundedOutput.content,
+        isError: boundedOutput.isError,
       };
     }
   }
@@ -189,22 +193,54 @@ function boundToolOutput(
     throw new Error("Tool result budget must contain positive integer limits.");
   }
   const limit = Math.min(budget.maxBytes, budget.maxTokens * 4);
-  if (Buffer.byteLength(output.content, "utf8") <= limit) return output;
+  const fits = budget.fits ?? (() => true);
+  if (
+    Buffer.byteLength(output.content, "utf8") <= limit &&
+    fits(output.content, output.isError)
+  ) return output;
 
   const marker =
     "\n\n<Tool output truncated; discarded content is not recoverable. " +
     "Redirect output to a workspace file and use read paging.>";
   const markerBytes = Buffer.byteLength(marker, "utf8");
-  if (markerBytes > limit) {
+  if (markerBytes > limit || !fits(marker, true)) {
     return {
-      content: utf8Prefix(marker.trimStart(), limit),
+      content: longestFittingPrefix(marker.trimStart(), limit, (content) =>
+        fits(content, true)
+      ),
       isError: true,
     };
   }
+  const prefix = longestFittingPrefix(
+    output.content,
+    limit - markerBytes,
+    (content) => fits(content + marker, true),
+  );
   return {
-    content: utf8Prefix(output.content, limit - markerBytes) + marker,
+    content: prefix + marker,
     isError: true,
   };
+}
+
+function longestFittingPrefix(
+  value: string,
+  maxBytes: number,
+  fits: (content: string) => boolean,
+): string {
+  let low = 0;
+  let high = Math.min(maxBytes, Buffer.byteLength(value, "utf8"));
+  let best = "";
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = utf8Prefix(value, middle);
+    if (fits(candidate)) {
+      best = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return best;
 }
 
 function utf8Prefix(value: string, maxBytes: number): string {

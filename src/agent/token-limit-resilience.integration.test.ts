@@ -119,7 +119,11 @@ describe("token limit resilience", () => {
     const chat = new ChatSession(
       new AgentLoop(runner, tools, undefined, coordinator),
       model,
-      { session },
+      {
+        session,
+        contextCoordinator: coordinator,
+        toolDefinitions: tools.listDefinitions(),
+      },
     );
 
     const events = await collect(chat.streamTurn("handle every overflow"));

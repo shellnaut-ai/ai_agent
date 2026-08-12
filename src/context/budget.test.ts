@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 
 import { cloneModelRequest } from "../model/request-clone.js";
 import type { ModelRequest } from "../model/types.js";
+import { ToolRegistry } from "../tools/registry.js";
 import { ContextBudgetCalculator } from "./budget.js";
 import { TokenEstimator } from "./token-estimator.js";
 
@@ -80,6 +81,50 @@ describe("ContextBudgetCalculator", () => {
       maxBytes: 448,
     });
   });
+
+  test("bounds an ASCII tool result so the complete next request fits", () => {
+    const compactModel = {
+      ...model,
+      contextWindow: 1_024,
+      maxOutputTokens: 256,
+    };
+    const estimator = new TokenEstimator(2);
+    const calculator = new ContextBudgetCalculator(estimator);
+    const baseRequest = request({
+      model: compactModel,
+      messages: [{
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "call-1", name: "read", arguments: {} }],
+      }],
+    });
+    const budget = (calculator.calculateToolResultBudget as (
+      request: ModelRequest,
+      toolCallId: string,
+    ) => ReturnType<ContextBudgetCalculator["calculateToolResultBudget"]>)(
+      baseRequest,
+      "call-1",
+    );
+    const raw = {
+      toolCallId: "call-1",
+      content: "a".repeat(budget.maxBytes),
+      isError: false,
+    };
+
+    const bounded = new ToolRegistry().boundResult(raw, budget);
+    const nextRequest: ModelRequest = {
+      ...baseRequest,
+      messages: [...baseRequest.messages, {
+        role: "tool",
+        toolCallId: bounded.toolCallId,
+        content: bounded.content,
+        isError: bounded.isError,
+      }],
+    };
+
+    expect(bounded.content.length).toBeLessThan(raw.content.length);
+    expect(() => calculator.assertFits(nextRequest)).not.toThrow();
+  });
 });
 
 describe("TokenEstimator request coverage", () => {
@@ -88,6 +133,9 @@ describe("TokenEstimator request coverage", () => {
     const plain = estimator.estimateRequest(request());
     const withSystem = estimator.estimateRequest(request({
       systemPrompt: "System instruction",
+    }));
+    const withModelSystem = estimator.estimateRequest(request({
+      model: { ...model, systemPrompt: "Model-owned instruction" },
     }));
     const withTool = estimator.estimateRequest(request({
       tools: [{
@@ -110,6 +158,7 @@ describe("TokenEstimator request coverage", () => {
     }));
 
     expect(withSystem).toBeGreaterThan(plain);
+    expect(withModelSystem).toBeGreaterThan(plain);
     expect(withTool).toBeGreaterThan(plain);
     expect(withContinuation).toBeGreaterThan(plain);
   });

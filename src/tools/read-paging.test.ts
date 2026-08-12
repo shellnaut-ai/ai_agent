@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -55,6 +55,36 @@ describe("ReadTool paging", () => {
     const over = await tool.execute({ path: "over.txt" });
     expect(over.isError).toBe(false);
     expect(over.content).toContain("<read-page>");
+  });
+
+  test("does not create cursor key material for a small path read", async () => {
+    const rootDir = await temporaryDirectory("pi-clone-read-no-key-");
+    await writeFile(join(rootDir, "small.txt"), "small", "utf8");
+    const tool = new ReadTool({ rootDir, maxBytes: 1024 });
+
+    await expect(tool.execute({ path: "small.txt" })).resolves.toEqual({
+      content: "small",
+      isError: false,
+    });
+    await expect(access(join(rootDir, "sessions", ".read-cursor-key")))
+      .rejects.toThrow();
+  });
+
+  test("pages before returning content that fails the exact result fit check", async () => {
+    const rootDir = await temporaryDirectory("pi-clone-read-exact-fit-");
+    await writeFile(join(rootDir, "budget.txt"), "a".repeat(2_000), "utf8");
+    const tool = new ReadTool({ rootDir, maxBytes: 4_000, cursorKey: randomBytes(32) });
+    const result = await tool.execute({ path: "budget.txt" }, {
+      resultBudget: {
+        maxBytes: 4_000,
+        maxTokens: 1_000,
+        fits: (content) => content.length <= 900,
+      },
+    });
+
+    expect(result.isError).toBe(false);
+    expect(result.content).toContain("<read-page>");
+    expect(result.content.length).toBeLessThanOrEqual(900);
   });
 
   test("rejects a stale file, invalid or expired cursors, and mixed input", async () => {

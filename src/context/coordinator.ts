@@ -1,5 +1,5 @@
 import type { ContextBudget, ContextBudgetCalculator, ToolResultBudget } from "./budget.js";
-import type { ModelRequest } from "../model/types.js";
+import type { ModelRequest, UserMessage } from "../model/types.js";
 
 export type ContextCoordinatorEvent =
   | { readonly type: "compaction-start"; readonly tokensBefore: number }
@@ -16,9 +16,16 @@ export type ContextCoordinatorEvent =
   | {
       readonly type: "tool-result-budget-ready";
       readonly budget: ToolResultBudget;
+      readonly request?: ModelRequest;
     };
 
 export interface ContextCoordinator {
+  preparePendingUserMessage?(
+    request: ModelRequest,
+    pendingUserMessage: UserMessage,
+    options?: { readonly signal?: AbortSignal },
+  ): AsyncIterable<ContextCoordinatorEvent>;
+
   prepareModelRequest(
     request: ModelRequest,
     options?: { readonly signal?: AbortSignal },
@@ -26,7 +33,10 @@ export interface ContextCoordinator {
 
   reserveToolResult(
     request: ModelRequest,
-    options?: { readonly signal?: AbortSignal },
+    options?: {
+      readonly signal?: AbortSignal;
+      readonly toolCallId?: string;
+    },
   ): AsyncIterable<ContextCoordinatorEvent>;
 }
 
@@ -49,10 +59,15 @@ export class BudgetOnlyContextCoordinator implements ContextCoordinator {
 
   async *reserveToolResult(
     request: ModelRequest,
+    options?: { readonly toolCallId?: string },
   ): AsyncIterable<ContextCoordinatorEvent> {
     yield {
       type: "tool-result-budget-ready",
-      budget: this.#calculator.calculateToolResultBudget(request),
+      budget: this.#calculator.calculateToolResultBudget(
+        request,
+        options?.toolCallId,
+      ),
+      request: structuredClone(request),
     };
   }
 }

@@ -204,9 +204,15 @@ export class CompactionService {
       model: request.model,
       messages: activeMessages,
       tools: request.toolDefinitions,
+      ...(request.systemPrompt === undefined
+        ? {}
+        : { systemPrompt: request.systemPrompt }),
       ...(request.maxOutputTokens === undefined
         ? {}
         : { maxOutputTokens: request.maxOutputTokens }),
+      ...(request.continuation === undefined
+        ? {}
+        : { continuation: structuredClone(request.continuation) }),
     });
     const tokensBefore = budget.estimatedInputTokens;
     const inputBudget = budget.inputBudget;
@@ -266,6 +272,11 @@ export class CompactionService {
       keptTurns,
       pendingUserMessage: request.pendingUserMessage,
       toolDefinitions: request.toolDefinitions,
+      systemPrompt: request.systemPrompt,
+      maxOutputTokens: request.maxOutputTokens,
+      continuation: request.continuation === undefined
+        ? undefined
+        : structuredClone(request.continuation),
       firstKeptEntryId: firstKeptTurn.firstEntryId,
       tokensBefore,
       inputBudget,
@@ -339,6 +350,15 @@ export class CompactionService {
       model: preparation.model,
       messages: compactedMessages,
       tools: preparation.toolDefinitions,
+      ...(preparation.systemPrompt === undefined
+        ? {}
+        : { systemPrompt: preparation.systemPrompt }),
+      ...(preparation.maxOutputTokens === undefined
+        ? {}
+        : { maxOutputTokens: preparation.maxOutputTokens }),
+      ...(preparation.continuation === undefined
+        ? {}
+        : { continuation: structuredClone(preparation.continuation) }),
     });
 
     if (tokensAfter > preparation.inputBudget) {

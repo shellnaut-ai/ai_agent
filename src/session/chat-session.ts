@@ -5,6 +5,7 @@ import {
   continuationTailHash,
 } from "../agent/output-continuation.js";
 import { CompactionService } from "../context/compaction.js";
+import type { ContextCoordinator } from "../context/coordinator.js";
 import type { Message, Model, UserMessage } from "../model/types.js";
 import type { ToolDefinition } from "../tools/types.js";
 import { InterruptedToolRecoveryError, Session } from "./session.js";
@@ -14,6 +15,8 @@ export interface ChatSessionOptions {
   readonly session: Session;
   readonly compactionService?: CompactionService;
   readonly toolDefinitions?: readonly ToolDefinition[];
+  readonly systemPrompt?: string;
+  readonly contextCoordinator?: ContextCoordinator;
 }
 
 export class ChatSession {
@@ -22,6 +25,8 @@ export class ChatSession {
   private readonly session: Session;
   private readonly compactionService: CompactionService | undefined;
   private readonly toolDefinitions: readonly ToolDefinition[];
+  private readonly systemPrompt: string | undefined;
+  private readonly contextCoordinator: ContextCoordinator | undefined;
   private turnActive = false;
 
   constructor(
@@ -34,6 +39,8 @@ export class ChatSession {
     this.session = options.session;
     this.compactionService = options.compactionService;
     this.toolDefinitions = [...(options.toolDefinitions ?? [])];
+    this.systemPrompt = options.systemPrompt;
+    this.contextCoordinator = options.contextCoordinator;
   }
 
   public getMessages(): readonly Message[] {
@@ -86,6 +93,9 @@ export class ChatSession {
       }
       yield* this.streamAgent({
         model: this.model,
+        ...(this.systemPrompt === undefined
+          ? {}
+          : { systemPrompt: this.systemPrompt }),
         messages,
         continuation: {
           kind: "assistant-output",
@@ -183,7 +193,34 @@ export class ChatSession {
       return;
     }
 
-    if (this.compactionService) {
+    if (this.contextCoordinator?.preparePendingUserMessage !== undefined) {
+      try {
+        const request = {
+          model: this.model,
+          ...(this.systemPrompt === undefined
+            ? {}
+            : { systemPrompt: this.systemPrompt }),
+          messages: [...this.session.buildActiveMessages()],
+          tools: this.toolDefinitions,
+        };
+        for await (const event of this.contextCoordinator.preparePendingUserMessage(
+          request,
+          newMessage,
+          { signal: options?.signal },
+        )) {
+          if (event.type === "compaction-start" || event.type === "compaction-done") {
+            yield event;
+          }
+        }
+      } catch (error: unknown) {
+        yield {
+          type: "error",
+          reason: options?.signal?.aborted ? "aborted" : "error",
+          error: error instanceof Error ? error : new Error(String(error)),
+        };
+        return;
+      }
+    } else if (this.compactionService) {
       let preparation;
 
       try {
@@ -194,6 +231,9 @@ export class ChatSession {
             this.session.getPreviousCompaction(),
           pendingUserMessage: newMessage,
           toolDefinitions: this.toolDefinitions,
+          ...(this.systemPrompt === undefined
+            ? {}
+            : { systemPrompt: this.systemPrompt }),
         });
       } catch (error: unknown) {
         yield {
@@ -250,6 +290,9 @@ export class ChatSession {
 
     const request = {
       model: this.model,
+      ...(this.systemPrompt === undefined
+        ? {}
+        : { systemPrompt: this.systemPrompt }),
       messages: [...this.session.buildActiveMessages()],
     };
 

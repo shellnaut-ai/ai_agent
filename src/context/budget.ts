@@ -18,6 +18,7 @@ export interface ContextBudget {
 export interface ToolResultBudget {
   readonly maxBytes: number;
   readonly maxTokens: number;
+  readonly fits?: (content: string, isError: boolean) => boolean;
 }
 
 export interface RequestTokenEstimator {
@@ -124,11 +125,42 @@ export class ContextBudgetCalculator {
     return budget;
   }
 
-  calculateToolResultBudget(request: ModelRequest): ToolResultBudget {
-    const remaining = Math.max(0, this.calculate(request).remainingInputTokens);
+  calculateToolResultBudget(
+    request: ModelRequest,
+    toolCallId?: string,
+  ): ToolResultBudget {
+    const requestBudget = this.calculate(request);
+    const remaining = toolCallId === undefined
+      ? Math.max(0, requestBudget.remainingInputTokens)
+      : Math.max(
+          0,
+          requestBudget.inputBudget - this.#estimator.estimateRequest({
+            ...request,
+            messages: [...request.messages, {
+              role: "tool",
+              toolCallId,
+              content: "",
+              isError: false,
+            }],
+          }),
+        );
     return {
       maxTokens: remaining,
       maxBytes: Math.min(64 * 1024, remaining * 4),
+      ...(toolCallId === undefined
+        ? {}
+        : {
+            fits: (content: string, isError: boolean): boolean =>
+              this.calculate({
+                ...request,
+                messages: [...request.messages, {
+                  role: "tool",
+                  toolCallId,
+                  content,
+                  isError,
+                }],
+              }).remainingInputTokens >= 0,
+          }),
     };
   }
 }

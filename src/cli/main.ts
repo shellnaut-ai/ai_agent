@@ -23,7 +23,6 @@ import { SessionContextCoordinator } from "../session/session-context-coordinato
 import { BashTool } from "../tools/bash.js";
 import { EditTool } from "../tools/edit.js";
 import { ReadTool } from "../tools/read.js";
-import { FileReadCursorKeyStore } from "../tools/read-cursor.js";
 import { ToolRegistry } from "../tools/registry.js";
 import { WriteTool } from "../tools/write.js";
 import { CliToolApprovalHandler } from "./approval.js";
@@ -148,8 +147,6 @@ async function runConfiguredChat(
         store: oauthStore,
         refresher: oauth,
       }),
-      instructions:
-        "You are a careful coding assistant. Use tools when files are needed.",
     }));
   }
 
@@ -167,8 +164,7 @@ async function runConfiguredChat(
     model: resolved.model,
   });
   const loadedSession = await sessionStore.load();
-  const cursorKey = await new FileReadCursorKeyStore(process.cwd()).loadOrCreate();
-  const tools = createTools(process.cwd(), cursorKey);
+  const tools = createTools(process.cwd());
   const runtime = new RetryingModelRuntime(new ModelRuntime(registry), {
     maxRetries: 2,
     initialDelayMs: 500,
@@ -200,6 +196,10 @@ async function runConfiguredChat(
   );
   const chat = new ChatSession(agent, resolved.model, {
     session,
+    contextCoordinator: coordinator,
+    toolDefinitions: tools.listDefinitions(),
+    systemPrompt:
+      "You are a careful coding assistant. Use tools when files are needed.",
   });
 
   cli.write(`Provider: ${options.provider}\n`);
@@ -220,9 +220,9 @@ function createModel(provider: ChatProvider, id: string): Model {
   };
 }
 
-function createTools(rootDir: string, cursorKey: Uint8Array): ToolRegistry {
+function createTools(rootDir: string): ToolRegistry {
   const tools = new ToolRegistry();
-  tools.register(new ReadTool({ rootDir, cursorKey }));
+  tools.register(new ReadTool({ rootDir }));
   tools.register(new WriteTool({ rootDir }));
   tools.register(new EditTool({ rootDir }));
   tools.register(new BashTool({

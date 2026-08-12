@@ -50,7 +50,23 @@ export async function runChat(
           io.writeError("Error: this session cannot resume continuations.\n");
           return;
         }
-        await renderContinuation(session.streamContinuation(), io);
+        const controller = new AbortController();
+        const cancelContinuation = (): void => {
+          if (controller.signal.aborted) return;
+          io.write("\nCancelling current turn...\n");
+          controller.abort();
+        };
+        const removeEscapeListener = io.onEscape(cancelContinuation);
+        const removeInterruptListener = io.onInterrupt(cancelContinuation);
+        try {
+          await renderContinuation(
+            session.streamContinuation({ signal: controller.signal }),
+            io,
+          );
+        } finally {
+          removeEscapeListener();
+          removeInterruptListener();
+        }
         continue;
       }
       io.write("[Recovery] Choose one of the listed options.\n");

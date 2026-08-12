@@ -7,6 +7,7 @@ import { ToolRegistry } from "../tools/registry.js";
 import { AgentLoop } from "./loop.js";
 import {
   ContinuationOverlapGuard,
+  continuationTailHash,
   createOutputContinuationPolicy,
 } from "./output-continuation.js";
 
@@ -87,8 +88,80 @@ describe("output continuation", () => {
     ).stream({ model, messages: [] }));
 
     expect(calls).toBe(2);
-    expect(events.filter((event) => event.type === "message-checkpoint"))
-      .toHaveLength(2);
+    const checkpoints = events.filter(
+      (event) => event.type === "message-checkpoint",
+    );
+    expect(checkpoints).toHaveLength(2);
+    expect(checkpoints.at(-1)).toMatchObject({
+      message: {
+        continuation: { status: "partial", resumeAllowed: false },
+      },
+    });
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { message: expect.stringMatching(/maximum continuation count/i) },
+    });
+  });
+
+  test("rejects a restored continuation cap before another Provider call", async () => {
+    let calls = 0;
+    const logicalMessageId = "logical-cap";
+    const firstTail = "first";
+    const secondTail = "firstsecond";
+    const runner: ModelStreamRunner = {
+      async *stream(): AsyncIterable<StreamEvent> {
+        calls += 1;
+        yield { type: "text-delta", delta: "must not run" };
+        yield { type: "done", reason: "stop" };
+      },
+    };
+    const messages = [
+      {
+        role: "assistant" as const,
+        content: "first",
+        toolCalls: [],
+        continuation: {
+          logicalMessageId,
+          segmentIndex: 0,
+          status: "partial" as const,
+          resumeAllowed: true,
+          tailHash: continuationTailHash(firstTail),
+          estimatedTotalOutputTokens: 2,
+        },
+      },
+      {
+        role: "assistant" as const,
+        content: "second",
+        toolCalls: [],
+        continuation: {
+          logicalMessageId,
+          segmentIndex: 1,
+          status: "partial" as const,
+          resumeAllowed: true,
+          tailHash: continuationTailHash(secondTail),
+          estimatedTotalOutputTokens: 3,
+        },
+      },
+    ];
+    const events = await collect(new AgentLoop(
+      runner,
+      new ToolRegistry(),
+      undefined,
+      undefined,
+      createOutputContinuationPolicy(model, { maxContinuations: 1 }),
+    ).stream({
+      model,
+      messages,
+      continuation: {
+        kind: "assistant-output",
+        logicalMessageId,
+        segmentIndex: 2,
+        previousTail: secondTail,
+        previousTailHash: continuationTailHash(secondTail),
+      },
+    }));
+
+    expect(calls).toBe(0);
     expect(events.at(-1)).toMatchObject({
       type: "error",
       error: { message: expect.stringMatching(/maximum continuation count/i) },
@@ -146,6 +219,81 @@ describe("output continuation", () => {
           status: "partial",
           resumeAllowed: false,
         }),
+      }),
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { message: expect.stringMatching(/incomplete tool call/i) },
+    });
+  });
+
+  test("checkpoints opaque Provider state when length has no visible text", async () => {
+    const providerState = {
+      provider: "openai-codex" as const,
+      value: {
+        reasoningItems: [{
+          type: "reasoning",
+          id: "rs_opaque",
+          summary: [],
+          encrypted_content: "encrypted",
+        }],
+        functionItemIds: {},
+      },
+    };
+    const runner: ModelStreamRunner = {
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: "done", reason: "length", providerState };
+      },
+    };
+
+    const events = await collect(new AgentLoop(
+      runner,
+      new ToolRegistry(),
+    ).stream({ model, messages: [] }));
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "message-checkpoint",
+      message: expect.objectContaining({
+        content: "",
+        providerState,
+        continuation: expect.objectContaining({
+          status: "partial",
+          resumeAllowed: false,
+        }),
+      }),
+    }));
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { message: expect.stringMatching(/no.*progress/i) },
+    });
+  });
+
+  test("checkpoints zero-text incomplete tool Provider state", async () => {
+    const providerState = {
+      provider: "openai-codex" as const,
+      value: { reasoningItems: [], functionItemIds: {} },
+    };
+    const runner: ModelStreamRunner = {
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield {
+          type: "done",
+          reason: "length",
+          incompleteToolCall: true,
+          providerState,
+        };
+      },
+    };
+
+    const events = await collect(
+      new AgentLoop(runner, new ToolRegistry()).stream({ model, messages: [] }),
+    );
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "message-checkpoint",
+      message: expect.objectContaining({
+        content: "",
+        providerState,
+        continuation: expect.objectContaining({ resumeAllowed: false }),
       }),
     }));
     expect(events.at(-1)).toMatchObject({

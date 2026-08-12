@@ -12,6 +12,9 @@ import { JsonlSessionStore } from "../session/jsonl-store.js";
 import { Session } from "../session/session.js";
 import { ToolRegistry } from "../tools/registry.js";
 import { CompactionService } from "./compaction.js";
+import { ContextBudgetCalculator } from "./budget.js";
+import { TokenEstimator } from "./token-estimator.js";
+import { SessionContextCoordinator } from "../session/session-context-coordinator.js";
 
 const cleanup: string[] = [];
 
@@ -294,5 +297,67 @@ describe("CompactionService integration", () => {
     expect(compaction).toBeDefined();
     expect(pendingUsers).toHaveLength(1);
     expect(pendingUsers[0]?.parentId).toBe(compaction?.id);
+  }, 15_000);
+
+  test("does not journal a pending user when coordinator compaction fails", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-compaction-fail-"));
+    cleanup.push(rootDir);
+    const model = {
+      id: "fake-model",
+      name: "Fake",
+      provider: "fake" as const,
+      contextWindow: 4_000,
+      maxOutputTokens: 100,
+    };
+    const store = new JsonlSessionStore({
+      rootDir,
+      sessionId: "pending-user-failure",
+      model,
+    });
+    await store.load();
+    const session = new Session(store);
+    const long = "x".repeat(900);
+    for (let index = 0; index < 3; index += 1) {
+      await session.appendMessages([
+        { role: "user", content: `${index}:${long}` },
+        { role: "assistant", content: long, toolCalls: [] },
+      ]);
+    }
+    const compaction = new CompactionService({
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: "error", reason: "error", error: new Error("summary failed") };
+      },
+    }, {
+      reserveTokens: 100,
+      keepRecentTokens: 1_000,
+      charsPerToken: 1,
+      maxSummaryOutputTokens: 100,
+      toolResultMaxChars: 1_000,
+    });
+    const coordinator = new SessionContextCoordinator(
+      session,
+      compaction,
+      new ContextBudgetCalculator(new TokenEstimator(1)),
+    );
+    const chat = new ChatSession(
+      new AgentLoop({
+        async *stream(): AsyncIterable<StreamEvent> {
+          throw new Error("Provider must not run");
+        },
+      }, new ToolRegistry(), undefined, coordinator),
+      model,
+      { session, contextCoordinator: coordinator },
+    );
+
+    const events = await collect(chat.streamTurn("must stay pending-only"));
+
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { message: "summary failed" },
+    });
+    expect(session.getMessages()).not.toContainEqual({
+      role: "user",
+      content: "must stay pending-only",
+    });
   }, 15_000);
 });
