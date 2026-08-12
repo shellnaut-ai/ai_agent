@@ -2,6 +2,7 @@ import { Type } from "typebox";
 import { describe, expect, test } from "vitest";
 
 import type { ToolApprovalHandler } from "../approval/types.js";
+import type { ContextCoordinator } from "../context/coordinator.js";
 import type { ModelStreamRunner } from "../model/runtime.js";
 import type {
   ModelRequest,
@@ -695,5 +696,181 @@ describe("AgentLoop integration policies", () => {
       type: "error",
       error: { message: expect.stringMatching(/duplicate.*tool call/i) },
     });
+  });
+
+  test("prepares every provider request through the common context coordinator", async () => {
+    let coordinatorCalls = 0;
+    let reserveCalls = 0;
+    let reservationMaxOutputTokens: number | undefined;
+    let seenToolResultBudget: { maxBytes: number; maxTokens: number } | undefined;
+    const seenSystemPrompts: Array<string | undefined> = [];
+    const coordinator: ContextCoordinator = {
+      async *prepareModelRequest(request) {
+        coordinatorCalls += 1;
+        yield {
+          type: "model-input-ready",
+          request: {
+            ...structuredClone(request),
+            systemPrompt: `prepared-${coordinatorCalls}`,
+          },
+          budget: {
+            requestedMaxOutputTokens: 1024,
+            safetyMarginTokens: 256,
+            inputBudget: 2816,
+            estimatedInputTokens: 100,
+            remainingInputTokens: 2716,
+          },
+        };
+      },
+      async *reserveToolResult(request) {
+        reserveCalls += 1;
+        reservationMaxOutputTokens = request.maxOutputTokens;
+        yield {
+          type: "tool-result-budget-ready",
+          budget: { maxBytes: 512, maxTokens: 128 },
+          request: {
+            ...structuredClone(request),
+            messages: [
+              { role: "user", content: "compacted projection" },
+              ...structuredClone(request.messages),
+            ],
+          },
+        };
+      },
+    };
+    let providerCalls = 0;
+    const runner: ModelStreamRunner = {
+      async *stream(request): AsyncIterable<StreamEvent> {
+        providerCalls += 1;
+        seenSystemPrompts.push(request.systemPrompt);
+        yield { type: "start" };
+        if (providerCalls === 1) {
+          yield {
+            type: "tool-call",
+            toolCall: { id: "call-1", name: "read-test", arguments: {} },
+          };
+          yield { type: "done", reason: "tool-call" };
+          return;
+        }
+        yield { type: "done", reason: "stop" };
+      },
+    };
+    const registry = new ToolRegistry();
+    registry.register({
+      approval: "never",
+      definition: {
+        name: "read-test",
+        description: "Return a result.",
+        inputSchema: Type.Object({}, { additionalProperties: false }),
+      },
+      async execute(_input, options) {
+        seenToolResultBudget = options?.resultBudget;
+        return { content: "ok", isError: false };
+      },
+    });
+
+    await collect(
+      new AgentLoop(runner, registry, undefined, coordinator).stream({
+        model,
+        messages: [{ role: "user", content: "inspect" }],
+        maxOutputTokens: 777,
+      }),
+    );
+
+    expect(coordinatorCalls).toBe(2);
+    expect(reserveCalls).toBe(1);
+    expect(reservationMaxOutputTokens).toBe(777);
+    expect(seenToolResultBudget).toEqual({ maxBytes: 512, maxTokens: 128 });
+    expect(seenSystemPrompts).toEqual(["prepared-1", "prepared-2"]);
+  });
+
+  test("carries the common system prompt into the budgeted Provider request", async () => {
+    let seenSystemPrompt: string | undefined;
+    const runner: ModelStreamRunner = {
+      async *stream(request): AsyncIterable<StreamEvent> {
+        seenSystemPrompt = request.systemPrompt;
+        yield { type: "done", reason: "stop" };
+      },
+    };
+    const request = {
+      model,
+      messages: [],
+      systemPrompt: "Budget this instruction.",
+    } as Parameters<AgentLoop["stream"]>[0] & { systemPrompt: string };
+
+    await collect(new AgentLoop(runner, new ToolRegistry()).stream(request));
+
+    expect(seenSystemPrompt).toBe("Budget this instruction.");
+  });
+
+  test("fails a tool call closed when less than 128 result tokens remain", async () => {
+    let executions = 0;
+    const coordinator: ContextCoordinator = {
+      async *prepareModelRequest(request) {
+        yield {
+          type: "model-input-ready",
+          request,
+          budget: {
+            requestedMaxOutputTokens: 100,
+            safetyMarginTokens: 256,
+            inputBudget: 1000,
+            estimatedInputTokens: 900,
+            remainingInputTokens: 100,
+          },
+        };
+      },
+      async *reserveToolResult() {
+        yield {
+          type: "tool-result-budget-ready",
+          budget: { maxBytes: 400, maxTokens: 100 },
+        };
+      },
+    };
+    let providerCalls = 0;
+    const runner: ModelStreamRunner = {
+      async *stream(): AsyncIterable<StreamEvent> {
+        providerCalls += 1;
+        yield { type: "start" };
+        if (providerCalls === 1) {
+          yield {
+            type: "tool-call",
+            toolCall: { id: "call-small", name: "small-budget", arguments: {} },
+          };
+          yield { type: "done", reason: "tool-call" };
+          return;
+        }
+        yield { type: "done", reason: "stop" };
+      },
+    };
+    const registry = new ToolRegistry();
+    registry.register({
+      approval: "never",
+      definition: {
+        name: "small-budget",
+        description: "Must not run.",
+        inputSchema: Type.Object({}, { additionalProperties: false }),
+      },
+      async execute() {
+        executions += 1;
+        return { content: "unsafe", isError: false };
+      },
+    });
+
+    const events = await collect(
+      new AgentLoop(runner, registry, undefined, coordinator).stream({
+        model,
+        messages: [{ role: "user", content: "inspect" }],
+      }),
+    );
+
+    expect(executions).toBe(0);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "tool-result",
+      result: expect.objectContaining({
+        toolCallId: "call-small",
+        isError: true,
+        content: expect.stringMatching(/insufficient.*tool result budget/i),
+      }),
+    }));
   });
 });

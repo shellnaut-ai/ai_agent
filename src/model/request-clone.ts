@@ -12,5 +12,8 @@ export function cloneModelRequest(request: ModelRequest): ModelRequest {
     ...(request.maxOutputTokens === undefined
       ? {}
       : { maxOutputTokens: request.maxOutputTokens }),
+    ...(request.continuation === undefined
+      ? {}
+      : { continuation: structuredClone(request.continuation) }),
   };
 }

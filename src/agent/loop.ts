@@ -1,7 +1,11 @@
+import { randomUUID } from "node:crypto";
+
 import type { ToolApprovalHandler } from "../approval/types.js";
+import type { ContextCoordinator } from "../context/coordinator.js";
 import type { ModelStreamRunner } from "../model/runtime.js";
 import type {
   AssistantMessage,
+  AssistantContinuationSegment,
   Message,
   ModelRequest,
   ProviderMessageState,
@@ -9,23 +13,49 @@ import type {
   ToolResultMessage,
 } from "../model/types.js";
 import type { ToolRegistry } from "../tools/registry.js";
+import type { ToolResultBudget } from "../context/budget.js";
 import type { ToolCall, ToolResult } from "../tools/types.js";
 import { cloneToolDefinition } from "../tools/definition.js";
 import type { AgentEvent, AgentLoopOptions, AgentRequest } from "./types.js";
+import {
+  ContinuationOverlapGuard,
+  continuationTail,
+  continuationTailHash,
+  createOutputContinuationPolicy,
+  estimateOutputTokens,
+  type OutputContinuationPolicy,
+} from "./output-continuation.js";
+
+interface ActiveContinuation {
+  readonly logicalMessageId: string;
+  readonly nextSegmentIndex: number;
+  readonly totalContent: string;
+  readonly estimatedTotalOutputTokens: number;
+  readonly previousTail: string;
+  readonly previousTailHash: string;
+  readonly tailHashes: ReadonlySet<string>;
+  readonly continuationsUsed: number;
+}
 
 export class AgentLoop {
   private readonly runtime: ModelStreamRunner;
   private readonly toolRegistry: ToolRegistry;
   private readonly approvalHandler: ToolApprovalHandler | undefined;
+  private readonly contextCoordinator: ContextCoordinator | undefined;
+  private readonly outputContinuationPolicy: OutputContinuationPolicy | undefined;
 
   constructor(
     runtime: ModelStreamRunner,
     toolRegistry: ToolRegistry,
     approvalHandler?: ToolApprovalHandler,
+    contextCoordinator?: ContextCoordinator,
+    outputContinuationPolicy?: OutputContinuationPolicy,
   ) {
     this.runtime = runtime;
     this.toolRegistry = toolRegistry;
     this.approvalHandler = approvalHandler;
+    this.contextCoordinator = contextCoordinator;
+    this.outputContinuationPolicy = outputContinuationPolicy;
   }
 
   async *stream(
@@ -38,6 +68,8 @@ export class AgentLoop {
 
     const maxSteps = options?.maxSteps ?? 8;
     const maxToolBatches = options?.maxToolBatches;
+    const continuationPolicy = this.outputContinuationPolicy ??
+      createOutputContinuationPolicy(request.model);
 
     if (!Number.isInteger(maxSteps) || maxSteps <= 0) {
       yield {
@@ -78,6 +110,10 @@ export class AgentLoop {
 
     const newMessages: Message[] = [];
     let completedToolBatches = 0;
+    let activeContinuation = restoreActiveContinuation(
+      request,
+      continuationPolicy,
+    );
     const seenToolCallIds = new Set<string>();
 
     for (const message of request.messages) {
@@ -100,17 +136,94 @@ export class AgentLoop {
     }
 
     try {
+      if (activeContinuation !== undefined) {
+        const restoredLimitError = continuationLimitError(
+          activeContinuation,
+          "",
+          continuationPolicy,
+          false,
+        );
+        if (restoredLimitError !== undefined) throw restoredLimitError;
+      }
+
       for (let step = 0; step < maxSteps; step += 1) {
-        const modelRequest: ModelRequest = {
+        const continuationRequest = activeContinuation;
+        const remainingOutputTokens = continuationRequest === undefined
+          ? request.model.maxOutputTokens
+          : continuationPolicy.maxTotalOutputTokens -
+            continuationRequest.estimatedTotalOutputTokens;
+        let modelRequest: ModelRequest = {
           model: request.model,
+          ...(request.systemPrompt === undefined
+            ? {}
+            : { systemPrompt: request.systemPrompt }),
           messages: structuredClone(workingMessages),
           tools: this.toolRegistry.listDefinitions(),
+          ...(continuationRequest === undefined && request.maxOutputTokens !== undefined
+            ? { maxOutputTokens: request.maxOutputTokens }
+            : {}),
+          ...(continuationRequest === undefined
+            ? {}
+            : {
+                maxOutputTokens: Math.min(
+                  request.model.maxOutputTokens,
+                  remainingOutputTokens,
+                ),
+                continuation: {
+                  kind: "assistant-output" as const,
+                  logicalMessageId: continuationRequest.logicalMessageId,
+                  segmentIndex: continuationRequest.nextSegmentIndex,
+                  previousTail: continuationRequest.previousTail,
+                  previousTailHash: continuationRequest.previousTailHash,
+                },
+              }),
         };
 
+        if (this.contextCoordinator !== undefined) {
+          let preparedRequest: ModelRequest | undefined;
+          for await (const event of this.contextCoordinator.prepareModelRequest(
+            modelRequest,
+            { signal: options?.signal },
+          )) {
+            if (event.type === "compaction-start") {
+              yield event;
+              continue;
+            }
+            if (event.type === "compaction-done") {
+              yield event;
+              continue;
+            }
+            if (event.type === "model-input-ready") {
+              preparedRequest = structuredClone(event.request);
+            }
+          }
+          if (preparedRequest === undefined) {
+            throw new Error(
+              "Context coordinator ended without a model-input-ready event.",
+            );
+          }
+          modelRequest = preparedRequest;
+          workingMessages.splice(
+            0,
+            workingMessages.length,
+            ...structuredClone(preparedRequest.messages),
+          );
+        }
+
         let assistantContent = "";
+        const overlapGuard = continuationRequest === undefined
+          ? undefined
+          : new ContinuationOverlapGuard(
+              continuationRequest.previousTail,
+              continuationPolicy.overlapWindowChars,
+            );
         const toolCalls: ToolCall[] = [];
         let terminalReason: StopReason | undefined;
         let terminalProviderState: ProviderMessageState | undefined;
+        let terminalIncompleteToolCall = false;
+        let streamError:
+          | { readonly reason: "aborted" | "error"; readonly error: Error }
+          | undefined;
 
         for await (const event of this.runtime.stream(modelRequest, {
           signal: options?.signal,
@@ -132,12 +245,16 @@ export class AgentLoop {
           }
 
           if (event.type === "text-delta") {
-            assistantContent += event.delta;
-
-            yield {
-              type: "text-delta",
-              delta: event.delta,
-            };
+            if (overlapGuard === undefined) {
+              assistantContent += event.delta;
+              yield { type: "text-delta", delta: event.delta };
+            } else {
+              const novel = overlapGuard.push(event.delta);
+              if (novel.length > 0) {
+                assistantContent += novel;
+                yield { type: "text-delta", delta: novel };
+              }
+            }
 
             continue;
           }
@@ -161,13 +278,8 @@ export class AgentLoop {
           }
 
           if (event.type === "error") {
-            yield {
-              type: "error",
-              reason: event.reason,
-              error: event.error,
-            };
-
-            return;
+            streamError = { reason: event.reason, error: event.error };
+            break;
           }
 
           if (event.type === "done") {
@@ -176,18 +288,98 @@ export class AgentLoop {
               event.providerState === undefined
                 ? undefined
                 : structuredClone(event.providerState);
+            terminalIncompleteToolCall = event.incompleteToolCall === true;
 
             break;
           }
         }
 
+        if (overlapGuard !== undefined) {
+          const novel = overlapGuard.finish();
+          if (novel.length > 0) {
+            assistantContent += novel;
+            yield { type: "text-delta", delta: novel };
+          }
+        }
+
+        if (streamError !== undefined) {
+          if (assistantContent.length > 0) {
+            const checkpoint = createContinuationSegment({
+              active: continuationRequest,
+              content: assistantContent,
+              providerState: undefined,
+              toolCalls: [],
+              status: "partial",
+              resumeAllowed: false,
+              policy: continuationPolicy,
+            });
+            yield {
+              type: "message-checkpoint",
+              message: structuredClone(checkpoint.message),
+            };
+            workingMessages.push(checkpoint.message);
+            newMessages.push(checkpoint.message);
+          }
+          yield {
+            type: "error",
+            reason: streamError.reason,
+            error: streamError.error,
+          };
+          return;
+        }
+
         if (!terminalReason) {
+          if (assistantContent.length > 0) {
+            const checkpoint = createContinuationSegment({
+              active: continuationRequest,
+              content: assistantContent,
+              providerState: undefined,
+              toolCalls: [],
+              status: "partial",
+              resumeAllowed: false,
+              policy: continuationPolicy,
+            });
+            yield {
+              type: "message-checkpoint",
+              message: structuredClone(checkpoint.message),
+            };
+            workingMessages.push(checkpoint.message);
+            newMessages.push(checkpoint.message);
+          }
           yield {
             type: "error",
             reason: "error",
             error: new Error("Model stream ended without a terminal event."),
           };
 
+          return;
+        }
+
+        if (terminalReason === "length" && terminalIncompleteToolCall) {
+          if (assistantContent.length > 0 || terminalProviderState !== undefined) {
+            const checkpoint = createContinuationSegment({
+              active: continuationRequest,
+              content: assistantContent,
+              providerState: terminalProviderState,
+              toolCalls: [],
+              status: "partial",
+              resumeAllowed: false,
+              policy: continuationPolicy,
+            });
+            yield {
+              type: "message-checkpoint",
+              message: structuredClone(checkpoint.message),
+            };
+            workingMessages.push(checkpoint.message);
+            newMessages.push(checkpoint.message);
+          }
+          yield {
+            type: "error",
+            reason: "error",
+            error: new Error(
+              "Model reached its output limit with an incomplete tool call.",
+            ),
+          };
           return;
         }
 
@@ -232,7 +424,58 @@ export class AgentLoop {
           return;
         }
 
-        const assistantMessage: AssistantMessage = {
+        if (
+          assistantContent.length === 0 &&
+          (terminalReason === "length" ||
+            (continuationRequest !== undefined && toolCalls.length === 0))
+        ) {
+          if (terminalProviderState !== undefined) {
+            const checkpoint = createContinuationSegment({
+              active: continuationRequest,
+              content: "",
+              providerState: terminalProviderState,
+              toolCalls: [],
+              status: "partial",
+              resumeAllowed: false,
+              policy: continuationPolicy,
+            });
+            yield {
+              type: "message-checkpoint",
+              message: structuredClone(checkpoint.message),
+            };
+            workingMessages.push(checkpoint.message);
+            newMessages.push(checkpoint.message);
+          }
+          yield {
+            type: "error",
+            reason: "error",
+            error: new Error("Continuation made no novel output progress."),
+          };
+          return;
+        }
+
+        const continuationError = terminalReason === "length"
+          ? continuationLimitError(
+              continuationRequest,
+              assistantContent,
+              continuationPolicy,
+              true,
+            )
+          : undefined;
+        const segment =
+          terminalReason === "length" || continuationRequest !== undefined
+            ? createContinuationSegment({
+                active: continuationRequest,
+                content: assistantContent,
+                providerState: terminalProviderState,
+                toolCalls,
+                status: terminalReason === "length" ? "partial" : "complete",
+                resumeAllowed:
+                  terminalReason === "length" && continuationError === undefined,
+                policy: continuationPolicy,
+              })
+            : undefined;
+        const assistantMessage: AssistantMessage = segment?.message ?? {
           role: "assistant",
           content: assistantContent,
           toolCalls: [...toolCalls],
@@ -250,6 +493,24 @@ export class AgentLoop {
 
         newMessages.push(assistantMessage);
 
+        if (terminalReason === "length") {
+          if (segment === undefined || segment.next === undefined) {
+            throw new Error("Continuation state was not created for a partial segment.");
+          }
+          activeContinuation = segment.next;
+          if (continuationError !== undefined) {
+            yield {
+              type: "error",
+              reason: "error",
+              error: continuationError,
+            };
+            return;
+          }
+          continue;
+        }
+
+        activeContinuation = undefined;
+
         if (terminalReason !== "tool-call") {
           yield {
             type: "done",
@@ -263,11 +524,75 @@ export class AgentLoop {
         completedToolBatches += 1;
 
         for (const toolCall of toolCalls) {
+          let resultBudget: ToolResultBudget | undefined;
+          if (this.contextCoordinator !== undefined) {
+            const reservationRequest: ModelRequest = {
+              model: request.model,
+              ...(request.systemPrompt === undefined
+                ? {}
+                : { systemPrompt: request.systemPrompt }),
+              messages: structuredClone(workingMessages),
+              tools: this.toolRegistry.listDefinitions(),
+              ...(request.maxOutputTokens === undefined
+                ? {}
+                : { maxOutputTokens: request.maxOutputTokens }),
+            };
+            for await (const event of this.contextCoordinator.reserveToolResult(
+              reservationRequest,
+              { signal: options?.signal, toolCallId: toolCall.id },
+            )) {
+              if (event.type === "compaction-start") {
+                yield event;
+                continue;
+              }
+              if (event.type === "compaction-done") {
+                yield event;
+                continue;
+              }
+              if (event.type === "tool-result-budget-ready") {
+                resultBudget = event.budget;
+                if (event.request !== undefined) {
+                  workingMessages.splice(
+                    0,
+                    workingMessages.length,
+                    ...structuredClone(event.request.messages),
+                  );
+                }
+              }
+            }
+            if (resultBudget === undefined) {
+              throw new Error(
+                "Context coordinator ended without a tool-result-budget-ready event.",
+              );
+            }
+          }
+
           const preparation = this.toolRegistry.prepare(toolCall);
           let result: ToolResult;
 
-          if (!preparation.ok) {
-            result = preparation.result;
+          if (resultBudget !== undefined && resultBudget.maxTokens < 128) {
+            const insufficient = this.toolRegistry.boundResult({
+              toolCallId: toolCall.id,
+              content:
+                "Insufficient tool result budget: at least 128 tokens are required.",
+              isError: true,
+            }, resultBudget);
+            if (resultBudget.fits?.(insufficient.content, true) === false) {
+              yield {
+                type: "error",
+                reason: "error",
+                error: new Error(
+                  "Insufficient context budget for a matched tool result.",
+                ),
+              };
+              return;
+            }
+            result = insufficient;
+          } else if (!preparation.ok) {
+            result = this.toolRegistry.boundResult(
+              preparation.result,
+              resultBudget,
+            );
           } else if (preparation.tool.approval === "always") {
             const decision = this.approvalHandler
               ? await this.approvalHandler.requestApproval(
@@ -287,15 +612,17 @@ export class AgentLoop {
               decision !== "deny"
                 ? await this.toolRegistry.executePrepared(preparation, {
                     signal: options?.signal,
+                    ...(resultBudget === undefined ? {} : { resultBudget }),
                   })
-                : {
+                : this.toolRegistry.boundResult({
                     toolCallId: toolCall.id,
                     content: `Tool "${toolCall.name}" was denied by the user.`,
                     isError: true,
-                  };
+                  }, resultBudget);
           } else {
             result = await this.toolRegistry.executePrepared(preparation, {
               signal: options?.signal,
+              ...(resultBudget === undefined ? {} : { resultBudget }),
             });
           }
 
@@ -333,4 +660,129 @@ export class AgentLoop {
       };
     }
   }
+}
+
+function continuationLimitError(
+  active: ActiveContinuation | undefined,
+  content: string,
+  policy: OutputContinuationPolicy,
+  includeNewContinuation: boolean,
+): Error | undefined {
+  const totalContent = (active?.totalContent ?? "") + content;
+  const tailHash = continuationTailHash(
+    continuationTail(totalContent, policy.overlapWindowChars),
+  );
+  if (includeNewContinuation && active?.tailHashes.has(tailHash) === true) {
+    return new Error("Continuation repeated a previous output tail.");
+  }
+  if (estimateOutputTokens(totalContent) >= policy.maxTotalOutputTokens) {
+    return new Error("Continuation exhausted the total output token limit.");
+  }
+  const continuationsUsed = (active?.continuationsUsed ?? 0) +
+    (includeNewContinuation && active !== undefined ? 1 : 0);
+  if (continuationsUsed >= policy.maxContinuations) {
+    return new Error("Continuation reached the maximum continuation count.");
+  }
+  return undefined;
+}
+
+function createContinuationSegment(input: {
+  readonly active: ActiveContinuation | undefined;
+  readonly content: string;
+  readonly providerState: ProviderMessageState | undefined;
+  readonly toolCalls: readonly ToolCall[];
+  readonly status: AssistantContinuationSegment["status"];
+  readonly resumeAllowed: boolean;
+  readonly policy: OutputContinuationPolicy;
+}): { readonly message: AssistantMessage; readonly next?: ActiveContinuation } {
+  const logicalMessageId = input.active?.logicalMessageId ?? randomUUID();
+  const segmentIndex = input.active?.nextSegmentIndex ?? 0;
+  const totalContent = (input.active?.totalContent ?? "") + input.content;
+  const estimatedTotalOutputTokens = estimateOutputTokens(totalContent);
+  const previousTail = continuationTail(
+    totalContent,
+    input.policy.overlapWindowChars,
+  );
+  const tailHash = continuationTailHash(previousTail);
+  const continuation: AssistantContinuationSegment = {
+    logicalMessageId,
+    segmentIndex,
+    status: input.status,
+    resumeAllowed: input.resumeAllowed,
+    tailHash,
+    estimatedTotalOutputTokens,
+  };
+  const message: AssistantMessage = {
+    role: "assistant",
+    content: input.content,
+    toolCalls: structuredClone(input.toolCalls),
+    ...(input.providerState === undefined
+      ? {}
+      : { providerState: structuredClone(input.providerState) }),
+    continuation,
+  };
+  if (input.status !== "partial") return { message };
+
+  const tailHashes = new Set(input.active?.tailHashes ?? []);
+  tailHashes.add(tailHash);
+  return {
+    message,
+    next: {
+      logicalMessageId,
+      nextSegmentIndex: segmentIndex + 1,
+      totalContent,
+      estimatedTotalOutputTokens,
+      previousTail,
+      previousTailHash: tailHash,
+      tailHashes,
+      continuationsUsed:
+        (input.active?.continuationsUsed ?? 0) +
+        (input.active === undefined ? 0 : 1),
+    },
+  };
+}
+
+function restoreActiveContinuation(
+  request: AgentRequest,
+  policy: OutputContinuationPolicy,
+): ActiveContinuation | undefined {
+  if (request.continuation === undefined) return undefined;
+  const segments = request.messages.filter((message): message is AssistantMessage =>
+    message.role === "assistant" &&
+    message.continuation?.logicalMessageId ===
+      request.continuation!.logicalMessageId
+  );
+  const last = segments.at(-1);
+  if (
+    last?.continuation === undefined ||
+    last.continuation.status !== "partial" ||
+    !last.continuation.resumeAllowed ||
+    last.continuation.segmentIndex + 1 !== request.continuation.segmentIndex
+  ) {
+    throw new Error("Cannot resume an invalid or non-resumable continuation.");
+  }
+  const totalContent = segments.map((message) => message.content).join("");
+  const previousTail = continuationTail(totalContent, policy.overlapWindowChars);
+  const previousTailHash = continuationTailHash(previousTail);
+  if (new Set(segments.map((message) => message.continuation!.tailHash)).size !==
+    segments.length) {
+    throw new Error("Cannot resume continuation because it repeated an output tail.");
+  }
+  if (
+    previousTail !== request.continuation.previousTail ||
+    previousTailHash !== request.continuation.previousTailHash ||
+    previousTailHash !== last.continuation.tailHash
+  ) {
+    throw new Error("Cannot resume continuation because its output tail changed.");
+  }
+  return {
+    logicalMessageId: request.continuation.logicalMessageId,
+    nextSegmentIndex: request.continuation.segmentIndex,
+    totalContent,
+    estimatedTotalOutputTokens: last.continuation.estimatedTotalOutputTokens,
+    previousTail,
+    previousTailHash,
+    tailHashes: new Set(segments.map((message) => message.continuation!.tailHash)),
+    continuationsUsed: Math.max(0, segments.length - 1),
+  };
 }

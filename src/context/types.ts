@@ -1,11 +1,13 @@
 import type {
   Message,
   Model,
+  ModelContinuation,
   UserMessage,
 } from "../model/types.js";
 import type { ToolDefinition } from "../tools/types.js";
 
 export interface CompactionSettings {
+  /** @deprecated Input budget is derived from the model and request. */
   readonly reserveTokens: number;
   readonly keepRecentTokens: number;
   readonly charsPerToken: number;
@@ -33,8 +35,11 @@ export interface CompactionRequest {
   readonly model: Model;
   readonly turns: readonly CompactionTurn[];
   readonly previousCompaction?: PreviousCompaction;
-  readonly pendingUserMessage: UserMessage;
+  readonly pendingUserMessage?: UserMessage;
   readonly toolDefinitions: readonly ToolDefinition[];
+  readonly systemPrompt?: string;
+  readonly maxOutputTokens?: number;
+  readonly continuation?: ModelContinuation;
 }
 
 export interface CompactionPreparation {
@@ -42,8 +47,11 @@ export interface CompactionPreparation {
   readonly previousSummary?: string;
   readonly turnsToSummarize: readonly CompactionTurn[];
   readonly keptTurns: readonly CompactionTurn[];
-  readonly pendingUserMessage: UserMessage;
+  readonly pendingUserMessage?: UserMessage;
   readonly toolDefinitions: readonly ToolDefinition[];
+  readonly systemPrompt?: string;
+  readonly maxOutputTokens?: number;
+  readonly continuation?: ModelContinuation;
   readonly firstKeptEntryId: string;
   readonly tokensBefore: number;
   readonly inputBudget: number;

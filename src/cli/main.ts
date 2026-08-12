@@ -6,6 +6,9 @@ import { OpenAICodexOAuth } from "../auth/openai-codex-oauth.js";
 import { OAuthResolver } from "../auth/oauth-resolver.js";
 import { SessionToolApprovalHandler } from "../approval/session.js";
 import { CompactionService } from "../context/compaction.js";
+import { ContextBudgetCalculator } from "../context/budget.js";
+import { TokenEstimator } from "../context/token-estimator.js";
+import { createOutputContinuationPolicy } from "../agent/output-continuation.js";
 import type { Model, ProviderId } from "../model/types.js";
 import { ProviderRegistry } from "../model/registry.js";
 import { RetryingModelRuntime } from "../model/retry.js";
@@ -16,6 +19,7 @@ import { LlamaProvider } from "../providers/llama/provider.js";
 import { ChatSession } from "../session/chat-session.js";
 import { JsonlSessionStore } from "../session/jsonl-store.js";
 import { Session } from "../session/session.js";
+import { SessionContextCoordinator } from "../session/session-context-coordinator.js";
 import { BashTool } from "../tools/bash.js";
 import { EditTool } from "../tools/edit.js";
 import { ReadTool } from "../tools/read.js";
@@ -143,8 +147,6 @@ async function runConfiguredChat(
         store: oauthStore,
         refresher: oauth,
       }),
-      instructions:
-        "You are a careful coding assistant. Use tools when files are needed.",
     }));
   }
 
@@ -172,7 +174,6 @@ async function runConfiguredChat(
     store: sessionStore,
     initialApprovalKeys: loadedSession.approvalKeys,
   });
-  const agent = new AgentLoop(runtime, tools, approval);
   const compaction = new CompactionService(runtime, {
     reserveTokens: 1280,
     keepRecentTokens: 1024,
@@ -180,10 +181,25 @@ async function runConfiguredChat(
     maxSummaryOutputTokens: 1024,
     toolResultMaxChars: 2000,
   });
+  const session = new Session(sessionStore);
+  const coordinator = new SessionContextCoordinator(
+    session,
+    compaction,
+    new ContextBudgetCalculator(new TokenEstimator(2)),
+  );
+  const agent = new AgentLoop(
+    runtime,
+    tools,
+    approval,
+    coordinator,
+    createOutputContinuationPolicy(resolved.model),
+  );
   const chat = new ChatSession(agent, resolved.model, {
-    session: new Session(sessionStore),
-    compactionService: compaction,
+    session,
+    contextCoordinator: coordinator,
     toolDefinitions: tools.listDefinitions(),
+    systemPrompt:
+      "You are a careful coding assistant. Use tools when files are needed.",
   });
 
   cli.write(`Provider: ${options.provider}\n`);

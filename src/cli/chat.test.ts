@@ -2,9 +2,52 @@ import { describe, expect, test } from "vitest";
 
 import type { AgentLoopOptions } from "../agent/types.js";
 import type { ChatEvent } from "../session/types.js";
-import { runChat } from "./chat.js";
+import { runChat, type ChatSessionLike } from "./chat.js";
 
 describe("runChat", () => {
+  test("prompts to abandon a non-resumable partial before reading a new turn", async () => {
+    const output: string[] = [];
+    const prompts: string[] = [];
+    let abandoned = 0;
+    let pending = true;
+    const inputs = ["a", "/exit"];
+    const io = {
+      async question(prompt: string): Promise<string | undefined> {
+        prompts.push(prompt);
+        return inputs.shift();
+      },
+      write(content: string): void { output.push(content); },
+      writeError(content: string): void { output.push(content); },
+      onEscape(): () => void { return () => undefined; },
+      onInterrupt(): () => void { return () => undefined; },
+    };
+    const session: ChatSessionLike = {
+      getPendingContinuation() {
+        return pending ? {
+          logicalMessageId: "logical",
+          segmentIndex: 0,
+          status: "partial",
+          resumeAllowed: false,
+          tailHash: "a".repeat(64),
+          estimatedTotalOutputTokens: 2,
+        } : undefined;
+      },
+      async abandonPendingContinuation() {
+        abandoned += 1;
+        pending = false;
+      },
+      async *streamTurn(): AsyncIterable<ChatEvent> {
+        throw new Error("must not start a turn");
+      },
+    };
+
+    await runChat(session, io);
+
+    expect(abandoned).toBe(1);
+    expect(prompts[0]).toMatch(/resume is unsafe/i);
+    expect(output.join("")).toMatch(/continuation abandoned/i);
+  });
+
   test("prints a partial recovery warning before its persistence error", async () => {
     const output: string[] = [];
     const errors: string[] = [];
@@ -120,6 +163,51 @@ describe("runChat", () => {
           reason: "aborted",
           error: new Error("aborted"),
         };
+      },
+    };
+
+    await runChat(session, io);
+
+    expect(output.join("")).toContain("Cancelling current turn");
+    expect(output.join("")).toContain("Turn cancelled");
+  });
+
+  test("routes Escape to a resumed continuation abort signal", async () => {
+    const output: string[] = [];
+    const inputs = ["r", "/exit"];
+    let pending = true;
+    let escape: (() => void) | undefined;
+    const io = {
+      async question(): Promise<string | undefined> {
+        return inputs.shift();
+      },
+      write(content: string): void { output.push(content); },
+      writeError(content: string): void { output.push(content); },
+      onEscape(listener: () => void): () => void {
+        escape = listener;
+        return () => { escape = undefined; };
+      },
+      onInterrupt(): () => void { return () => undefined; },
+    };
+    const session: ChatSessionLike = {
+      getPendingContinuation() {
+        return pending ? {
+          logicalMessageId: "logical",
+          segmentIndex: 0,
+          status: "partial",
+          resumeAllowed: true,
+          tailHash: "a".repeat(64),
+          estimatedTotalOutputTokens: 2,
+        } : undefined;
+      },
+      async *streamContinuation(options): AsyncIterable<ChatEvent> {
+        pending = false;
+        escape?.();
+        expect(options?.signal?.aborted).toBe(true);
+        yield { type: "error", reason: "aborted", error: new Error("aborted") };
+      },
+      async *streamTurn(): AsyncIterable<ChatEvent> {
+        throw new Error("must not start a turn");
       },
     };
 

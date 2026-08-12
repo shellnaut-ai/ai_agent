@@ -1,6 +1,7 @@
 import type { AgentEvent } from "../agent/types.js";
 import type { CompactionFileDetails } from "../context/types.js";
 import type { Message, Model } from "../model/types.js";
+import type { AssistantContinuationSegment } from "../model/types.js";
 
 export interface SessionEntryBase {
   readonly id: string;
@@ -86,4 +87,8 @@ export type ChatEvent =
   | {
       readonly type: "session-recovery";
       readonly recoveredToolCallIds: readonly string[];
+    }
+  | {
+      readonly type: "continuation-recovery-required";
+      readonly continuation: AssistantContinuationSegment;
     };

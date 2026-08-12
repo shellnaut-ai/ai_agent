@@ -1,5 +1,7 @@
 import type { TSchema } from "typebox";
 
+import type { ToolResultBudget } from "../context/budget.js";
+
 export interface ToolDefinition {
   readonly name: string;
   readonly description: string;
@@ -23,6 +25,7 @@ export interface ToolResult extends ToolOutput {
 
 export interface ToolExecutionOptions {
   readonly signal?: AbortSignal;
+  readonly resultBudget?: ToolResultBudget;
 }
 
 export type ToolApprovalMode = "never" | "always";

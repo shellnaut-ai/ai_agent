@@ -1,4 +1,9 @@
 export { AgentLoop } from "./agent/loop.js";
+export {
+  ContinuationOverlapGuard,
+  createOutputContinuationPolicy,
+} from "./agent/output-continuation.js";
+export type { OutputContinuationPolicy } from "./agent/output-continuation.js";
 export type {
   AgentEvent,
   AgentExecutionPolicy,
@@ -15,11 +20,26 @@ export { MemoryOAuthStore } from "./auth/memory-oauth-store.js";
 export { OpenAICodexOAuth } from "./auth/openai-codex-oauth.js";
 export { AuthRequiredError, OAuthResolver } from "./auth/oauth-resolver.js";
 export { CompactionService } from "./context/compaction.js";
+export { ContextBudgetCalculator } from "./context/budget.js";
+export type {
+  ContextBudget,
+  ContextBudgetSettings,
+  ToolResultBudget,
+} from "./context/budget.js";
+export {
+  BudgetOnlyContextCoordinator,
+} from "./context/coordinator.js";
+export type {
+  ContextCoordinator,
+  ContextCoordinatorEvent,
+} from "./context/coordinator.js";
+export { TokenEstimator } from "./context/token-estimator.js";
 export { ProviderRegistry } from "./model/registry.js";
 export { RetryingModelRuntime } from "./model/retry.js";
 export { ModelRuntime } from "./model/runtime.js";
 export type {
   Message,
+  AssistantContinuationSegment,
   Model,
   ModelRequest,
   JsonValue,
@@ -33,9 +53,18 @@ export { LlamaProvider } from "./providers/llama/provider.js";
 export { ChatSession } from "./session/chat-session.js";
 export { JsonlSessionStore } from "./session/jsonl-store.js";
 export { Session } from "./session/session.js";
+export { SessionContextCoordinator } from "./session/session-context-coordinator.js";
 export { BashTool } from "./tools/bash.js";
 export { EditTool } from "./tools/edit.js";
 export { ReadTool } from "./tools/read.js";
+export {
+  FileReadCursorKeyStore,
+  ReadCursorCodec,
+} from "./tools/read-cursor.js";
+export type {
+  ReadCursorPayload,
+} from "./tools/read-cursor.js";
+export type { ReadInput, ReadPageMetadata } from "./tools/read.js";
 export { ToolRegistry } from "./tools/registry.js";
 export { WorkspacePaths } from "./tools/workspace-paths.js";
 export { WriteTool } from "./tools/write.js";

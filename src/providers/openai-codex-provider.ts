@@ -1,16 +1,18 @@
 import type { OAuthCredential } from "../auth/oauth-contracts.js";
 import type { ModelProvider, StreamOptions } from "../model/provider.js";
-import type {
-  JsonValue,
-  Message,
-  Model,
-  ModelRequest,
-  ProviderMessageState,
-  StreamEvent,
+import {
+  combineSystemPrompts,
+  type JsonValue,
+  type Message,
+  type Model,
+  type ModelRequest,
+  type ProviderMessageState,
+  type StreamEvent,
 } from "../model/types.js";
 import type { ToolDefinition } from "../tools/types.js";
 import { serializeToolCallArguments } from "../tools/arguments.js";
 import { readSseData } from "./sse.js";
+import { continuationInstruction } from "./continuation.js";
 
 export interface CredentialResolver {
   resolve(signal?: AbortSignal): Promise<OAuthCredential>;
@@ -39,21 +41,25 @@ export class OpenAICodexProvider implements ModelProvider {
   readonly #resolver: CredentialResolver;
   readonly #fetch: typeof fetch;
   readonly #endpoint: string;
-  readonly #instructions: string | undefined;
   readonly #originator: string;
 
   constructor(options: OpenAICodexProviderOptions) {
     if (options.model.provider !== this.id) {
       throw new Error(`OpenAI Codex model provider must be "${this.id}".`);
     }
-    this.#model = options.model;
+    this.#model = {
+      ...options.model,
+      systemPrompt: combineSystemPrompts(
+        options.model.systemPrompt,
+        options.instructions,
+      ),
+    };
     this.name = options.model.name;
     this.#resolver = options.resolver;
     this.#fetch = options.fetch ?? globalThis.fetch;
     this.#endpoint = codexResponsesEndpoint(
       options.baseUrl ?? "https://chatgpt.com/backend-api",
     );
-    this.#instructions = options.instructions;
     this.#originator = options.originator ?? "pi";
   }
 
@@ -77,18 +83,34 @@ export class OpenAICodexProvider implements ModelProvider {
             `"${request.model.provider}".`,
         );
       }
+      if (request.model.systemPrompt !== this.#model.systemPrompt) {
+        throw new Error(
+          "OpenAI Codex request model must use the normalized model returned by listModels().",
+        );
+      }
 
-      const instructions = [this.#instructions, request.systemPrompt]
-        .filter((value): value is string => value !== undefined)
-        .join("\n\n");
+      const instructions = combineSystemPrompts(
+        request.model.systemPrompt,
+        request.systemPrompt,
+      );
+      const continuation = continuationInstruction(request);
       const body = JSON.stringify({
         model: request.model.id,
-        ...(instructions === ""
+        ...(instructions === undefined
           ? {}
           : { instructions }),
         max_output_tokens:
           request.maxOutputTokens ?? request.model.maxOutputTokens,
-        input: serializeMessages(request.messages),
+        input: [
+          ...serializeMessages(request.messages),
+          ...(continuation === undefined
+            ? []
+            : [{
+                type: "message",
+                role: "user",
+                content: [{ type: "input_text", text: continuation }],
+              }]),
+        ],
         tools: request.tools.map(serializeTool),
         tool_choice: "auto",
         parallel_tool_calls: true,
@@ -226,7 +248,14 @@ export class OpenAICodexProvider implements ModelProvider {
 
           collectTerminalReasoning(event, reasoningItems);
           const providerState = createProviderState(reasoningItems, toolItems);
-          yield { type: "done", reason: "length", providerState };
+          yield {
+            type: "done",
+            reason: "length",
+            providerState,
+            ...(sawToolCall || pendingCalls.size > 0
+              ? { incompleteToolCall: true }
+              : {}),
+          };
           return;
         }
 

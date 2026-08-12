@@ -57,6 +57,130 @@ async function reloadMessages(rootDir: string, sessionId: string) {
 }
 
 describe("session message journal", () => {
+  test("reloads, displays, and abandons append-only continuation segments", async () => {
+    const { rootDir, session } = await createSession("continuation-segments");
+    await session.appendMessage({ role: "user", content: "Write a long answer." });
+    await session.appendMessage({
+      role: "assistant",
+      content: "part one ",
+      toolCalls: [],
+      providerState: {
+        provider: "openai-codex",
+        value: { reasoningItems: [{ id: "rs_1", encrypted_content: "enc_1" }] },
+      },
+      continuation: {
+        logicalMessageId: "logical-1",
+        segmentIndex: 0,
+        status: "partial",
+        resumeAllowed: true,
+        tailHash: "a".repeat(64),
+        estimatedTotalOutputTokens: 3,
+      },
+    });
+    await session.appendMessage({
+      role: "assistant",
+      content: "part two",
+      toolCalls: [],
+      providerState: {
+        provider: "openai-codex",
+        value: { reasoningItems: [{ id: "rs_2", encrypted_content: "enc_2" }] },
+      },
+      continuation: {
+        logicalMessageId: "logical-1",
+        segmentIndex: 1,
+        status: "partial",
+        resumeAllowed: true,
+        tailHash: "b".repeat(64),
+        estimatedTotalOutputTokens: 6,
+      },
+    });
+
+    const reloadedStore = new JsonlSessionStore({
+      rootDir,
+      sessionId: "continuation-segments",
+      model,
+    });
+    await reloadedStore.load();
+    const reloaded = new Session(reloadedStore);
+    expect(reloaded.getPendingContinuation()).toMatchObject({
+      logicalMessageId: "logical-1",
+      segmentIndex: 1,
+      status: "partial",
+      resumeAllowed: true,
+    });
+    expect(reloaded.buildActiveMessages().slice(-2).map((message) => message.content))
+      .toEqual(["part one ", "part two"]);
+    expect(reloaded.buildDisplayMessages().at(-1)).toMatchObject({
+      role: "assistant",
+      content: "part one part two",
+      continuation: { segmentIndex: 1, status: "partial" },
+      providerState: {
+        value: { reasoningItems: [{ encrypted_content: "enc_2" }] },
+      },
+    });
+
+    await reloaded.appendContinuationAbandoned();
+    expect(reloaded.getPendingContinuation()).toBeUndefined();
+    expect(reloaded.buildActiveMessages()).not.toContainEqual(
+      expect.objectContaining({
+        continuation: expect.objectContaining({ status: "abandoned" }),
+      }),
+    );
+    expect(reloaded.buildDisplayMessages().at(-1)).toMatchObject({
+      role: "assistant",
+      content: "part one part two",
+      continuation: { segmentIndex: 2, status: "abandoned" },
+    });
+  });
+
+  test("rejects duplicate indexes and segments after a terminal continuation", async () => {
+    const { session } = await createSession("continuation-transitions");
+    await session.appendMessage({ role: "user", content: "continue" });
+    const metadata = {
+      logicalMessageId: "logical-transition",
+      segmentIndex: 0,
+      status: "partial" as const,
+      resumeAllowed: true,
+      tailHash: "c".repeat(64),
+      estimatedTotalOutputTokens: 2,
+    };
+    await session.appendMessage({
+      role: "assistant",
+      content: "first",
+      toolCalls: [],
+      continuation: metadata,
+    });
+    await expect(session.appendMessage({
+      role: "assistant",
+      content: "duplicate",
+      toolCalls: [],
+      continuation: metadata,
+    })).rejects.toThrow(/continuation.*transition/i);
+    await session.appendMessage({
+      role: "assistant",
+      content: "final",
+      toolCalls: [],
+      continuation: {
+        ...metadata,
+        segmentIndex: 1,
+        status: "complete",
+        resumeAllowed: false,
+        estimatedTotalOutputTokens: 4,
+      },
+    });
+    await expect(session.appendMessage({
+      role: "assistant",
+      content: "too late",
+      toolCalls: [],
+      continuation: {
+        ...metadata,
+        segmentIndex: 2,
+        tailHash: "d".repeat(64),
+        estimatedTotalOutputTokens: 5,
+      },
+    })).rejects.toThrow(/continuation.*transition/i);
+  });
+
   test("appends user, assistant tool-call, and tool result messages in order", async () => {
     const { rootDir, session } = await createSession("message-order");
     const messages: Message[] = [

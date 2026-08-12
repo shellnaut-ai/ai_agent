@@ -93,4 +93,68 @@ describe("ToolRegistry snapshots", () => {
         .properties.path.type,
     ).toBe("string");
   });
+
+  test("bounds non-paged output with an explicit non-recoverable marker", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      approval: "never",
+      definition: {
+        name: "large-output",
+        description: "Return too much text.",
+        inputSchema: Type.Object({}, { additionalProperties: false }),
+      },
+      async execute() {
+        return { content: "x".repeat(2_000), isError: false };
+      },
+    });
+    const preparation = registry.prepare({
+      id: "large-1",
+      name: "large-output",
+      arguments: {},
+    });
+    if (!preparation.ok) throw new Error("Expected valid tool input.");
+
+    const result = await registry.executePrepared(preparation, {
+      resultBudget: { maxBytes: 512, maxTokens: 128 },
+    });
+
+    expect(Buffer.byteLength(result.content, "utf8")).toBeLessThanOrEqual(512);
+    expect(result).toMatchObject({
+      isError: true,
+      content: expect.stringMatching(/truncated.*not recoverable|not recoverable.*truncated/i),
+    });
+  });
+
+  test("bounds a thrown tool error through the exact result fit contract", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      approval: "never",
+      definition: {
+        name: "throw-large",
+        description: "Throw too much text.",
+        inputSchema: Type.Object({}, { additionalProperties: false }),
+      },
+      async execute() {
+        throw new Error("boom".repeat(1_000));
+      },
+    });
+    const preparation = registry.prepare({
+      id: "throw-1",
+      name: "throw-large",
+      arguments: {},
+    });
+    if (!preparation.ok) throw new Error("Expected valid tool input.");
+
+    const result = await registry.executePrepared(preparation, {
+      resultBudget: {
+        maxBytes: 256,
+        maxTokens: 128,
+        fits: (content) => content.length <= 120,
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content.length).toBeLessThanOrEqual(120);
+    expect(result.content).not.toContain("boom".repeat(100));
+  });
 });

@@ -201,8 +201,10 @@ describe("OpenAICodexProvider", () => {
       },
     });
 
+    const normalizedModel = (await provider.listModels())[0]!;
     const events = await collect(provider.stream({
       ...request(),
+      model: normalizedModel,
       systemPrompt: "Summarize only the supplied conversation.",
       maxOutputTokens: 321,
     }));
@@ -239,6 +241,24 @@ describe("OpenAICodexProvider", () => {
       max_output_tokens: 321,
       stream: true,
       store: false,
+    });
+  });
+
+  test("rejects hidden constructor instructions before network", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      instructions: "Hidden instruction",
+      fetch,
+    });
+
+    const events = await collect(provider.stream(request()));
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { message: expect.stringMatching(/normalized model/i) },
     });
   });
 

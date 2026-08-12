@@ -1,6 +1,11 @@
 import { AgentLoop } from "../agent/loop.js";
 import type { AgentLoopOptions } from "../agent/types.js";
+import {
+  continuationTail,
+  continuationTailHash,
+} from "../agent/output-continuation.js";
 import { CompactionService } from "../context/compaction.js";
+import type { ContextCoordinator } from "../context/coordinator.js";
 import type { Message, Model, UserMessage } from "../model/types.js";
 import type { ToolDefinition } from "../tools/types.js";
 import { InterruptedToolRecoveryError, Session } from "./session.js";
@@ -10,6 +15,8 @@ export interface ChatSessionOptions {
   readonly session: Session;
   readonly compactionService?: CompactionService;
   readonly toolDefinitions?: readonly ToolDefinition[];
+  readonly systemPrompt?: string;
+  readonly contextCoordinator?: ContextCoordinator;
 }
 
 export class ChatSession {
@@ -18,6 +25,8 @@ export class ChatSession {
   private readonly session: Session;
   private readonly compactionService: CompactionService | undefined;
   private readonly toolDefinitions: readonly ToolDefinition[];
+  private readonly systemPrompt: string | undefined;
+  private readonly contextCoordinator: ContextCoordinator | undefined;
   private turnActive = false;
 
   constructor(
@@ -30,10 +39,81 @@ export class ChatSession {
     this.session = options.session;
     this.compactionService = options.compactionService;
     this.toolDefinitions = [...(options.toolDefinitions ?? [])];
+    this.systemPrompt = options.systemPrompt;
+    this.contextCoordinator = options.contextCoordinator;
   }
 
   public getMessages(): readonly Message[] {
     return this.session.getMessages();
+  }
+
+  public getPendingContinuation() {
+    return this.session.getPendingContinuation();
+  }
+
+  public async abandonPendingContinuation(): Promise<void> {
+    if (this.turnActive) throw new Error("ChatSession already has an active turn.");
+    await this.session.appendContinuationAbandoned();
+  }
+
+  public async *streamContinuation(
+    options?: AgentLoopOptions,
+  ): AsyncIterable<ChatEvent> {
+    if (this.turnActive) {
+      yield {
+        type: "error",
+        reason: "error",
+        error: new Error("ChatSession already has an active turn."),
+      };
+      return;
+    }
+    this.turnActive = true;
+    try {
+      const pending = this.session.getPendingContinuation();
+      if (pending === undefined || !pending.resumeAllowed) {
+        yield {
+          type: "error",
+          reason: "error",
+          error: new Error("The pending continuation cannot be resumed."),
+        };
+        return;
+      }
+      const messages = [...this.session.buildActiveMessages()];
+      const logicalContent = messages
+        .filter((message) =>
+          message.role === "assistant" &&
+          message.continuation?.logicalMessageId === pending.logicalMessageId
+        )
+        .map((message) => message.content)
+        .join("");
+      const previousTail = continuationTail(logicalContent, 1024);
+      const previousTailHash = continuationTailHash(previousTail);
+      if (previousTailHash !== pending.tailHash) {
+        throw new Error("The pending continuation output tail has changed.");
+      }
+      yield* this.streamAgent({
+        model: this.model,
+        ...(this.systemPrompt === undefined
+          ? {}
+          : { systemPrompt: this.systemPrompt }),
+        messages,
+        continuation: {
+          kind: "assistant-output",
+          logicalMessageId: pending.logicalMessageId,
+          segmentIndex: pending.segmentIndex + 1,
+          previousTail,
+          previousTailHash,
+        },
+      }, options);
+    } catch (error: unknown) {
+      yield {
+        type: "error",
+        reason: options?.signal?.aborted ? "aborted" : "error",
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+    } finally {
+      this.turnActive = false;
+    }
   }
 
   public async *streamTurn(
@@ -104,7 +184,43 @@ export class ChatSession {
       return;
     }
 
-    if (this.compactionService) {
+    const pendingContinuation = this.session.getPendingContinuation();
+    if (pendingContinuation !== undefined) {
+      yield {
+        type: "continuation-recovery-required",
+        continuation: pendingContinuation,
+      };
+      return;
+    }
+
+    if (this.contextCoordinator?.preparePendingUserMessage !== undefined) {
+      try {
+        const request = {
+          model: this.model,
+          ...(this.systemPrompt === undefined
+            ? {}
+            : { systemPrompt: this.systemPrompt }),
+          messages: [...this.session.buildActiveMessages()],
+          tools: this.toolDefinitions,
+        };
+        for await (const event of this.contextCoordinator.preparePendingUserMessage(
+          request,
+          newMessage,
+          { signal: options?.signal },
+        )) {
+          if (event.type === "compaction-start" || event.type === "compaction-done") {
+            yield event;
+          }
+        }
+      } catch (error: unknown) {
+        yield {
+          type: "error",
+          reason: options?.signal?.aborted ? "aborted" : "error",
+          error: error instanceof Error ? error : new Error(String(error)),
+        };
+        return;
+      }
+    } else if (this.compactionService) {
       let preparation;
 
       try {
@@ -115,6 +231,9 @@ export class ChatSession {
             this.session.getPreviousCompaction(),
           pendingUserMessage: newMessage,
           toolDefinitions: this.toolDefinitions,
+          ...(this.systemPrompt === undefined
+            ? {}
+            : { systemPrompt: this.systemPrompt }),
         });
       } catch (error: unknown) {
         yield {
@@ -171,9 +290,19 @@ export class ChatSession {
 
     const request = {
       model: this.model,
+      ...(this.systemPrompt === undefined
+        ? {}
+        : { systemPrompt: this.systemPrompt }),
       messages: [...this.session.buildActiveMessages()],
     };
 
+    yield* this.streamAgent(request, options);
+  }
+
+  private async *streamAgent(
+    request: Parameters<AgentLoop["stream"]>[0],
+    options?: AgentLoopOptions,
+  ): AsyncIterable<ChatEvent> {
     for await (const event of this.agentLoop.stream(request, options)) {
       if (event.type === "message-checkpoint") {
         try {

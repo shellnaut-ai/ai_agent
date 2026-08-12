@@ -1,13 +1,15 @@
 import type { ModelProvider, StreamOptions } from "../model/provider.js";
-import type {
-  Message,
-  Model,
-  ModelRequest,
-  StreamEvent,
+import {
+  combineSystemPrompts,
+  type Message,
+  type Model,
+  type ModelRequest,
+  type StreamEvent,
 } from "../model/types.js";
 import type { ToolDefinition } from "../tools/types.js";
 import { serializeToolCallArguments } from "../tools/arguments.js";
 import { readSseData } from "./sse.js";
+import { continuationInstruction } from "./continuation.js";
 
 export interface OpenAICompatibleProviderOptions {
   readonly baseUrl: string;
@@ -76,6 +78,11 @@ export class OpenAICompatibleProvider implements ModelProvider {
       const headers: Record<string, string> = {
         "content-type": "application/json",
       };
+      const instruction = continuationInstruction(request);
+      const systemPrompt = combineSystemPrompts(
+        request.model.systemPrompt,
+        request.systemPrompt,
+      );
       if (this.apiKey !== undefined) {
         headers.authorization = `Bearer ${this.apiKey}`;
       }
@@ -87,10 +94,13 @@ export class OpenAICompatibleProvider implements ModelProvider {
           model: request.model.id,
           stream: true,
           messages: [
-            ...(request.systemPrompt === undefined
+            ...(systemPrompt === undefined
               ? []
-              : [{ role: "system", content: request.systemPrompt }]),
+              : [{ role: "system", content: systemPrompt }]),
             ...request.messages.map(serializeMessage),
+            ...(instruction === undefined
+              ? []
+              : [{ role: "user", content: instruction }]),
           ],
           tools: request.tools.map(serializeTool),
           max_tokens:
@@ -180,6 +190,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
               yield {
                 type: "done",
                 reason: reason === "length" ? "length" : "stop",
+                ...(reason === "length" && pending.size > 0
+                  ? { incompleteToolCall: true }
+                  : {}),
               };
             }
             return;

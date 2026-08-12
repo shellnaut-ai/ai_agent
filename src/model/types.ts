@@ -35,6 +35,8 @@ export interface Model {
   contextWindow: number;
   // 최대 출력을 얼마로 요청할 것인가?
   maxOutputTokens: number;
+  // Provider wire에 포함되며 공통 context budget에도 계산되는 기본 지침.
+  systemPrompt?: string;
 }
 
 // 사용자의 질문과 이전 모델 답변
@@ -44,11 +46,21 @@ export interface UserMessage {
   readonly content: string;
 }
 
+export interface AssistantContinuationSegment {
+  readonly logicalMessageId: string;
+  readonly segmentIndex: number;
+  readonly status: "partial" | "complete" | "abandoned";
+  readonly resumeAllowed: boolean;
+  readonly tailHash: string;
+  readonly estimatedTotalOutputTokens: number;
+}
+
 export interface AssistantMessage {
   readonly role: "assistant";
   readonly content: string;
   readonly toolCalls: readonly ToolCall[];
   readonly providerState?: ProviderMessageState;
+  readonly continuation?: AssistantContinuationSegment;
 }
 
 export interface ToolResultMessage {
@@ -59,6 +71,18 @@ export interface ToolResultMessage {
 }
 export type Message = UserMessage | AssistantMessage | ToolResultMessage;
 
+export const CONTINUATION_INSTRUCTION =
+  "Continue the immediately preceding assistant output from its exact " +
+  "endpoint. Return only new continuation text and do not repeat its tail.";
+
+export interface ModelContinuation {
+  readonly kind: "assistant-output";
+  readonly logicalMessageId: string;
+  readonly segmentIndex: number;
+  readonly previousTail: string;
+  readonly previousTailHash: string;
+}
+
 // 선택한 모델과 대화 기록을 묶은 요청
 export interface ModelRequest {
   readonly model: Model;
@@ -66,6 +90,16 @@ export interface ModelRequest {
   readonly messages: Message[];
   readonly tools: readonly ToolDefinition[];
   readonly maxOutputTokens?: number;
+  readonly continuation?: ModelContinuation;
+}
+
+export function combineSystemPrompts(
+  ...values: readonly (string | undefined)[]
+): string | undefined {
+  const combined = values
+    .filter((value): value is string => value !== undefined && value.length > 0)
+    .join("\n\n");
+  return combined.length === 0 ? undefined : combined;
 }
 
 export type StopReason = "stop" | "length" | "tool-call";
@@ -79,5 +113,6 @@ export type StreamEvent =
       type: "done";
       reason: StopReason;
       providerState?: ProviderMessageState;
+      incompleteToolCall?: boolean;
     }
   | { type: "error"; reason: ErrorReason; error: Error };

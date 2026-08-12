@@ -7,6 +7,8 @@ import type {
   PreviousCompaction,
 } from "../context/types.js";
 import type {
+  AssistantContinuationSegment,
+  AssistantMessage,
   Message,
   ToolResultMessage,
 } from "../model/types.js";
@@ -23,11 +25,17 @@ function cloneMessage(message: Message): Message {
 
 function messagesFromEntries(
   entries: readonly SessionEntry[],
+  options?: { readonly omitAbandoned?: boolean },
 ): Message[] {
   return entries
     .filter(
       (entry): entry is MessageEntry => entry.type === "message",
     )
+    .filter((entry) => !(
+      options?.omitAbandoned === true &&
+      entry.message.role === "assistant" &&
+      entry.message.continuation?.status === "abandoned"
+    ))
     .map((entry) => cloneMessage(entry.message));
 }
 
@@ -88,6 +96,57 @@ export class Session {
     return messagesFromEntries(this.store.getPathToRoot());
   }
 
+  getPendingContinuation(): AssistantContinuationSegment | undefined {
+    const messages = this.getMessages();
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message?.role !== "assistant" || message.continuation === undefined) {
+        continue;
+      }
+      return message.continuation.status === "partial"
+        ? structuredClone(message.continuation)
+        : undefined;
+    }
+    return undefined;
+  }
+
+  buildDisplayMessages(): readonly Message[] {
+    const display: Message[] = [];
+    for (const message of this.getMessages()) {
+      if (message.role !== "assistant" || message.continuation === undefined) {
+        display.push(cloneMessage(message));
+        continue;
+      }
+      const previous = display.at(-1);
+      if (
+        previous?.role === "assistant" &&
+        previous.continuation?.logicalMessageId ===
+          message.continuation.logicalMessageId
+      ) {
+        const combined: AssistantMessage = {
+          role: "assistant",
+          content: previous.content + message.content,
+          toolCalls: [
+            ...structuredClone(previous.toolCalls),
+            ...structuredClone(message.toolCalls),
+          ],
+          ...(message.providerState === undefined
+            ? previous.providerState === undefined
+              ? {}
+              : { providerState: structuredClone(previous.providerState) }
+            : { providerState: structuredClone(message.providerState) }),
+          continuation: structuredClone(message.continuation),
+        };
+        display[display.length - 1] = combined;
+        continue;
+      }
+      if (message.continuation.status !== "abandoned") {
+        display.push(cloneMessage(message));
+      }
+    }
+    return display;
+  }
+
   getLatestCompaction(): CompactionEntry | undefined {
     const path = this.store.getPathToRoot();
 
@@ -128,7 +187,7 @@ export class Session {
     }
 
     if (compactionIndex < 0) {
-      return messagesFromEntries(path);
+      return messagesFromEntries(path, { omitAbandoned: true });
     }
 
     const compaction = path[compactionIndex];
@@ -155,8 +214,11 @@ export class Session {
       createCompactionSummaryMessage(compaction.summary),
       ...messagesFromEntries(
         path.slice(firstKeptIndex, compactionIndex),
+        { omitAbandoned: true },
       ),
-      ...messagesFromEntries(path.slice(compactionIndex + 1)),
+      ...messagesFromEntries(path.slice(compactionIndex + 1), {
+        omitAbandoned: true,
+      }),
     ];
   }
 
@@ -172,6 +234,13 @@ export class Session {
 
     for (const entry of path) {
       if (entry.type !== "message") {
+        continue;
+      }
+
+      if (
+        entry.message.role === "assistant" &&
+        entry.message.continuation?.status === "abandoned"
+      ) {
         continue;
       }
 
@@ -278,6 +347,24 @@ export class Session {
 
     await this.store.appendEntry(entry);
     return structuredClone(entry);
+  }
+
+  async appendContinuationAbandoned(): Promise<MessageEntry> {
+    const pending = this.getPendingContinuation();
+    if (pending === undefined) {
+      throw new Error("The active session has no pending continuation.");
+    }
+    return await this.appendMessage({
+      role: "assistant",
+      content: "",
+      toolCalls: [],
+      continuation: {
+        ...pending,
+        segmentIndex: pending.segmentIndex + 1,
+        status: "abandoned",
+        resumeAllowed: false,
+      },
+    });
   }
 
   async recoverInterruptedToolCalls(): Promise<

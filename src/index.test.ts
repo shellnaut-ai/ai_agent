@@ -2,10 +2,13 @@ import { describe, expect, test } from "vitest";
 
 import {
   AgentLoop,
+  ContextBudgetCalculator,
+  FileReadCursorKeyStore,
   JsonlSessionStore,
   OpenAICodexProvider,
   OpenAICompatibleProvider,
   ToolRegistry,
+  SessionContextCoordinator,
   WorkspacePaths,
   type JsonValue,
   type ProviderMessageState,
@@ -15,10 +18,13 @@ describe("public package entry", () => {
   test("exports the unified runtime boundaries", () => {
     expect([
       AgentLoop,
+      ContextBudgetCalculator,
+      FileReadCursorKeyStore,
       JsonlSessionStore,
       OpenAICodexProvider,
       OpenAICompatibleProvider,
       ToolRegistry,
+      SessionContextCoordinator,
       WorkspacePaths,
     ]).not.toContain(undefined);
   });

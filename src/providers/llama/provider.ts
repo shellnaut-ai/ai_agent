@@ -1,13 +1,15 @@
 import type { ModelProvider, StreamOptions } from "../../model/provider.js";
-import type {
-  Message,
-  Model,
-  ModelRequest,
-  ProviderId,
-  StreamEvent,
+import {
+  combineSystemPrompts,
+  type Message,
+  type Model,
+  type ModelRequest,
+  type ProviderId,
+  type StreamEvent,
 } from "../../model/types.js";
 import { serializeToolCallArguments } from "../../tools/arguments.js";
 import { readSseData } from "./sse.js";
+import { continuationInstruction } from "../continuation.js";
 
 export interface LlamaProviderOptions {
   serverUrl: string;
@@ -153,16 +155,24 @@ function toLlamaMessage(message: Message): Record<string, unknown> {
 }
 
 function toLlamaMessages(request: ModelRequest): Record<string, unknown>[] {
+  const instruction = continuationInstruction(request);
+  const systemPrompt = combineSystemPrompts(
+    request.model.systemPrompt,
+    request.systemPrompt,
+  );
   return [
-    ...(request.systemPrompt
+    ...(systemPrompt
       ? [
           {
             role: "system",
-            content: request.systemPrompt,
+            content: systemPrompt,
           },
         ]
       : []),
     ...request.messages.map(toLlamaMessage),
+    ...(instruction === undefined
+      ? []
+      : [{ role: "user", content: instruction }]),
   ];
 }
 
@@ -255,6 +265,15 @@ export class LlamaProvider implements ModelProvider {
 
       for await (const data of readSseData(response.body)) {
         if (data === "[DONE]") {
+          if (finishReason === "length" && pendingToolCalls.size > 0) {
+            yield {
+              type: "done",
+              reason: "length",
+              incompleteToolCall: true,
+            };
+            return;
+          }
+
           if (finishReason === "tool_calls" && pendingToolCalls.size === 0) {
             throw new Error(
               "llama.cpp finished with tool_calls but returned no calls.",
