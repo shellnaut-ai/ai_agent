@@ -805,6 +805,8 @@ describe("ChatSession incremental journal", () => {
     const fixture = await createOverflowFixture("overflow-recovery", "recover");
 
     const events = await collect(fixture.chat.streamTurn("hello"));
+    const reloaded = await reloadSession(fixture.rootDir, fixture.sessionId);
+    const [firstRequest, secondRequest] = fixture.requests;
 
     expect(fixture.getAgentCalls()).toBe(2);
     expect(fixture.compactReasons).toEqual(["overflow"]);
@@ -815,12 +817,42 @@ describe("ChatSession incremental journal", () => {
       }),
       expect.objectContaining({ type: "done" }),
     ]));
+    expect(secondRequest?.messages).toEqual(
+      fixture.activeMessagesAtAgentCalls[1],
+    );
+    expect(secondRequest?.messages).toEqual(
+      fixture.getRefreshedMessagesAfterCompaction(),
+    );
+    expect(firstRequest?.messages).toContainEqual({
+      role: "user",
+      content: "old oversized question",
+    });
+    expect(secondRequest?.messages).not.toContainEqual({
+      role: "user",
+      content: "old oversized question",
+    });
+    expect(secondRequest?.messages[0]).toMatchObject({
+      role: "user",
+      content: expect.stringContaining("overflow compact summary"),
+    });
+    expect(reloaded.store.getEntries().map((entry) => entry.id)).toEqual(
+      expect.arrayContaining(fixture.durableEntryIdsBeforeCompaction),
+    );
+    expect(reloaded.session.getMessages()).toEqual(
+      expect.arrayContaining(firstRequest?.messages ?? []),
+    );
   });
 
-  test("does not retry overflow after visible output", async () => {
+  test.each([
+    ["text", "visible-text"],
+    ["tool call", "visible-tool-call"],
+  ] as const)("does not retry overflow after visible %s", async (
+    _visibleKind,
+    behavior,
+  ) => {
     const fixture = await createOverflowFixture(
-      "visible-overflow",
-      "visible",
+      `visible-overflow-${behavior}`,
+      behavior,
     );
 
     const events = await collect(fixture.chat.streamTurn("hello"));
@@ -854,17 +886,46 @@ describe("ChatSession incremental journal", () => {
 
 async function createOverflowFixture(
   sessionId: string,
-  behavior: "recover" | "visible" | "always-overflow",
+  behavior:
+    | "recover"
+    | "visible-text"
+    | "visible-tool-call"
+    | "always-overflow",
 ): Promise<{
   chat: ChatSession;
+  rootDir: string;
+  sessionId: string;
+  requests: ModelRequest[];
+  activeMessagesAtAgentCalls: Message[][];
   compactReasons: CompactionReason[];
+  durableEntryIdsBeforeCompaction: string[];
+  getRefreshedMessagesAfterCompaction(): readonly Message[] | undefined;
   getAgentCalls(): number;
 }> {
-  const { store } = await createStore(sessionId);
+  const { rootDir, store } = await createStore(sessionId);
+  const session = new Session(store);
+  await session.appendMessages([
+    { role: "user", content: "old oversized question" },
+    { role: "assistant", content: "old oversized answer", toolCalls: [] },
+  ]);
+  const recentEntries = await session.appendMessages([
+    { role: "user", content: "recent question" },
+    { role: "assistant", content: "recent answer", toolCalls: [] },
+  ]);
+  const firstKeptEntryId = recentEntries[0]?.id;
+  if (firstKeptEntryId === undefined) {
+    throw new Error("Expected a durable recent user entry.");
+  }
   let agentCalls = 0;
+  const requests: ModelRequest[] = [];
+  const activeMessagesAtAgentCalls: Message[][] = [];
   const runner: ModelStreamRunner = {
-    async *stream(): AsyncIterable<StreamEvent> {
+    async *stream(request): AsyncIterable<StreamEvent> {
       agentCalls += 1;
+      requests.push(structuredClone(request));
+      activeMessagesAtAgentCalls.push([
+        ...structuredClone(session.buildActiveMessages()),
+      ]);
 
       if (behavior === "recover" && agentCalls > 1) {
         yield { type: "text-delta", delta: "recovered answer" };
@@ -872,8 +933,18 @@ async function createOverflowFixture(
         return;
       }
 
-      if (behavior === "visible") {
+      if (behavior === "visible-text") {
         yield { type: "text-delta", delta: "visible partial" };
+      }
+      if (behavior === "visible-tool-call") {
+        yield {
+          type: "tool-call",
+          toolCall: {
+            id: "visible-call-1",
+            name: "read",
+            arguments: { path: "visible.txt" },
+          },
+        };
       }
 
       yield {
@@ -884,6 +955,8 @@ async function createOverflowFixture(
     },
   };
   const compactReasons: CompactionReason[] = [];
+  const durableEntryIdsBeforeCompaction: string[] = [];
+  let refreshedMessagesAfterCompaction: readonly Message[] | undefined;
   const coordinator: ContextCoordinator = {
     async *prepareModelRequest(): AsyncIterable<never> {
       throw new Error("prepareModelRequest must not run in this fixture");
@@ -893,11 +966,24 @@ async function createOverflowFixture(
     },
     async *compact(_request, reason): AsyncIterable<ContextCoordinatorEvent> {
       compactReasons.push(reason);
+      durableEntryIdsBeforeCompaction.push(
+        ...store.getEntries().map((entry) => entry.id),
+      );
       yield {
         type: "compaction-start",
         reason,
         tokensBefore: 200,
       };
+      await session.appendCompaction({
+        summary: "overflow compact summary",
+        firstKeptEntryId,
+        tokensBefore: 200,
+        tokensAfter: 80,
+        details: { readFiles: [], modifiedFiles: [] },
+      });
+      refreshedMessagesAfterCompaction = [
+        ...structuredClone(session.buildActiveMessages()),
+      ];
       yield {
         type: "compaction-done",
         reason,
@@ -912,11 +998,18 @@ async function createOverflowFixture(
       new AgentLoop(runner, new ToolRegistry()),
       model,
       {
-        session: new Session(store),
+        session,
         contextCoordinator: coordinator,
       },
     ),
+    rootDir,
+    sessionId,
+    requests,
+    activeMessagesAtAgentCalls,
     compactReasons,
+    durableEntryIdsBeforeCompaction,
+    getRefreshedMessagesAfterCompaction: () =>
+      refreshedMessagesAfterCompaction,
     getAgentCalls: () => agentCalls,
   };
 }

@@ -321,11 +321,33 @@ describe("SessionContextCoordinator", () => {
     const fixture = await createCountingFixture("coordinator-count-abort");
     const controller = new AbortController();
     let counterCalls = 0;
+    let receivedSignal: AbortSignal | undefined;
+    let markCountingStarted: (() => void) | undefined;
+    const countingStarted = new Promise<void>((resolve) => {
+      markCountingStarted = resolve;
+    });
     const counter = {
-      async countInputTokens(): Promise<number> {
+      countInputTokens(
+        _request: ModelRequest,
+        options?: { readonly signal?: AbortSignal },
+      ): Promise<number> {
         counterCalls += 1;
-        controller.abort();
-        throw new Error("token count aborted");
+        receivedSignal = options?.signal;
+        markCountingStarted?.();
+
+        return new Promise<number>((_resolve, reject) => {
+          if (options?.signal === undefined) {
+            reject(new Error("token count signal missing"));
+            return;
+          }
+          if (options.signal.aborted) {
+            reject(new Error("token count aborted"));
+            return;
+          }
+          options.signal.addEventListener("abort", () => {
+            reject(new Error("token count aborted"));
+          }, { once: true });
+        });
       },
     };
     const coordinator = new SessionContextCoordinator(
@@ -335,9 +357,25 @@ describe("SessionContextCoordinator", () => {
       counter,
     );
 
-    await expect(collect(coordinator.prepareModelRequest(fixture.request, {
+    const collection = collect(coordinator.prepareModelRequest(fixture.request, {
       signal: controller.signal,
-    }))).rejects.toThrow("token count aborted");
+    }));
+    const settled = collection.then(
+      (events) => ({ status: "resolved" as const, events }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    );
+    const firstOutcome = await Promise.race([
+      countingStarted.then(() => "counting" as const),
+      settled.then(() => "completed" as const),
+    ]);
+
+    expect(firstOutcome).toBe("counting");
+    expect(receivedSignal).toBe(controller.signal);
+    controller.abort();
+    expect(await settled).toMatchObject({
+      status: "rejected",
+      error: { message: "token count aborted" },
+    });
     expect(counterCalls).toBe(1);
   });
 });
