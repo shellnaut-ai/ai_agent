@@ -15,6 +15,7 @@ import type { ToolCall } from "../tools/types.js";
 import { JsonlSessionStore } from "../session/jsonl-store.js";
 import { Session } from "../session/session.js";
 import { OpenAICodexProvider } from "./openai-codex-provider.js";
+import { createCodexModel } from "./openai-codex-models.js";
 
 const credential: OAuthCredential = {
   accessToken: "test-access",
@@ -165,6 +166,142 @@ describe("OpenAICodexProvider", () => {
     expect(events[1]).toMatchObject({ type: "error", reason: "error" });
   });
 
+  test("shows a bounded redacted structured HTTP error", async () => {
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async () => Response.json({
+        error: {
+          type: "invalid_request_error",
+          code: "unsupported_parameter",
+          param: "max_output_tokens",
+          message:
+            "Unsupported parameter:\nmax_output_tokens " +
+            "Bearer secret-value eyJabc.def.ghi sk-secret-value",
+        },
+      }, { status: 400 }),
+    });
+
+    const events = await collect(provider.stream(request()));
+    const terminal = events.at(-1);
+
+    expect(terminal).toMatchObject({
+      type: "error",
+      reason: "error",
+      error: {
+        name: "ModelHttpError",
+        status: 400,
+        retryable: false,
+        message: expect.stringContaining("unsupported_parameter"),
+      },
+    });
+    if (terminal?.type !== "error") throw new Error("Expected provider error");
+    expect(terminal.error.message).toContain("max_output_tokens");
+    expect(terminal.error.message).not.toContain("Unsupported parameter");
+    expect(terminal.error.message).not.toMatch(
+      /[\r\n]|secret-value|eyJabc|sk-secret/,
+    );
+    expect(terminal.error.message.length).toBeLessThanOrEqual(360);
+  });
+
+  test("does not expose arbitrary credentials quoted by an HTTP error", async () => {
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async () => Response.json({
+        error: {
+          type: "invalid_request_error",
+          code: "bad_request",
+          param: "input",
+          message:
+            "access_token=opaque-access refresh_token=opaque-refresh " +
+            "Cookie: session=opaque-cookie account_id=private-account",
+        },
+      }, { status: 400 }),
+    });
+
+    const events = await collect(provider.stream(request()));
+    const terminal = events.at(-1);
+
+    expect(terminal).toMatchObject({
+      type: "error",
+      error: {
+        name: "ModelHttpError",
+        status: 400,
+        retryable: false,
+        message: expect.stringContaining("bad_request"),
+      },
+    });
+    if (terminal?.type !== "error") throw new Error("Expected provider error");
+    expect(terminal.error.message).not.toMatch(
+      /opaque-access|opaque-refresh|opaque-cookie|private-account/,
+    );
+  });
+
+  test("falls back to status only for an oversized HTTP error body", async () => {
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async () => Response.json({
+        error: { message: "x".repeat(5_000) },
+      }, { status: 400 }),
+    });
+
+    const events = await collect(provider.stream(request()));
+    const terminal = events.at(-1);
+
+    expect(terminal).toMatchObject({
+      type: "error",
+      error: {
+        name: "ModelHttpError",
+        status: 400,
+        message: "OpenAI Codex provider request failed (400)",
+      },
+    });
+  });
+
+  test.each([
+    ["top-level code", { code: "top-level-secret-code" }],
+    ["top-level type", { type: "top-level-secret-type" }],
+    ["top-level param", { param: "top-level-secret-param" }],
+    ["nested detail", { error: { detail: "nested-secret-detail" } }],
+  ])("ignores HTTP error field outside the structural allowlist: %s", async (
+    _caseName,
+    payload,
+  ) => {
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async () => Response.json(payload, { status: 400 }),
+    });
+
+    const events = await collect(provider.stream(request()));
+
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { message: "OpenAI Codex provider request failed (400)" },
+    });
+  });
+
+  test("does not expose an unstructured HTTP error body", async () => {
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async () => new Response("secret-refresh-token", { status: 500 }),
+    });
+
+    const events = await collect(provider.stream(request()));
+    const terminal = events.at(-1);
+
+    expect(terminal).toMatchObject({
+      type: "error",
+      error: { name: "ModelHttpError", status: 500, retryable: true },
+    });
+    if (terminal?.type !== "error") throw new Error("Expected provider error");
+    expect(terminal.error.message).toContain("500");
+    expect(terminal.error.message).not.toContain("secret-refresh-token");
+  });
+
   test("serializes Responses input and assembles one function call", async () => {
     let captured: Request | undefined;
     const provider = new OpenAICodexProvider({
@@ -234,14 +371,40 @@ describe("OpenAICodexProvider", () => {
     ]);
     expect(captured?.headers.get("authorization")).toBe("Bearer test-access");
     expect(captured?.headers.get("chatgpt-account-id")).toBe("account-1");
-    await expect(captured?.json()).resolves.toMatchObject({
+    const body = await captured?.json() as Record<string, unknown>;
+    expect(body).toMatchObject({
       model: "gpt-5.1-codex-mini",
       instructions:
         "Base coding policy.\n\nSummarize only the supplied conversation.",
-      max_output_tokens: 321,
       stream: true,
       store: false,
     });
+    expect(body).not.toHaveProperty("max_output_tokens");
+  });
+
+  test("translates the legacy GPT-5.6 alias only on the wire", async () => {
+    const aliasModel = createCodexModel("gpt-5.6");
+    let captured: Request | undefined;
+    const provider = new OpenAICodexProvider({
+      model: aliasModel,
+      resolver: { resolve: async () => credential },
+      fetch: async (input, init) => {
+        captured = new Request(input, init);
+        return terminalResponse();
+      },
+    });
+    const normalizedModel = (await provider.listModels())[0]!;
+
+    await collect(provider.stream({
+      model: normalizedModel,
+      messages: [{ role: "user", content: "hello" }],
+      tools: [],
+    }));
+
+    const body = await captured?.json() as Record<string, unknown>;
+    expect(body.model).toBe("gpt-5.6-sol");
+    expect(aliasModel.id).toBe("gpt-5.6");
+    expect(normalizedModel.id).toBe("gpt-5.6");
   });
 
   test("rejects hidden constructor instructions before network", async () => {

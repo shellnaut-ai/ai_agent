@@ -1,3 +1,5 @@
+import { assertValidSessionId } from "../session/session-id.js";
+
 export function parseSessionId(
   argumentsValue: readonly string[],
 ): string | undefined {
@@ -23,5 +25,6 @@ export function parseSessionId(
     throw new Error("--session requires a session ID.");
   }
 
+  assertValidSessionId(sessionId);
   return sessionId;
 }

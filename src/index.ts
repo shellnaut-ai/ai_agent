@@ -35,6 +35,10 @@ export type {
 } from "./context/coordinator.js";
 export { TokenEstimator } from "./context/token-estimator.js";
 export { ProviderRegistry } from "./model/registry.js";
+export {
+  isRetryableModelError,
+  ModelHttpError,
+} from "./model/errors.js";
 export { RetryingModelRuntime } from "./model/retry.js";
 export { ModelRuntime } from "./model/runtime.js";
 export type {
@@ -48,6 +52,13 @@ export type {
   StreamEvent,
 } from "./model/types.js";
 export { OpenAICodexProvider } from "./providers/openai-codex-provider.js";
+export {
+  CODEX_DEFAULT_MODEL_ID,
+  CODEX_SUPPORTED_MODEL_IDS,
+  codexWireModelId,
+  createCodexModel,
+} from "./providers/openai-codex-models.js";
+export type { CodexModelId } from "./providers/openai-codex-models.js";
 export { OpenAICompatibleProvider } from "./providers/openai-compatible-provider.js";
 export { LlamaProvider } from "./providers/llama/provider.js";
 export { ChatSession } from "./session/chat-session.js";

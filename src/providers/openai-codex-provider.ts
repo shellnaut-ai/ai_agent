@@ -1,4 +1,5 @@
 import type { OAuthCredential } from "../auth/oauth-contracts.js";
+import { ModelHttpError } from "../model/errors.js";
 import type { ModelProvider, StreamOptions } from "../model/provider.js";
 import {
   combineSystemPrompts,
@@ -13,6 +14,7 @@ import type { ToolDefinition } from "../tools/types.js";
 import { serializeToolCallArguments } from "../tools/arguments.js";
 import { readSseData } from "./sse.js";
 import { continuationInstruction } from "./continuation.js";
+import { codexWireModelId } from "./openai-codex-models.js";
 
 export interface CredentialResolver {
   resolve(signal?: AbortSignal): Promise<OAuthCredential>;
@@ -95,12 +97,10 @@ export class OpenAICodexProvider implements ModelProvider {
       );
       const continuation = continuationInstruction(request);
       const body = JSON.stringify({
-        model: request.model.id,
+        model: codexWireModelId(request.model.id),
         ...(instructions === undefined
           ? {}
           : { instructions }),
-        max_output_tokens:
-          request.maxOutputTokens ?? request.model.maxOutputTokens,
         input: [
           ...serializeMessages(request.messages),
           ...(continuation === undefined
@@ -136,11 +136,11 @@ export class OpenAICodexProvider implements ModelProvider {
       });
 
       if (!response.ok) {
-        // 서버 body 전체는 출력하지 않는다. 단, 구조와 문장이 정확히 일치하는 알려진
-        // unsupported-model 오류만 우리가 만든 안전한 안내 문장으로 바꾼다.
-        const suffix = await safeHttpErrorSuffix(response, request.model.id);
-        throw new Error(
-          `OpenAI Codex provider request failed (${response.status})${suffix}`,
+        const detail = await safeHttpErrorDetail(response);
+        throw new ModelHttpError(
+          response.status,
+          `OpenAI Codex provider request failed (${response.status})` +
+            (detail === undefined ? "" : `: ${detail}`),
         );
       }
       if (response.body === null) {
@@ -410,27 +410,90 @@ function createProviderState(
   };
 }
 
-async function safeHttpErrorSuffix(
-  response: Response,
-  requestedModel: string,
-): Promise<string> {
-  if (response.status !== 400) return "";
+async function safeHttpErrorDetail(response: Response): Promise<string | undefined> {
+  const body = await readBoundedHttpErrorBody(response);
+  if (body === undefined) return undefined;
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(await response.text()) as unknown;
+    parsed = JSON.parse(body) as unknown;
   } catch {
-    return "";
+    return undefined;
   }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return "";
-  const error = (parsed as Record<string, unknown>).error;
-  if (typeof error !== "object" || error === null || Array.isArray(error)) return "";
-  const fields = error as Record<string, unknown>;
-  const expected = `The '${requestedModel}' model is not supported when using Codex with a ChatGPT account.`;
-  if (fields.type !== "invalid_request_error" || fields.message !== expected) return "";
+  if (!isRecord(parsed)) return undefined;
 
-  // 외부 message를 그대로 이어 붙이지 않고 로컬 model 값으로 새 문장을 만든다.
-  return `: model "${requestedModel}" is not supported for this ChatGPT account`;
+  const nested = parsed.error;
+  return isRecord(nested) ? structuredHttpErrorDetail(nested) : undefined;
+}
+
+const MAX_HTTP_ERROR_BODY_BYTES = 4_096;
+
+async function readBoundedHttpErrorBody(
+  response: Response,
+): Promise<string | undefined> {
+  const declaredLength = response.headers.get("content-length");
+  if (declaredLength !== null) {
+    const bytes = Number(declaredLength);
+    if (Number.isFinite(bytes) && bytes > MAX_HTTP_ERROR_BODY_BYTES) {
+      await response.body?.cancel().catch(() => undefined);
+      return undefined;
+    }
+  }
+
+  if (response.body === null) return undefined;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined || value.byteLength === 0) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_HTTP_ERROR_BODY_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        return undefined;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    await reader.cancel().catch(() => undefined);
+    return undefined;
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function structuredHttpErrorDetail(
+  fields: Record<string, unknown>,
+): string | undefined {
+  const parts: string[] = [];
+  for (const key of ["type", "code", "param"] as const) {
+    const value = fields[key];
+    if (
+      typeof value === "string" &&
+      /^[A-Za-z][A-Za-z0-9_.-]{0,99}$/u.test(value)
+    ) {
+      parts.push(`${key}=${value}`);
+    }
+  }
+  return parts.length === 0 ? undefined : parts.join(", ");
 }
 
 function codexResponsesEndpoint(baseUrl: string): string {

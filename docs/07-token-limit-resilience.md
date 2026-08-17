@@ -31,6 +31,11 @@ remainingInputTokens = inputBudget - estimatedInputTokens
 
 추정 입력에는 model/request system prompt, message, tool schema, continuation instruction과 metadata가 모두 포함된다. Provider 기본 지침도 model metadata로 공통 estimator에 노출되며 adapter 내부의 숨은 budget 입력으로 두지 않는다. 입력이 초과하면 `SessionContextCoordinator`가 append-only JSONL의 active projection을 기준으로 오래된 complete turn만 compaction한다. 현재 tool-call/result 묶음은 요약하지 않으며, 한 번에 요약 요청에 들어가지 않는 과거 turn은 complete-turn 경계에서 여러 batch로 나눈다.
 
+ChatGPT Codex backend는 `max_output_tokens` request field를 거부하므로 Codex adapter는
+이 값을 wire에 보내지 않는다. `Model.maxOutputTokens`와 request override는 삭제하지 않고
+공통 input reservation, tool-result budget, continuation 총량 제한에만 사용한다.
+llama.cpp와 OpenAI-compatible adapter는 각각의 기존 output-limit wire field를 유지한다.
+
 새 user message는 journal에 append하기 전에 같은 coordinator가 pending input으로 preflight한다. summarizer 실패·abort·최종 fit 실패 시 user message는 남지 않는다. coordinator는 caller message와 durable session projection이 정확히 같지 않으면 조용히 덮어쓰지 않고 요청을 거부한다.
 
 `CompactionSettings.reserveTokens`는 이전 호출부 호환성을 위해 남아 있지만 입력 예산 공식에는 사용하지 않는다. `keepRecentTokens`는 최근 turn 선택 정책일 뿐 출력 reserve가 아니다.
@@ -149,11 +154,19 @@ npm run check
 ```powershell
 # Ollama
 $env:AI_AGENT_OPENAI_BASE_URL = 'http://127.0.0.1:11434/v1'
-npm run cli -- --provider openai-compatible --model gemma4:latest
+npm run cli -- chat --provider openai-compatible --model gemma4:latest
 
 # llama.cpp
 $env:AI_AGENT_LLAMA_URL = 'http://127.0.0.1:8080'
-npm run cli -- --provider llama --model gemma
+npm run cli -- chat --provider llama --model gemma
+
+# ChatGPT Codex OAuth (기본 Sol)
+npm run cli -- chat --provider openai-codex
+
+# 명시적인 5.6 tier
+npm run cli -- chat --provider openai-codex --model gpt-5.6-terra
 ```
 
-Codex OAuth/network live 호출도 수동 검증만 수행한다.
+Codex OAuth/network live 호출도 수동 검증만 수행한다. 현재 명시 지원 model ID는
+`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`이며 기존 session용
+`gpt-5.6` alias는 Sol로 번역한다.

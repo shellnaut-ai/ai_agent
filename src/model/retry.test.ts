@@ -2,6 +2,7 @@ import { Type } from "typebox";
 import { describe, expect, test } from "vitest";
 
 import type { ModelStreamRunner } from "./runtime.js";
+import { ModelHttpError } from "./errors.js";
 import { RetryingModelRuntime } from "./retry.js";
 import type { ModelRequest, StreamEvent } from "./types.js";
 
@@ -16,6 +17,86 @@ async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
 }
 
 describe("RetryingModelRuntime", () => {
+  test("does not retry a permanent HTTP failure", async () => {
+    let attempts = 0;
+    const runner: ModelStreamRunner = {
+      async *stream(): AsyncIterable<StreamEvent> {
+        attempts += 1;
+        yield { type: "start" };
+        yield {
+          type: "error",
+          reason: "error",
+          error: new ModelHttpError(400, "Unsupported parameter"),
+        };
+      },
+    };
+    const request: ModelRequest = {
+      model: {
+        id: "model-1",
+        name: "Model One",
+        provider: "fake",
+        contextWindow: 8_192,
+        maxOutputTokens: 1_024,
+      },
+      messages: [{ role: "user", content: "hello" }],
+      tools: [],
+    };
+
+    const events = await collect(new RetryingModelRuntime(runner, {
+      maxRetries: 2,
+      initialDelayMs: 0,
+    }).stream(request));
+
+    expect(attempts).toBe(1);
+    expect(events.some((event) => event.type === "retry")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { message: "Unsupported parameter" },
+    });
+  });
+
+  test.each([429, 503])("retries transient HTTP %i failures", async (status) => {
+    let attempts = 0;
+    const runner: ModelStreamRunner = {
+      async *stream(): AsyncIterable<StreamEvent> {
+        attempts += 1;
+        yield { type: "start" };
+        if (attempts === 1) {
+          yield {
+            type: "error",
+            reason: "error",
+            error: new ModelHttpError(status, `HTTP ${status}`),
+          };
+          return;
+        }
+        yield { type: "done", reason: "stop" };
+      },
+    };
+    const request: ModelRequest = {
+      model: {
+        id: "model-1",
+        name: "Model One",
+        provider: "fake",
+        contextWindow: 8_192,
+        maxOutputTokens: 1_024,
+      },
+      messages: [{ role: "user", content: "hello" }],
+      tools: [],
+    };
+
+    const events = await collect(new RetryingModelRuntime(runner, {
+      maxRetries: 2,
+      initialDelayMs: 0,
+    }).stream(request));
+
+    expect(attempts).toBe(2);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "retry",
+      attempt: 1,
+    }));
+    expect(events.at(-1)).toEqual({ type: "done", reason: "stop" });
+  });
+
   test("clones the complete ModelRequest independently for every attempt", async () => {
     const original: ModelRequest = {
       model: {
