@@ -1,6 +1,9 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  ContextOverflowError,
+  isContextOverflowError,
+  isContextOverflowMessage,
   isRetryableModelError,
   ModelHttpError,
 } from "./errors.js";
@@ -29,5 +32,13 @@ describe("model request errors", () => {
 
   test("keeps ordinary transport errors retryable", () => {
     expect(isRetryableModelError(new Error("connection reset"))).toBe(true);
+  });
+
+  test("classifies only known context overflow messages", () => {
+    expect(isContextOverflowMessage("context_length_exceeded")).toBe(true);
+    expect(isContextOverflowMessage("exceeds the available context size")).toBe(true);
+    expect(isContextOverflowMessage("HTTP 500 connection reset")).toBe(false);
+    expect(isContextOverflowError(new ContextOverflowError("overflow"))).toBe(true);
+    expect(isContextOverflowError(new Error("overflow"))).toBe(false);
   });
 });
