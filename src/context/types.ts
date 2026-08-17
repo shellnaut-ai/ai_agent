@@ -18,6 +18,7 @@ export interface CompactionSettings {
 export interface CompactionTurn {
   readonly firstEntryId: string;
   readonly messages: readonly Message[];
+  readonly messageEntryIds?: readonly string[];
 }
 
 export interface CompactionFileDetails {
@@ -34,6 +35,7 @@ export interface PreviousCompaction {
 export interface CompactionRequest {
   readonly model: Model;
   readonly turns: readonly CompactionTurn[];
+  readonly force?: boolean;
   readonly previousCompaction?: PreviousCompaction;
   readonly pendingUserMessage?: UserMessage;
   readonly toolDefinitions: readonly ToolDefinition[];

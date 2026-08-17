@@ -1,10 +1,17 @@
 import type { ContextBudget, ContextBudgetCalculator, ToolResultBudget } from "./budget.js";
 import type { ModelRequest, UserMessage } from "../model/types.js";
 
+export type CompactionReason = "manual" | "threshold" | "overflow";
+
 export type ContextCoordinatorEvent =
-  | { readonly type: "compaction-start"; readonly tokensBefore: number }
+  | {
+      readonly type: "compaction-start";
+      readonly reason: CompactionReason;
+      readonly tokensBefore: number;
+    }
   | {
       readonly type: "compaction-done";
+      readonly reason: CompactionReason;
       readonly tokensBefore: number;
       readonly tokensAfter: number;
     }
@@ -37,6 +44,12 @@ export interface ContextCoordinator {
       readonly signal?: AbortSignal;
       readonly toolCallId?: string;
     },
+  ): AsyncIterable<ContextCoordinatorEvent>;
+
+  compact?(
+    request: ModelRequest,
+    reason: CompactionReason,
+    options?: { readonly signal?: AbortSignal },
   ): AsyncIterable<ContextCoordinatorEvent>;
 }
 

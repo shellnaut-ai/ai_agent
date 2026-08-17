@@ -529,10 +529,10 @@ function validateEntry(
     if (
       !firstKeptEntry ||
       firstKeptEntry.type !== "message" ||
-      firstKeptEntry.message.role !== "user"
+      firstKeptEntry.message.role === "tool"
     ) {
       throw new Error(
-        `Compaction entry "${entry.id}" must keep a user message.`,
+        `Compaction entry "${entry.id}" must keep a user or assistant message.`,
       );
     }
 

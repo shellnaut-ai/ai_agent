@@ -1,5 +1,9 @@
 import type { ModelProvider, StreamOptions } from "../../model/provider.js";
 import {
+  ContextOverflowError,
+  isContextOverflowMessage,
+} from "../../model/errors.js";
+import {
   combineSystemPrompts,
   type Message,
   type Model,
@@ -29,6 +33,7 @@ interface ToolCallDelta {
 interface ParsedChunk {
   readonly content?: string;
   readonly finishReason?: string;
+  readonly errorMessage?: string;
   readonly toolCallDeltas: readonly ToolCallDelta[];
 }
 
@@ -42,11 +47,37 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function readErrorMessage(value: Record<string, unknown>): string | undefined {
+  if (typeof value.error === "string") {
+    return value.error;
+  }
+
+  if (isRecord(value.error) && typeof value.error.message === "string") {
+    return value.error.message;
+  }
+
+  return typeof value.message === "string" ? value.message : undefined;
+}
+
+function createLlamaServerError(message: string): Error {
+  return isContextOverflowMessage(message)
+    ? new ContextOverflowError(message)
+    : new Error(message);
+}
+
 function parseChatChunk(data: string): ParsedChunk {
   const value: unknown = JSON.parse(data);
 
   if (!isRecord(value)) {
     throw new Error("Invalid llama.cpp stream chunk.");
+  }
+
+  const errorMessage = readErrorMessage(value);
+  if (errorMessage !== undefined) {
+    return {
+      errorMessage,
+      toolCallDeltas: [],
+    };
   }
 
   const choices = value.choices;
@@ -176,6 +207,27 @@ function toLlamaMessages(request: ModelRequest): Record<string, unknown>[] {
   ];
 }
 
+function toLlamaRequestBody(
+  request: ModelRequest,
+  stream: boolean,
+): Record<string, unknown> {
+  return {
+    model: request.model.id,
+    messages: toLlamaMessages(request),
+    tools: request.tools.map((definition) => ({
+      type: "function",
+      function: {
+        name: definition.name,
+        description: definition.description,
+        parameters: definition.inputSchema,
+      },
+    })),
+    parallel_tool_calls: false,
+    max_tokens: request.maxOutputTokens ?? request.model.maxOutputTokens,
+    ...(stream ? { stream: true } : {}),
+  };
+}
+
 export class LlamaProvider implements ModelProvider {
   readonly id: ProviderId = "llama";
   readonly name = "llama.cpp";
@@ -205,6 +257,46 @@ export class LlamaProvider implements ModelProvider {
     return [this.model];
   }
 
+  async countInputTokens(
+    request: ModelRequest,
+    options?: StreamOptions,
+  ): Promise<number> {
+    if (options?.signal?.aborted) {
+      throw new Error("Request aborted.");
+    }
+
+    const response = await fetch(
+      this.serverUrl + "/v1/chat/completions/input_tokens",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(toLlamaRequestBody(request, false)),
+        signal: options?.signal,
+      },
+    );
+
+    if (!response.ok) {
+      const responseBody = await response.text();
+      throw createLlamaServerError(
+        "llama.cpp returned HTTP " + response.status + ": " + responseBody,
+      );
+    }
+
+    const value: unknown = await response.json();
+    if (
+      !isRecord(value) ||
+      typeof value.input_tokens !== "number" ||
+      !Number.isInteger(value.input_tokens) ||
+      value.input_tokens < 0
+    ) {
+      throw new Error("llama.cpp returned an invalid input token count.");
+    }
+
+    return value.input_tokens;
+  }
+
   async *stream(
     request: ModelRequest,
     options?: StreamOptions,
@@ -229,29 +321,14 @@ export class LlamaProvider implements ModelProvider {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          model: request.model.id,
-          messages: toLlamaMessages(request),
-          tools: request.tools.map((definition) => ({
-            type: "function",
-            function: {
-              name: definition.name,
-              description: definition.description,
-              parameters: definition.inputSchema,
-            },
-          })),
-          parallel_tool_calls: false,
-          max_tokens:
-            request.maxOutputTokens ?? request.model.maxOutputTokens,
-          stream: true,
-        }),
+        body: JSON.stringify(toLlamaRequestBody(request, true)),
         signal: options?.signal,
       });
 
       if (!response.ok) {
         const responseBody = await response.text();
 
-        throw new Error(
+        throw createLlamaServerError(
           `llama.cpp returned HTTP ${response.status}: ${responseBody}`,
         );
       }
@@ -324,6 +401,12 @@ export class LlamaProvider implements ModelProvider {
         }
 
         const chunk = parseChatChunk(data);
+
+        if (chunk.errorMessage !== undefined) {
+          throw createLlamaServerError(
+            "llama.cpp returned stream error: " + chunk.errorMessage,
+          );
+        }
 
         if (chunk.content) {
           yield {
