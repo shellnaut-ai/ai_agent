@@ -2,6 +2,7 @@ import type { ModelProvider, StreamOptions } from "../../model/provider.js";
 import {
   ContextOverflowError,
   isContextOverflowMessage,
+  ModelHttpError,
 } from "../../model/errors.js";
 import {
   combineSystemPrompts,
@@ -43,30 +44,152 @@ interface PendingToolCall {
   argumentsText: string;
 }
 
+const MAX_LLAMA_ERROR_BODY_BYTES = 4_096;
+const MAX_LLAMA_ERROR_DETAIL_CHARS = 280;
+const LLAMA_CONTEXT_OVERFLOW_MESSAGE =
+  "llama.cpp context window exceeded.";
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function readErrorMessage(value: Record<string, unknown>): string | undefined {
+  let rawMessage: string | undefined;
+
   if (typeof value.error === "string") {
-    return value.error;
+    rawMessage = value.error;
+  } else if (isRecord(value.error) && typeof value.error.message === "string") {
+    rawMessage = value.error.message;
+  } else if (typeof value.message === "string") {
+    rawMessage = value.message;
   }
 
-  if (isRecord(value.error) && typeof value.error.message === "string") {
-    return value.error.message;
+  if (rawMessage === undefined) {
+    return undefined;
   }
 
-  return typeof value.message === "string" ? value.message : undefined;
+  return sanitizeErrorMessage(rawMessage);
 }
 
-function createLlamaServerError(message: string): Error {
-  return isContextOverflowMessage(message)
-    ? new ContextOverflowError(message)
-    : new Error(message);
+function sanitizeErrorMessage(message: string): string {
+  const normalized = message
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .replace(/\bBearer\s+[^\s,;]+/giu, "Bearer [REDACTED]")
+    .replace(
+      /\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gu,
+      "[REDACTED]",
+    )
+    .replace(/\bsk-[A-Za-z0-9_-]{4,}\b/giu, "[REDACTED]")
+    .replace(
+      /\b(access[_-]?token|refresh[_-]?token|api[_-]?key|client[_-]?secret|cookie|set-cookie|session(?:[_-]?id)?)\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/giu,
+      "$1=[REDACTED]",
+    );
+
+  return normalized.length <= MAX_LLAMA_ERROR_DETAIL_CHARS
+    ? normalized
+    : normalized.slice(0, MAX_LLAMA_ERROR_DETAIL_CHARS - 3) + "...";
+}
+
+function createLlamaServerError(
+  message: string | undefined,
+  options?: {
+    readonly status?: number;
+    readonly operation?: "request" | "input token count request";
+  },
+): Error {
+  if (message !== undefined && isContextOverflowMessage(message)) {
+    return new ContextOverflowError(LLAMA_CONTEXT_OVERFLOW_MESSAGE);
+  }
+
+  const operation = options?.operation ?? "stream";
+  const prefix = options?.status === undefined
+    ? `llama.cpp ${operation} error`
+    : `llama.cpp ${operation} failed (${options.status})`;
+  const safeMessage = prefix +
+    (message === undefined || message.length === 0 ? "" : `: ${message}`);
+
+  return options?.status === undefined
+    ? new Error(safeMessage)
+    : new ModelHttpError(options.status, safeMessage);
+}
+
+async function readHttpErrorMessage(
+  response: Response,
+): Promise<string | undefined> {
+  const body = await readBoundedHttpErrorBody(response);
+  if (body === undefined) return undefined;
+
+  let value: unknown;
+  try {
+    value = JSON.parse(body) as unknown;
+  } catch {
+    return undefined;
+  }
+
+  return isRecord(value) ? readErrorMessage(value) : undefined;
+}
+
+async function readBoundedHttpErrorBody(
+  response: Response,
+): Promise<string | undefined> {
+  const declaredLength = response.headers.get("content-length");
+  if (declaredLength !== null) {
+    const bytes = Number(declaredLength);
+    if (Number.isFinite(bytes) && bytes > MAX_LLAMA_ERROR_BODY_BYTES) {
+      await response.body?.cancel().catch(() => undefined);
+      return undefined;
+    }
+  }
+
+  if (response.body === null) return undefined;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined || value.byteLength === 0) continue;
+
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_LLAMA_ERROR_BODY_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        return undefined;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    await reader.cancel().catch(() => undefined);
+    return undefined;
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return undefined;
+  }
 }
 
 function parseChatChunk(data: string): ParsedChunk {
-  const value: unknown = JSON.parse(data);
+  let value: unknown;
+
+  try {
+    value = JSON.parse(data) as unknown;
+  } catch {
+    throw new Error("Invalid llama.cpp stream chunk.");
+  }
 
   if (!isRecord(value)) {
     throw new Error("Invalid llama.cpp stream chunk.");
@@ -278,13 +401,21 @@ export class LlamaProvider implements ModelProvider {
     );
 
     if (!response.ok) {
-      const responseBody = await response.text();
       throw createLlamaServerError(
-        "llama.cpp returned HTTP " + response.status + ": " + responseBody,
+        await readHttpErrorMessage(response),
+        {
+          status: response.status,
+          operation: "input token count request",
+        },
       );
     }
 
-    const value: unknown = await response.json();
+    let value: unknown;
+    try {
+      value = await response.json() as unknown;
+    } catch {
+      throw new Error("llama.cpp returned an invalid input token count.");
+    }
     if (
       !isRecord(value) ||
       typeof value.input_tokens !== "number" ||
@@ -326,10 +457,9 @@ export class LlamaProvider implements ModelProvider {
       });
 
       if (!response.ok) {
-        const responseBody = await response.text();
-
         throw createLlamaServerError(
-          `llama.cpp returned HTTP ${response.status}: ${responseBody}`,
+          await readHttpErrorMessage(response),
+          { status: response.status, operation: "request" },
         );
       }
 
@@ -403,9 +533,7 @@ export class LlamaProvider implements ModelProvider {
         const chunk = parseChatChunk(data);
 
         if (chunk.errorMessage !== undefined) {
-          throw createLlamaServerError(
-            "llama.cpp returned stream error: " + chunk.errorMessage,
-          );
+          throw createLlamaServerError(chunk.errorMessage);
         }
 
         if (chunk.content) {

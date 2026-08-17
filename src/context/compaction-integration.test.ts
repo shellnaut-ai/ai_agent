@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { AgentLoop } from "../agent/loop.js";
+import { continuationTailHash } from "../agent/output-continuation.js";
 import type { ModelStreamRunner } from "../model/runtime.js";
 import type { ModelRequest, StreamEvent } from "../model/types.js";
 import { ChatSession } from "../session/chat-session.js";
@@ -200,6 +201,230 @@ describe("CompactionService integration", () => {
 
     expect(preparation?.firstKeptEntryId).toBe("assistant-final");
     expect(preparation?.keptTurns[0]?.messages[0]?.role).toBe("assistant");
+  });
+
+  test("fails closed when forced compaction has only one small complete turn", () => {
+    const service = new CompactionService({
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: "done", reason: "stop" };
+      },
+    }, {
+      reserveTokens: 100,
+      keepRecentTokens: 1_000,
+      charsPerToken: 1,
+      maxSummaryOutputTokens: 100,
+      toolResultMaxChars: 100,
+    });
+
+    expect(() => service.prepare({
+      model: {
+        id: "fake-model",
+        name: "Fake",
+        provider: "fake",
+        contextWindow: 4_000,
+        maxOutputTokens: 100,
+      },
+      turns: [{
+        firstEntryId: "only-user",
+        messageEntryIds: ["only-user", "only-assistant"],
+        messages: [
+          { role: "user", content: "small request" },
+          { role: "assistant", content: "small answer", toolCalls: [] },
+        ],
+      }],
+      force: true,
+      toolDefinitions: [],
+    })).toThrow(/only active turn.*safe message boundary/i);
+  });
+
+  test("keeps a continuation sequence atomic across compaction, reload, and resume", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-compact-continuation-"));
+    cleanup.push(rootDir);
+    const model = {
+      id: "fake-model",
+      name: "Fake",
+      provider: "fake" as const,
+      contextWindow: 5_000,
+      maxOutputTokens: 100,
+    };
+    const sessionId = "continuation-atomic-compaction";
+    const store = new JsonlSessionStore({ rootDir, sessionId, model });
+    await store.load();
+    const session = new Session(store);
+    const firstContent = "first segment ".repeat(50);
+    const secondContent = "second segment";
+    const logicalContent = firstContent + secondContent;
+    const entries = await session.appendMessages([
+      { role: "user", content: "continue this answer" },
+      {
+        role: "assistant",
+        content: firstContent,
+        toolCalls: [],
+        providerState: {
+          provider: "openai-codex",
+          value: { replay: [{ type: "reasoning", id: "reasoning-0" }] },
+        },
+        continuation: {
+          logicalMessageId: "logical-atomic",
+          segmentIndex: 0,
+          status: "partial",
+          resumeAllowed: true,
+          tailHash: continuationTailHash(firstContent),
+          estimatedTotalOutputTokens: 200,
+        },
+      },
+      {
+        role: "assistant",
+        content: secondContent,
+        toolCalls: [],
+        providerState: {
+          provider: "openai-codex",
+          value: { replay: [{ type: "reasoning", id: "reasoning-1" }] },
+        },
+        continuation: {
+          logicalMessageId: "logical-atomic",
+          segmentIndex: 1,
+          status: "partial",
+          resumeAllowed: true,
+          tailHash: continuationTailHash(logicalContent),
+          estimatedTotalOutputTokens: 220,
+        },
+      },
+    ]);
+    const firstSegmentEntry = entries[1];
+    if (firstSegmentEntry === undefined) {
+      throw new Error("Expected a durable first continuation segment.");
+    }
+    const compaction = new CompactionService({
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: "text-delta", delta: "compact summary" };
+        yield { type: "done", reason: "stop" };
+      },
+    }, {
+      reserveTokens: 100,
+      keepRecentTokens: 600,
+      charsPerToken: 1,
+      maxSummaryOutputTokens: 100,
+      toolResultMaxChars: 100,
+    });
+    const coordinator = new SessionContextCoordinator(
+      session,
+      compaction,
+      new ContextBudgetCalculator(new TokenEstimator(1)),
+    );
+
+    await collect(coordinator.compact({
+      model,
+      messages: [...session.buildActiveMessages()],
+      tools: [],
+    }, "manual"));
+
+    expect(session.getPreviousCompaction()?.firstKeptEntryId).toBe(
+      firstSegmentEntry.id,
+    );
+
+    const reloadedStore = new JsonlSessionStore({ rootDir, sessionId, model });
+    await reloadedStore.load();
+    const reloadedSession = new Session(reloadedStore);
+    const requests: ModelRequest[] = [];
+    const chat = new ChatSession(
+      new AgentLoop({
+        async *stream(request): AsyncIterable<StreamEvent> {
+          requests.push(structuredClone(request));
+          yield { type: "text-delta", delta: " final" };
+          yield { type: "done", reason: "stop" };
+        },
+      }, new ToolRegistry()),
+      model,
+      { session: reloadedSession },
+    );
+
+    const events = await collect(chat.streamContinuation());
+
+    expect(events.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.continuation).toMatchObject({
+      logicalMessageId: "logical-atomic",
+      segmentIndex: 2,
+      previousTailHash: continuationTailHash(logicalContent),
+    });
+    expect(
+      requests[0]?.messages
+        .flatMap((message) =>
+          message.role === "assistant" &&
+            message.continuation?.logicalMessageId === "logical-atomic"
+            ? [message.providerState?.value]
+            : []
+        ),
+    ).toEqual([
+      { replay: [{ type: "reasoning", id: "reasoning-0" }] },
+      { replay: [{ type: "reasoning", id: "reasoning-1" }] },
+    ]);
+  });
+
+  test("rejects a previous compaction that re-enters midway through a continuation", () => {
+    const service = new CompactionService({
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: "done", reason: "stop" };
+      },
+    }, {
+      reserveTokens: 100,
+      keepRecentTokens: 1_000,
+      charsPerToken: 1,
+      maxSummaryOutputTokens: 100,
+      toolResultMaxChars: 100,
+    });
+    const logicalContent = "firstsecond";
+
+    expect(() => service.prepare({
+      model: {
+        id: "fake-model",
+        name: "Fake",
+        provider: "fake",
+        contextWindow: 4_000,
+        maxOutputTokens: 100,
+      },
+      turns: [{
+        firstEntryId: "user",
+        messageEntryIds: ["user", "segment-0", "segment-1"],
+        messages: [
+          { role: "user", content: "continue" },
+          {
+            role: "assistant",
+            content: "first",
+            toolCalls: [],
+            continuation: {
+              logicalMessageId: "logical-unsafe",
+              segmentIndex: 0,
+              status: "partial",
+              resumeAllowed: true,
+              tailHash: continuationTailHash("first"),
+              estimatedTotalOutputTokens: 2,
+            },
+          },
+          {
+            role: "assistant",
+            content: "second",
+            toolCalls: [],
+            continuation: {
+              logicalMessageId: "logical-unsafe",
+              segmentIndex: 1,
+              status: "partial",
+              resumeAllowed: true,
+              tailHash: continuationTailHash(logicalContent),
+              estimatedTotalOutputTokens: 4,
+            },
+          },
+        ],
+      }],
+      previousCompaction: {
+        summary: "unsafe summary",
+        firstKeptEntryId: "segment-1",
+        details: { readFiles: [], modifiedFiles: [] },
+      },
+      force: true,
+      toolDefinitions: [],
+    })).toThrow(/unsafe continuation boundary/i);
   });
 
   test("compacts again after an assistant-start compaction without rewriting history", async () => {

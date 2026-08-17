@@ -292,6 +292,71 @@ describe("SessionContextCoordinator", () => {
     expect(events.at(-1)).toMatchObject({ type: "model-input-ready" });
   }, 15_000);
 
+  test("forces manual compaction to summarize the older of two small complete turns", async () => {
+    const fixture = await createCountingFixture(
+      "coordinator-manual-small-turns",
+      10_000,
+    );
+    const entriesBefore = fixture.session.getMessages();
+    const coordinator = new SessionContextCoordinator(
+      fixture.session,
+      fixture.compaction,
+      fixture.calculator,
+    );
+
+    const events = await collect(coordinator.compact(
+      fixture.request,
+      "manual",
+    ));
+
+    expect(events).toEqual([
+      expect.objectContaining({ type: "compaction-start", reason: "manual" }),
+      expect.objectContaining({ type: "compaction-done", reason: "manual" }),
+    ]);
+    expect(fixture.session.getPreviousCompaction()).toMatchObject({
+      summary: "stable summary",
+    });
+    expect(fixture.session.buildActiveMessages()).not.toContainEqual(
+      entriesBefore[0],
+    );
+    expect(fixture.session.buildActiveMessages()).toContainEqual(
+      entriesBefore[2],
+    );
+  });
+
+  test("compacts when exact input tokens exceed budget but the estimator keeps both turns", async () => {
+    const fixture = await createCountingFixture(
+      "coordinator-exact-high-estimate-low",
+      10_000,
+    );
+    let counterCalls = 0;
+    const coordinator = new SessionContextCoordinator(
+      fixture.session,
+      fixture.compaction,
+      fixture.calculator,
+      {
+        async countInputTokens(): Promise<number | undefined> {
+          counterCalls += 1;
+          return counterCalls === 1 ? 9_000 : undefined;
+        },
+      },
+    );
+
+    const events = await collect(
+      coordinator.prepareModelRequest(fixture.request),
+    );
+
+    expect(counterCalls).toBe(2);
+    expect(events.map((event) => event.type)).toEqual([
+      "compaction-start",
+      "compaction-done",
+      "model-input-ready",
+    ]);
+    expect(fixture.session.getPreviousCompaction()).toMatchObject({
+      summary: "stable summary",
+    });
+  });
+
   test("falls back to estimated tokens when optional counting fails", async () => {
     const fixture = await createCountingFixture("coordinator-count-fallback");
     let counterCalls = 0;
@@ -380,7 +445,10 @@ describe("SessionContextCoordinator", () => {
   });
 });
 
-async function createCountingFixture(sessionId: string): Promise<{
+async function createCountingFixture(
+  sessionId: string,
+  keepRecentTokens = 450,
+): Promise<{
   session: Session;
   compaction: CompactionService;
   calculator: ContextBudgetCalculator;
@@ -411,7 +479,7 @@ async function createCountingFixture(sessionId: string): Promise<{
     },
   }, {
     reserveTokens: 100,
-    keepRecentTokens: 450,
+    keepRecentTokens,
     charsPerToken: 1,
     maxSummaryOutputTokens: 100,
     toolResultMaxChars: 1_000,

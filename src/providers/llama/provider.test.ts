@@ -91,6 +91,21 @@ describe("LlamaProvider", () => {
   });
 
   test.each([
+    ["negative", -1],
+    ["fractional", 1.5],
+    ["string", "321"],
+    ["missing", undefined],
+  ])("rejects a %s input_tokens value", async (_caseId, inputTokens) => {
+    vi.stubGlobal("fetch", async () => Response.json(
+      inputTokens === undefined ? {} : { input_tokens: inputTokens },
+    ));
+
+    await expect(createProvider().countInputTokens(request)).rejects.toThrow(
+      "invalid input token count",
+    );
+  });
+
+  test.each([
     [400, { error: { message: "context_length_exceeded" } }],
     [500, { message: "exceeds the available context size" }],
   ])("maps HTTP %i context overflow", async (status, body) => {
@@ -101,7 +116,144 @@ describe("LlamaProvider", () => {
 
     expect(events.at(-1)).toMatchObject({
       type: "error",
-      error: { name: "ContextOverflowError" },
+      error: {
+        name: "ContextOverflowError",
+        message: "llama.cpp context window exceeded.",
+      },
     });
+  });
+
+  test("maps a structured SSE overflow to a fixed generic error", async () => {
+    vi.stubGlobal("fetch", async () => sseResponse([
+      {
+        error: {
+          message:
+            "context_length_exceeded Bearer overflow-secret " +
+            "access_token=overflow-access",
+        },
+      },
+    ]));
+
+    const events = await collect(createProvider().stream(request));
+
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: {
+        name: "ContextOverflowError",
+        message: "llama.cpp context window exceeded.",
+      },
+    });
+  });
+
+  test("does not classify an unstructured HTTP body as context overflow", async () => {
+    vi.stubGlobal("fetch", async () => new Response(
+      "proxy debug context_length_exceeded",
+      { status: 502 },
+    ));
+
+    const events = await collect(createProvider().stream(request));
+
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: {
+        name: "ModelHttpError",
+        status: 502,
+        message: "llama.cpp request failed (502)",
+      },
+    });
+  });
+
+  test("keeps an ordinary structured HTTP error non-overflow and sanitized", async () => {
+    const secretValues = [
+      "bearer-secret",
+      "eyJabc.def.ghi",
+      "sk-secret-value",
+      "opaque-access",
+      "opaque-refresh",
+      "opaque-cookie",
+    ];
+    vi.stubGlobal("fetch", async () => Response.json({
+      error: {
+        message:
+          "ordinary\u0000 failure\n" +
+          "Bearer bearer-secret eyJabc.def.ghi sk-secret-value " +
+          "access_token=opaque-access refresh_token=opaque-refresh " +
+          "Cookie: opaque-cookie " +
+          "x".repeat(1_000),
+        debug: "context_length_exceeded",
+      },
+      raw: "must-not-appear",
+    }, { status: 400 }));
+
+    const events = await collect(createProvider().stream(request));
+    const terminal = events.at(-1);
+    if (terminal?.type !== "error") {
+      throw new Error("Expected a terminal llama.cpp HTTP error.");
+    }
+
+    expect(terminal.error).toMatchObject({
+      name: "ModelHttpError",
+      status: 400,
+    });
+    expect(terminal.error.message).toContain("ordinary failure");
+    expect(terminal.error.message).not.toContain("must-not-appear");
+    expect(terminal.error.message).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+    for (const secret of secretValues) {
+      expect(terminal.error.message).not.toContain(secret);
+    }
+    expect(terminal.error.message.length).toBeLessThanOrEqual(340);
+  });
+
+  test("sanitizes structured token-endpoint errors without leaking raw fields", async () => {
+    vi.stubGlobal("fetch", async () => Response.json({
+      error: {
+        message:
+          "tokenizer offline refresh_token=token-refresh " +
+          "Cookie: token-cookie",
+      },
+      diagnostics: "token-endpoint-private-diagnostics",
+    }, { status: 503 }));
+
+    const error = await createProvider().countInputTokens(request).then(
+      () => undefined,
+      (cause: unknown) => cause,
+    );
+
+    expect(error).toMatchObject({
+      name: "ModelHttpError",
+      status: 503,
+      message: expect.stringContaining("tokenizer offline"),
+    });
+    expect((error as Error).message).not.toMatch(
+      /token-refresh|token-cookie|token-endpoint-private-diagnostics/,
+    );
+  });
+
+  test("sanitizes structured SSE errors without exposing credentials", async () => {
+    vi.stubGlobal("fetch", async () => sseResponse([
+      {
+        error: {
+          message:
+            "backend\nfailed Bearer stream-secret " +
+            "access_token=stream-access Cookie: stream-cookie",
+          debug: "sse-private-debug",
+        },
+      },
+    ]));
+
+    const events = await collect(createProvider().stream(request));
+    const terminal = events.at(-1);
+    if (terminal?.type !== "error") {
+      throw new Error("Expected a terminal llama.cpp SSE error.");
+    }
+
+    expect(terminal.error).toMatchObject({
+      name: "Error",
+      message: expect.stringContaining("backend failed"),
+    });
+    expect(terminal.error.message).not.toMatch(
+      /stream-secret|stream-access|stream-cookie|sse-private-debug/,
+    );
+    expect(terminal.error.message.length).toBeLessThanOrEqual(340);
   });
 });

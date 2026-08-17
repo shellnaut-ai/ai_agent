@@ -107,6 +107,7 @@ export async function runChat(
         await renderEvents(
           session.streamCompaction({ signal: controller.signal }),
           io,
+          "Compaction cancelled.\n",
         );
       } finally {
         removeEscapeListener();
@@ -229,6 +230,7 @@ export async function runChat(
 async function renderEvents(
   stream: AsyncIterable<ChatEvent>,
   io: ChatIO,
+  abortedMessage = "Turn cancelled.\n",
 ): Promise<void> {
   let assistantLineOpen = false;
   for await (const event of stream) {
@@ -268,7 +270,7 @@ async function renderEvents(
     } else if (event.type === "error") {
       if (assistantLineOpen) io.write("\n");
       assistantLineOpen = false;
-      if (event.reason === "aborted") io.write("Turn cancelled.\n");
+      if (event.reason === "aborted") io.write(abortedMessage);
       else io.writeError(`Error: ${event.error.message}\n`);
     } else if (event.type === "done" && assistantLineOpen) {
       io.write("\n");
