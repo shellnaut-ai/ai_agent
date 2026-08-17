@@ -5,6 +5,19 @@ export interface StreamOptions {
     signal?: AbortSignal;
 }
 
+export interface ModelInputTokenCounter {
+    countInputTokens(
+        request: ModelRequest,
+        options?: StreamOptions,
+    ): Promise<number>;
+}
+
+export function isModelInputTokenCounter(
+    provider: ModelProvider,
+): provider is ModelProvider & ModelInputTokenCounter {
+    return typeof Reflect.get(provider, "countInputTokens") === "function";
+}
+
 export interface ModelProvider{
     // 레지스트리가 프로바이더를 찾을 떄 사용하는 안정적인 식별자, 변경 되면 안됨
     readonly id: ProviderId;

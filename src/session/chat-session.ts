@@ -6,6 +6,7 @@ import {
 } from "../agent/output-continuation.js";
 import { CompactionService } from "../context/compaction.js";
 import type { ContextCoordinator } from "../context/coordinator.js";
+import { isContextOverflowError } from "../model/errors.js";
 import type { Message, Model, UserMessage } from "../model/types.js";
 import type { ToolDefinition } from "../tools/types.js";
 import { InterruptedToolRecoveryError, Session } from "./session.js";
@@ -54,6 +55,62 @@ export class ChatSession {
   public async abandonPendingContinuation(): Promise<void> {
     if (this.turnActive) throw new Error("ChatSession already has an active turn.");
     await this.session.appendContinuationAbandoned();
+  }
+
+  public async *streamCompaction(
+    options?: AgentLoopOptions,
+  ): AsyncIterable<ChatEvent> {
+    if (this.turnActive) {
+      yield {
+        type: "error",
+        reason: "error",
+        error: new Error("ChatSession already has an active turn."),
+      };
+      return;
+    }
+
+    if (this.contextCoordinator?.compact === undefined) {
+      yield {
+        type: "error",
+        reason: "error",
+        error: new Error("Manual compaction is not configured for this session."),
+      };
+      return;
+    }
+
+    this.turnActive = true;
+
+    try {
+      const request = {
+        model: this.model,
+        ...(this.systemPrompt === undefined
+          ? {}
+          : { systemPrompt: this.systemPrompt }),
+        messages: [...this.session.buildActiveMessages()],
+        tools: this.toolDefinitions,
+      };
+
+      for await (const event of this.contextCoordinator.compact(
+        request,
+        "manual",
+        { signal: options?.signal },
+      )) {
+        if (
+          event.type === "compaction-start" ||
+          event.type === "compaction-done"
+        ) {
+          yield event;
+        }
+      }
+    } catch (error: unknown) {
+      yield {
+        type: "error",
+        reason: options?.signal?.aborted ? "aborted" : "error",
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+    } finally {
+      this.turnActive = false;
+    }
   }
 
   public async *streamContinuation(
@@ -247,6 +304,7 @@ export class ChatSession {
       if (preparation) {
         yield {
           type: "compaction-start",
+          reason: "threshold",
           tokensBefore: preparation.tokensBefore,
         };
 
@@ -263,6 +321,7 @@ export class ChatSession {
 
           yield {
             type: "compaction-done",
+            reason: "threshold",
             tokensBefore: result.tokensBefore,
             tokensAfter: result.tokensAfter,
           };
@@ -296,7 +355,113 @@ export class ChatSession {
       messages: [...this.session.buildActiveMessages()],
     };
 
-    yield* this.streamAgent(request, options);
+    yield* this.streamAgentWithOverflowRecovery(request, options);
+  }
+
+  private async *streamAgentWithOverflowRecovery(
+    request: Parameters<AgentLoop["stream"]>[0],
+    options?: AgentLoopOptions,
+  ): AsyncIterable<ChatEvent> {
+    let activeRequest = structuredClone(request);
+    let overflowRecoveryAttempted = false;
+
+    while (true) {
+      let visibleOutputSeen = false;
+      let overflowError: Error | undefined;
+
+      for await (const event of this.streamAgent(activeRequest, options)) {
+        if (
+          event.type === "text-delta" ||
+          event.type === "tool-call" ||
+          event.type === "tool-result" ||
+          event.type === "message-checkpoint"
+        ) {
+          visibleOutputSeen = true;
+        }
+
+        if (
+          event.type === "error" &&
+          isContextOverflowError(event.error)
+        ) {
+          overflowError = event.error;
+          break;
+        }
+
+        yield event;
+
+        if (event.type === "error" || event.type === "done") {
+          return;
+        }
+      }
+
+      if (overflowError === undefined) {
+        return;
+      }
+
+      if (
+        visibleOutputSeen ||
+        overflowRecoveryAttempted ||
+        this.contextCoordinator?.compact === undefined
+      ) {
+        yield {
+          type: "error",
+          reason: "error",
+          error:
+            overflowRecoveryAttempted
+              ? new Error(
+                  "Context overflow recovery failed after one " +
+                    "compact-and-retry attempt. Reduce context or use " +
+                    "a larger model context window.",
+                )
+              : overflowError,
+        };
+        return;
+      }
+
+      overflowRecoveryAttempted = true;
+
+      const recoveryRequest = {
+        model: activeRequest.model,
+        ...(activeRequest.systemPrompt === undefined
+          ? {}
+          : { systemPrompt: activeRequest.systemPrompt }),
+        messages: [...this.session.buildActiveMessages()],
+        tools: this.toolDefinitions,
+        ...(activeRequest.maxOutputTokens === undefined
+          ? {}
+          : { maxOutputTokens: activeRequest.maxOutputTokens }),
+        ...(activeRequest.continuation === undefined
+          ? {}
+          : { continuation: structuredClone(activeRequest.continuation) }),
+      };
+
+      try {
+        for await (const event of this.contextCoordinator.compact(
+          recoveryRequest,
+          "overflow",
+          { signal: options?.signal },
+        )) {
+          if (
+            event.type === "compaction-start" ||
+            event.type === "compaction-done"
+          ) {
+            yield event;
+          }
+        }
+      } catch (error: unknown) {
+        yield {
+          type: "error",
+          reason: options?.signal?.aborted ? "aborted" : "error",
+          error: error instanceof Error ? error : new Error(String(error)),
+        };
+        return;
+      }
+
+      activeRequest = {
+        ...structuredClone(activeRequest),
+        messages: [...this.session.buildActiveMessages()],
+      };
+    }
   }
 
   private async *streamAgent(

@@ -1,25 +1,33 @@
-import type { ContextBudgetCalculator } from "../context/budget.js";
 import type {
+  ContextBudget,
+  ContextBudgetCalculator,
+} from "../context/budget.js";
+import type {
+  CompactionReason,
   ContextCoordinator,
   ContextCoordinatorEvent,
 } from "../context/coordinator.js";
 import type { CompactionService } from "../context/compaction.js";
 import type { ModelRequest, UserMessage } from "../model/types.js";
+import type { ModelInputTokenCounter } from "../model/runtime.js";
 import type { Session } from "./session.js";
 
 export class SessionContextCoordinator implements ContextCoordinator {
   readonly #session: Session;
   readonly #compaction: CompactionService;
   readonly #calculator: ContextBudgetCalculator;
+  readonly #tokenCounter: ModelInputTokenCounter | undefined;
 
   constructor(
     session: Session,
     compaction: CompactionService,
     calculator: ContextBudgetCalculator,
+    tokenCounter?: ModelInputTokenCounter,
   ) {
     this.#session = session;
     this.#compaction = compaction;
     this.#calculator = calculator;
+    this.#tokenCounter = tokenCounter;
   }
 
   async *preparePendingUserMessage(
@@ -34,12 +42,18 @@ export class SessionContextCoordinator implements ContextCoordinator {
       ...structuredClone(request),
       messages: [...sessionMessages, structuredClone(pendingUserMessage)],
     };
-    if (this.#calculator.calculate(pendingRequest).remainingInputTokens >= 0) {
+    if (
+      (await this.#calculateBudget(
+        pendingRequest,
+        options?.signal,
+      )).remainingInputTokens >= 0
+    ) {
       return;
     }
     const preparation = this.#compaction.prepare({
       model: request.model,
       turns: this.#session.buildCompactionTurns(),
+      force: true,
       previousCompaction: this.#session.getPreviousCompaction(),
       pendingUserMessage: structuredClone(pendingUserMessage),
       toolDefinitions: request.tools,
@@ -54,10 +68,13 @@ export class SessionContextCoordinator implements ContextCoordinator {
         : { continuation: structuredClone(request.continuation) }),
     });
     if (preparation === undefined) {
-      this.#calculator.assertFits(pendingRequest);
-      return;
+      throw new Error("Context compaction did not produce a preparation.");
     }
-    yield { type: "compaction-start", tokensBefore: preparation.tokensBefore };
+    yield {
+      type: "compaction-start",
+      reason: "threshold",
+      tokensBefore: preparation.tokensBefore,
+    };
     const result = await this.#compaction.compact(preparation, {
       signal: options?.signal,
     });
@@ -65,16 +82,17 @@ export class SessionContextCoordinator implements ContextCoordinator {
     await this.#session.appendCompaction(result);
     yield {
       type: "compaction-done",
+      reason: "threshold",
       tokensBefore: result.tokensBefore,
       tokensAfter: result.tokensAfter,
     };
-    this.#calculator.assertFits({
+    await this.#assertFits({
       ...structuredClone(request),
       messages: [
         ...this.#session.buildActiveMessages(),
         structuredClone(pendingUserMessage),
       ],
-    });
+    }, options?.signal);
   }
 
   async *prepareModelRequest(
@@ -88,7 +106,10 @@ export class SessionContextCoordinator implements ContextCoordinator {
       ...structuredClone(request),
       messages: sessionMessages,
     };
-    const initialBudget = this.#calculator.calculate(canonicalRequest);
+    const initialBudget = await this.#calculateBudget(
+      canonicalRequest,
+      options?.signal,
+    );
     if (initialBudget.remainingInputTokens >= 0) {
       yield {
         type: "model-input-ready",
@@ -101,6 +122,7 @@ export class SessionContextCoordinator implements ContextCoordinator {
     const preparation = this.#compaction.prepare({
       model: request.model,
       turns: this.#session.buildCompactionTurns(),
+      force: true,
       previousCompaction: this.#session.getPreviousCompaction(),
       toolDefinitions: request.tools,
       ...(request.systemPrompt === undefined
@@ -114,12 +136,12 @@ export class SessionContextCoordinator implements ContextCoordinator {
         : { continuation: structuredClone(request.continuation) }),
     });
     if (preparation === undefined) {
-      this.#calculator.assertFits(canonicalRequest);
-      throw new Error("Unreachable context preparation state.");
+      throw new Error("Context compaction did not produce a preparation.");
     }
 
     yield {
       type: "compaction-start",
+      reason: "threshold",
       tokensBefore: preparation.tokensBefore,
     };
     const result = await this.#compaction.compact(preparation, {
@@ -129,6 +151,7 @@ export class SessionContextCoordinator implements ContextCoordinator {
     await this.#session.appendCompaction(result);
     yield {
       type: "compaction-done",
+      reason: "threshold",
       tokensBefore: result.tokensBefore,
       tokensAfter: result.tokensAfter,
     };
@@ -140,7 +163,7 @@ export class SessionContextCoordinator implements ContextCoordinator {
     yield {
       type: "model-input-ready",
       request: preparedRequest,
-      budget: this.#calculator.assertFits(preparedRequest),
+      budget: await this.#assertFits(preparedRequest, options?.signal),
     };
   }
 
@@ -168,6 +191,7 @@ export class SessionContextCoordinator implements ContextCoordinator {
       const preparation = this.#compaction.prepare({
         model: request.model,
         turns: this.#session.buildCompactionTurns(),
+        force: true,
         previousCompaction: this.#session.getPreviousCompaction(),
         toolDefinitions: request.tools,
         ...(request.systemPrompt === undefined
@@ -181,6 +205,7 @@ export class SessionContextCoordinator implements ContextCoordinator {
       if (preparation !== undefined) {
         yield {
           type: "compaction-start",
+          reason: "threshold",
           tokensBefore: preparation.tokensBefore,
         };
         const result = await this.#compaction.compact(preparation, {
@@ -192,6 +217,7 @@ export class SessionContextCoordinator implements ContextCoordinator {
         await this.#session.appendCompaction(result);
         yield {
           type: "compaction-done",
+          reason: "threshold",
           tokensBefore: result.tokensBefore,
           tokensAfter: result.tokensAfter,
         };
@@ -210,6 +236,119 @@ export class SessionContextCoordinator implements ContextCoordinator {
       budget,
       request: structuredClone(preparedRequest),
     };
+  }
+
+  async *compact(
+    request: ModelRequest,
+    reason: CompactionReason,
+    options?: { readonly signal?: AbortSignal },
+  ): AsyncIterable<ContextCoordinatorEvent> {
+    if (options?.signal?.aborted) {
+      throw new Error("Context preparation aborted.");
+    }
+
+    const sessionMessages = [...this.#session.buildActiveMessages()];
+    assertSynchronizedMessages(request.messages, sessionMessages);
+
+    const preparation = this.#compaction.prepare({
+      model: request.model,
+      turns: this.#session.buildCompactionTurns(),
+      force: true,
+      previousCompaction: this.#session.getPreviousCompaction(),
+      toolDefinitions: request.tools,
+      ...(request.systemPrompt === undefined
+        ? {}
+        : { systemPrompt: request.systemPrompt }),
+      ...(request.maxOutputTokens === undefined
+        ? {}
+        : { maxOutputTokens: request.maxOutputTokens }),
+      ...(request.continuation === undefined
+        ? {}
+        : { continuation: structuredClone(request.continuation) }),
+    });
+
+    if (preparation === undefined) {
+      throw new Error("Context compaction did not produce a preparation.");
+    }
+
+    yield {
+      type: "compaction-start",
+      reason,
+      tokensBefore: preparation.tokensBefore,
+    };
+
+    const result = await this.#compaction.compact(preparation, {
+      signal: options?.signal,
+    });
+
+    if (options?.signal?.aborted) {
+      throw new Error("Context preparation aborted.");
+    }
+
+    await this.#session.appendCompaction(result);
+
+    yield {
+      type: "compaction-done",
+      reason,
+      tokensBefore: result.tokensBefore,
+      tokensAfter: result.tokensAfter,
+    };
+
+    await this.#assertFits({
+      ...structuredClone(request),
+      messages: [...this.#session.buildActiveMessages()],
+    }, options?.signal);
+  }
+
+  async #calculateBudget(
+    request: ModelRequest,
+    signal?: AbortSignal,
+  ): Promise<ContextBudget> {
+    const estimated = this.#calculator.calculate(request);
+
+    if (this.#tokenCounter === undefined) {
+      return estimated;
+    }
+
+    try {
+      const inputTokens = await this.#tokenCounter.countInputTokens(
+        request,
+        { signal },
+      );
+
+      return inputTokens === undefined
+        ? estimated
+        : this.#calculator.calculateWithInputTokens(
+            request,
+            inputTokens,
+          );
+    } catch (error: unknown) {
+      if (signal?.aborted) {
+        throw error;
+      }
+
+      return estimated;
+    }
+  }
+
+  async #assertFits(
+    request: ModelRequest,
+    signal?: AbortSignal,
+  ): Promise<ContextBudget> {
+    const budget = await this.#calculateBudget(request, signal);
+
+    if (budget.remainingInputTokens < 0) {
+      const excess = Math.abs(budget.remainingInputTokens);
+      throw new Error(
+        "Model input exceeds the calculated context budget by " +
+          excess +
+          " token" +
+          (excess === 1 ? "" : "s") +
+          ".",
+      );
+    }
+
+    return budget;
   }
 }
 

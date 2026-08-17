@@ -113,6 +113,25 @@ export class ContextBudgetCalculator {
     };
   }
 
+  calculateWithInputTokens(
+    request: ModelRequest,
+    inputTokens: number,
+  ): ContextBudget {
+    if (!Number.isInteger(inputTokens) || inputTokens < 0) {
+      throw new Error(
+        "Input token counter must return a non-negative integer.",
+      );
+    }
+
+    const budget = this.calculate(request);
+
+    return {
+      ...budget,
+      estimatedInputTokens: inputTokens,
+      remainingInputTokens: budget.inputBudget - inputTokens,
+    };
+  }
+
   assertFits(request: ModelRequest): ContextBudget {
     const budget = this.calculate(request);
     if (budget.remainingInputTokens < 0) {
@@ -120,6 +139,24 @@ export class ContextBudgetCalculator {
         `Model input exceeds the calculated context budget by ` +
           `${Math.abs(budget.remainingInputTokens)} token` +
           `${budget.remainingInputTokens === -1 ? "" : "s"}.`,
+      );
+    }
+    return budget;
+  }
+
+  assertFitsWithInputTokens(
+    request: ModelRequest,
+    inputTokens: number,
+  ): ContextBudget {
+    const budget = this.calculateWithInputTokens(request, inputTokens);
+    if (budget.remainingInputTokens < 0) {
+      const excess = Math.abs(budget.remainingInputTokens);
+      throw new Error(
+        "Model input exceeds the calculated context budget by " +
+          excess +
+          " token" +
+          (excess === 1 ? "" : "s") +
+          ".",
       );
     }
     return budget;

@@ -116,6 +116,70 @@ function assertCompleteToolPairs(turns: readonly CompactionTurn[]): void {
   }
 }
 
+function hasCompleteToolPairs(messages: readonly Message[]): boolean {
+  const pending = new Set<string>();
+
+  for (const message of messages) {
+    if (message.role === "assistant") {
+      for (const call of message.toolCalls) {
+        if (pending.has(call.id)) return false;
+        pending.add(call.id);
+      }
+      continue;
+    }
+
+    if (message.role === "tool" && !pending.delete(message.toolCallId)) {
+      return false;
+    }
+  }
+
+  return pending.size === 0;
+}
+
+function splitOversizedTurn(
+  turn: CompactionTurn,
+  keepRecentTokens: number,
+  estimator: TokenEstimator,
+): {
+  readonly summarized: CompactionTurn;
+  readonly kept: CompactionTurn;
+} | undefined {
+  const entryIds = turn.messageEntryIds;
+
+  if (entryIds === undefined || entryIds.length !== turn.messages.length) {
+    return undefined;
+  }
+
+  for (let index = 1; index < turn.messages.length; index += 1) {
+    const firstKeptMessage = turn.messages[index];
+    const summarizedMessages = turn.messages.slice(0, index);
+    const keptMessages = turn.messages.slice(index);
+
+    if (
+      firstKeptMessage.role === "tool" ||
+      !hasCompleteToolPairs(summarizedMessages) ||
+      estimator.estimateMessages(keptMessages) > keepRecentTokens
+    ) {
+      continue;
+    }
+
+    return {
+      summarized: {
+        firstEntryId: turn.firstEntryId,
+        messages: summarizedMessages,
+        messageEntryIds: entryIds.slice(0, index),
+      },
+      kept: {
+        firstEntryId: entryIds[index],
+        messages: keptMessages,
+        messageEntryIds: entryIds.slice(index),
+      },
+    };
+  }
+
+  return undefined;
+}
+
 export class CompactionService {
   private readonly runner: ModelStreamRunner;
   private readonly settings: CompactionSettings;
@@ -217,23 +281,41 @@ export class CompactionService {
     const tokensBefore = budget.estimatedInputTokens;
     const inputBudget = budget.inputBudget;
 
-    if (tokensBefore <= inputBudget) {
+    if (tokensBefore <= inputBudget && request.force !== true) {
       return undefined;
     }
 
-    if (activeTurns.length < 2) {
+    if (activeTurns.length === 0) {
       throw new Error(
-        "The active context is too large and has no complete old turn " +
-          "that can be compacted.",
+        "The active context is too large and has no messages to compact.",
       );
     }
 
     const keptTurns: CompactionTurn[] = [];
     let keptTokens = 0;
+    let turnsToSummarize: CompactionTurn[] | undefined;
 
     for (let index = activeTurns.length - 1; index >= 0; index -= 1) {
       const turn = activeTurns[index];
       const turnTokens = this.estimator.estimateMessages(turn.messages);
+
+      if (keptTurns.length === 0 && turnTokens > this.settings.keepRecentTokens) {
+        const split = splitOversizedTurn(
+          turn,
+          this.settings.keepRecentTokens,
+          this.estimator,
+        );
+
+        if (split === undefined) {
+          throw new Error(
+            "A single message is too large to fit in the model context.",
+          );
+        }
+
+        keptTurns.unshift(split.kept);
+        turnsToSummarize = [...activeTurns.slice(0, index), split.summarized];
+        break;
+      }
 
       if (
         keptTurns.length > 0 &&
@@ -252,10 +334,12 @@ export class CompactionService {
       throw new Error("Compaction could not select a recent turn to keep.");
     }
 
-    const firstKeptPosition = activeTurns.findIndex(
-      (turn) => turn.firstEntryId === firstKeptTurn.firstEntryId,
+    turnsToSummarize ??= activeTurns.slice(
+      0,
+      activeTurns.findIndex(
+        (turn) => turn.firstEntryId === firstKeptTurn.firstEntryId,
+      ),
     );
-    const turnsToSummarize = activeTurns.slice(0, firstKeptPosition);
 
     if (turnsToSummarize.length === 0) {
       throw new Error(

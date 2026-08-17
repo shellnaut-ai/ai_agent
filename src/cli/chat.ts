@@ -9,6 +9,7 @@ export interface ChatSessionLike {
   ): AsyncIterable<ChatEvent>;
   getPendingContinuation?(): AssistantContinuationSegment | undefined;
   streamContinuation?(options?: AgentLoopOptions): AsyncIterable<ChatEvent>;
+  streamCompaction?(options?: AgentLoopOptions): AsyncIterable<ChatEvent>;
   abandonPendingContinuation?(): Promise<void>;
 }
 
@@ -59,7 +60,7 @@ export async function runChat(
         const removeEscapeListener = io.onEscape(cancelContinuation);
         const removeInterruptListener = io.onInterrupt(cancelContinuation);
         try {
-          await renderContinuation(
+          await renderEvents(
             session.streamContinuation({ signal: controller.signal }),
             io,
           );
@@ -87,6 +88,34 @@ export async function runChat(
       return;
     }
 
+    if (content === "/compact") {
+      if (session.streamCompaction === undefined) {
+        io.writeError("Error: this session cannot compact context.\n");
+        continue;
+      }
+
+      const controller = new AbortController();
+      const cancelCompaction = (): void => {
+        if (controller.signal.aborted) return;
+        io.write("\nCancelling compaction...\n");
+        controller.abort();
+      };
+      const removeEscapeListener = io.onEscape(cancelCompaction);
+      const removeInterruptListener = io.onInterrupt(cancelCompaction);
+
+      try {
+        await renderEvents(
+          session.streamCompaction({ signal: controller.signal }),
+          io,
+        );
+      } finally {
+        removeEscapeListener();
+        removeInterruptListener();
+      }
+
+      continue;
+    }
+
     let assistantLineOpen = false;
     const controller = new AbortController();
 
@@ -107,14 +136,19 @@ export async function runChat(
       })) {
         if (event.type === "compaction-start") {
           io.write(
-            `[Compaction] Summarizing ${event.tokensBefore} tokens...\n`,
+            "[Compaction: " + event.reason + "] Summarizing " +
+              event.tokensBefore +
+              " tokens...\n",
           );
         }
 
         if (event.type === "compaction-done") {
           io.write(
-            `[Compaction] Context reduced from ` +
-              `${event.tokensBefore} to ${event.tokensAfter} tokens.\n`,
+            "[Compaction: " + event.reason + "] Context reduced from " +
+              event.tokensBefore +
+              " to " +
+              event.tokensAfter +
+              " tokens.\n",
           );
         }
 
@@ -192,7 +226,7 @@ export async function runChat(
   }
 }
 
-async function renderContinuation(
+async function renderEvents(
   stream: AsyncIterable<ChatEvent>,
   io: ChatIO,
 ): Promise<void> {
@@ -205,11 +239,18 @@ async function renderContinuation(
       }
       io.write(event.delta);
     } else if (event.type === "compaction-start") {
-      io.write(`[Compaction] Summarizing ${event.tokensBefore} tokens...\n`);
+      io.write(
+        "[Compaction: " + event.reason + "] Summarizing " +
+          event.tokensBefore +
+          " tokens...\n",
+      );
     } else if (event.type === "compaction-done") {
       io.write(
-        `[Compaction] Context reduced from ${event.tokensBefore} ` +
-          `to ${event.tokensAfter} tokens.\n`,
+        "[Compaction: " + event.reason + "] Context reduced from " +
+          event.tokensBefore +
+          " to " +
+          event.tokensAfter +
+          " tokens.\n",
       );
     } else if (event.type === "retry") {
       if (assistantLineOpen) io.write("\n");

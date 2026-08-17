@@ -108,6 +108,7 @@ async function main(): Promise<void> {
       session,
       compactionService,
       new ContextBudgetCalculator(new TokenEstimator(2)),
+      retryingRuntime,
     );
     const agentLoop = new AgentLoop(
       retryingRuntime,
