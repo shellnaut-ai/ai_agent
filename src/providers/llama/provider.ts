@@ -71,8 +71,15 @@ function readErrorMessage(value: Record<string, unknown>): string | undefined {
   return sanitizeErrorMessage(rawMessage);
 }
 
+function redactCookieHeaderValues(message: string): string {
+  return message.replace(
+    /(^|[\r\n])([ \t]*(?:set-cookie|cookie)[ \t]*:)[^\r\n]*/giu,
+    "$1$2 [REDACTED]",
+  );
+}
+
 function sanitizeErrorMessage(message: string): string {
-  const normalized = message
+  const normalized = redactCookieHeaderValues(message)
     .replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " ")
     .replace(/\s+/gu, " ")
     .trim()

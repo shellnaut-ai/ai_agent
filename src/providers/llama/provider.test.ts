@@ -256,4 +256,60 @@ describe("LlamaProvider", () => {
     );
     expect(terminal.error.message.length).toBeLessThanOrEqual(340);
   });
+
+  test("redacts complete multi-cookie Cookie headers without consuming later lines", async () => {
+    vi.stubGlobal("fetch", async () => Response.json({
+      error: {
+        message:
+          "request failed\r\n" +
+          "Cookie: sid=http-cookie-one; auth=http-cookie-two\r\n" +
+          "safe detail after cookie\n" +
+          "Cookie: prefs=http-cookie-three; flags=http-cookie-four\n" +
+          "safe final detail",
+      },
+      diagnostics: "cookie-private-diagnostics",
+    }, { status: 400 }));
+
+    const events = await collect(createProvider().stream(request));
+    const terminal = events.at(-1);
+    if (terminal?.type !== "error") {
+      throw new Error("Expected a terminal llama.cpp Cookie error.");
+    }
+
+    expect(terminal.error).toMatchObject({
+      name: "ModelHttpError",
+      status: 400,
+    });
+    expect(terminal.error.message).toContain("request failed");
+    expect(terminal.error.message).toContain("safe detail after cookie");
+    expect(terminal.error.message).toContain("safe final detail");
+    expect(terminal.error.message).not.toMatch(
+      /http-cookie-one|http-cookie-two|http-cookie-three|http-cookie-four|cookie-private-diagnostics/,
+    );
+  });
+
+  test("redacts complete Set-Cookie values and attributes at SSE line boundaries", async () => {
+    vi.stubGlobal("fetch", async () => sseResponse([{
+      error: {
+        message:
+          "stream failed\n" +
+          "Set-Cookie: sid=sse-cookie-one; Path=/private; HttpOnly\r\n" +
+          "Set-Cookie: auth=sse-cookie-two; SameSite=None; Secure\n" +
+          "safe detail after set-cookie",
+        raw: "set-cookie-private-debug",
+      },
+    }]));
+
+    const events = await collect(createProvider().stream(request));
+    const terminal = events.at(-1);
+    if (terminal?.type !== "error") {
+      throw new Error("Expected a terminal llama.cpp Set-Cookie error.");
+    }
+
+    expect(terminal.error.message).toContain("stream failed");
+    expect(terminal.error.message).toContain("safe detail after set-cookie");
+    expect(terminal.error.message).not.toMatch(
+      /sse-cookie-one|sse-cookie-two|Path=\/private|HttpOnly|SameSite=None|Secure|set-cookie-private-debug/,
+    );
+  });
 });
