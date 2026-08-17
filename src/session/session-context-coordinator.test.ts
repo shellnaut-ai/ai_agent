@@ -261,4 +261,133 @@ describe("SessionContextCoordinator", () => {
     expect(store.getEntries().some((entry) => entry.type === "compaction"))
       .toBe(true);
   }, 15_000);
+
+  test("uses exact provider input tokens before estimator compaction", async () => {
+    const fixture = await createCountingFixture("coordinator-exact-count");
+    let counterCalls = 0;
+    const counter = {
+      async countInputTokens(): Promise<number | undefined> {
+        counterCalls += 1;
+        return counterCalls === 1 ? 9_000 : undefined;
+      },
+    };
+    const coordinator = new SessionContextCoordinator(
+      fixture.session,
+      fixture.compaction,
+      fixture.calculator,
+      counter,
+    );
+
+    const events = await collect(
+      coordinator.prepareModelRequest(fixture.request),
+    );
+
+    expect(counterCalls).toBe(2);
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "compaction-start",
+        reason: "threshold",
+      }),
+    ]));
+    expect(events.at(-1)).toMatchObject({ type: "model-input-ready" });
+  }, 15_000);
+
+  test("falls back to estimated tokens when optional counting fails", async () => {
+    const fixture = await createCountingFixture("coordinator-count-fallback");
+    let counterCalls = 0;
+    const counter = {
+      async countInputTokens(): Promise<number> {
+        counterCalls += 1;
+        throw new Error("offline");
+      },
+    };
+    const coordinator = new SessionContextCoordinator(
+      fixture.session,
+      fixture.compaction,
+      fixture.calculator,
+      counter,
+    );
+
+    const events = await collect(
+      coordinator.prepareModelRequest(fixture.request),
+    );
+
+    expect(counterCalls).toBe(1);
+    expect(events).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: "model-input-ready" });
+  });
+
+  test("does not hide an aborted token-count request", async () => {
+    const fixture = await createCountingFixture("coordinator-count-abort");
+    const controller = new AbortController();
+    let counterCalls = 0;
+    const counter = {
+      async countInputTokens(): Promise<number> {
+        counterCalls += 1;
+        controller.abort();
+        throw new Error("token count aborted");
+      },
+    };
+    const coordinator = new SessionContextCoordinator(
+      fixture.session,
+      fixture.compaction,
+      fixture.calculator,
+      counter,
+    );
+
+    await expect(collect(coordinator.prepareModelRequest(fixture.request, {
+      signal: controller.signal,
+    }))).rejects.toThrow("token count aborted");
+    expect(counterCalls).toBe(1);
+  });
 });
+
+async function createCountingFixture(sessionId: string): Promise<{
+  session: Session;
+  compaction: CompactionService;
+  calculator: ContextBudgetCalculator;
+  request: ModelRequest;
+}> {
+  const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-context-count-"));
+  cleanup.push(rootDir);
+  const model = {
+    id: "fake-model",
+    name: "Fake",
+    provider: "fake" as const,
+    contextWindow: 4_000,
+    maxOutputTokens: 100,
+  };
+  const store = new JsonlSessionStore({ rootDir, sessionId, model });
+  await store.load();
+  const session = new Session(store);
+  for (let index = 0; index < 2; index += 1) {
+    await session.appendMessages([
+      { role: "user", content: `${index}:${"q".repeat(150)}` },
+      { role: "assistant", content: "a".repeat(150), toolCalls: [] },
+    ]);
+  }
+  const compaction = new CompactionService({
+    async *stream(): AsyncIterable<StreamEvent> {
+      yield { type: "text-delta", delta: "stable summary" };
+      yield { type: "done", reason: "stop" };
+    },
+  }, {
+    reserveTokens: 100,
+    keepRecentTokens: 450,
+    charsPerToken: 1,
+    maxSummaryOutputTokens: 100,
+    toolResultMaxChars: 1_000,
+  });
+  const calculator = new ContextBudgetCalculator(new TokenEstimator(1));
+
+  return {
+    session,
+    compaction,
+    calculator,
+    request: {
+      model,
+      messages: [...session.buildActiveMessages()],
+      tools: [],
+    },
+  };
+}

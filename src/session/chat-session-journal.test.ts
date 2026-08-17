@@ -7,6 +7,11 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import { AgentLoop } from "../agent/loop.js";
 import { continuationTailHash } from "../agent/output-continuation.js";
+import type {
+  CompactionReason,
+  ContextCoordinator,
+  ContextCoordinatorEvent,
+} from "../context/coordinator.js";
 import type { ModelStreamRunner } from "../model/runtime.js";
 import type {
   Message,
@@ -795,7 +800,141 @@ describe("ChatSession incremental journal", () => {
     });
     expect(providerCalls).toBe(1);
   });
+
+  test("compacts and retries one overflow before visible output", async () => {
+    const fixture = await createOverflowFixture("overflow-recovery", "recover");
+
+    const events = await collect(fixture.chat.streamTurn("hello"));
+
+    expect(fixture.getAgentCalls()).toBe(2);
+    expect(fixture.compactReasons).toEqual(["overflow"]);
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "compaction-start",
+        reason: "overflow",
+      }),
+      expect.objectContaining({ type: "done" }),
+    ]));
+  });
+
+  test("does not retry overflow after visible output", async () => {
+    const fixture = await createOverflowFixture(
+      "visible-overflow",
+      "visible",
+    );
+
+    const events = await collect(fixture.chat.streamTurn("hello"));
+
+    expect(fixture.getAgentCalls()).toBe(1);
+    expect(fixture.compactReasons).toEqual([]);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { name: "ContextOverflowError" },
+    });
+  });
+
+  test("stops after one compact-and-retry", async () => {
+    const fixture = await createOverflowFixture(
+      "repeated-overflow",
+      "always-overflow",
+    );
+
+    const events = await collect(fixture.chat.streamTurn("hello"));
+
+    expect(fixture.getAgentCalls()).toBe(2);
+    expect(fixture.compactReasons).toEqual(["overflow"]);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: {
+        message: expect.stringMatching(/one.*compact-and-retry/i),
+      },
+    });
+  });
 });
+
+async function createOverflowFixture(
+  sessionId: string,
+  behavior: "recover" | "visible" | "always-overflow",
+): Promise<{
+  chat: ChatSession;
+  compactReasons: CompactionReason[];
+  getAgentCalls(): number;
+}> {
+  const { store } = await createStore(sessionId);
+  let agentCalls = 0;
+  const runner: ModelStreamRunner = {
+    async *stream(): AsyncIterable<StreamEvent> {
+      agentCalls += 1;
+
+      if (behavior === "recover" && agentCalls > 1) {
+        yield { type: "text-delta", delta: "recovered answer" };
+        yield { type: "done", reason: "stop" };
+        return;
+      }
+
+      if (behavior === "visible") {
+        yield { type: "text-delta", delta: "visible partial" };
+      }
+
+      yield {
+        type: "error",
+        reason: "error",
+        error: await createContextOverflowError(),
+      };
+    },
+  };
+  const compactReasons: CompactionReason[] = [];
+  const coordinator: ContextCoordinator = {
+    async *prepareModelRequest(): AsyncIterable<never> {
+      throw new Error("prepareModelRequest must not run in this fixture");
+    },
+    async *reserveToolResult(): AsyncIterable<never> {
+      throw new Error("reserveToolResult must not run in this fixture");
+    },
+    async *compact(_request, reason): AsyncIterable<ContextCoordinatorEvent> {
+      compactReasons.push(reason);
+      yield {
+        type: "compaction-start",
+        reason,
+        tokensBefore: 200,
+      };
+      yield {
+        type: "compaction-done",
+        reason,
+        tokensBefore: 200,
+        tokensAfter: 80,
+      };
+    },
+  };
+
+  return {
+    chat: new ChatSession(
+      new AgentLoop(runner, new ToolRegistry()),
+      model,
+      {
+        session: new Session(store),
+        contextCoordinator: coordinator,
+      },
+    ),
+    compactReasons,
+    getAgentCalls: () => agentCalls,
+  };
+}
+
+async function createContextOverflowError(): Promise<Error> {
+  const errorModule = await import("../model/errors.js") as {
+    ContextOverflowError?: new (message: string) => Error;
+  };
+  const ContextOverflowError = errorModule.ContextOverflowError;
+
+  if (ContextOverflowError !== undefined) {
+    return new ContextOverflowError("context_length_exceeded");
+  }
+
+  const fallback = new Error("context_length_exceeded");
+  fallback.name = "ContextOverflowError";
+  return fallback;
+}
 
 class FailingJsonlSessionStore extends JsonlSessionStore {
   private failure:

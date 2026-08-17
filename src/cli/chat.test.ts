@@ -2,7 +2,11 @@ import { describe, expect, test } from "vitest";
 
 import type { AgentLoopOptions } from "../agent/types.js";
 import type { ChatEvent } from "../session/types.js";
-import { runChat, type ChatSessionLike } from "./chat.js";
+import {
+  runChat,
+  type ChatIO,
+  type ChatSessionLike,
+} from "./chat.js";
 
 describe("runChat", () => {
   test("prompts to abandon a non-resumable partial before reading a new turn", async () => {
@@ -216,4 +220,49 @@ describe("runChat", () => {
     expect(output.join("")).toContain("Cancelling current turn");
     expect(output.join("")).toContain("Turn cancelled");
   });
+
+  test("routes /compact without appending a user turn", async () => {
+    const calls: string[] = [];
+    const session: ChatSessionLike = {
+      async *streamTurn(content): AsyncIterable<ChatEvent> {
+        calls.push(`turn:${content}`);
+      },
+      async *streamCompaction(): AsyncIterable<ChatEvent> {
+        calls.push("compact");
+        yield {
+          type: "compaction-start",
+          reason: "manual",
+          tokensBefore: 200,
+        };
+        yield {
+          type: "compaction-done",
+          reason: "manual",
+          tokensBefore: 200,
+          tokensAfter: 80,
+        };
+      },
+    };
+
+    await runChat(session, scriptedIo(["/compact", "/exit"]));
+
+    expect(calls).toEqual(["compact"]);
+  });
 });
+
+function scriptedIo(inputs: string[]): ChatIO {
+  const remaining = [...inputs];
+
+  return {
+    async question(): Promise<string | undefined> {
+      return remaining.shift();
+    },
+    write(): void {},
+    writeError(): void {},
+    onEscape(): () => void {
+      return () => undefined;
+    },
+    onInterrupt(): () => void {
+      return () => undefined;
+    },
+  };
+}

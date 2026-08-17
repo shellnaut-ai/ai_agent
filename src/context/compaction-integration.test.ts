@@ -148,6 +148,109 @@ describe("CompactionService integration", () => {
     })).toThrow(/incomplete tool call.*call-1/i);
   });
 
+  test("splits an oversized turn only after a complete tool pair", () => {
+    const service = new CompactionService({
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: "done", reason: "stop" };
+      },
+    }, {
+      reserveTokens: 100,
+      keepRecentTokens: 100,
+      charsPerToken: 1,
+      maxSummaryOutputTokens: 100,
+      toolResultMaxChars: 100,
+    });
+    const call = {
+      id: "call-1",
+      name: "read",
+      arguments: { path: "old.txt" },
+    };
+
+    const preparation = service.prepare({
+      model: {
+        id: "fake-model",
+        name: "Fake",
+        provider: "fake",
+        contextWindow: 4_000,
+        maxOutputTokens: 100,
+      },
+      turns: [{
+        firstEntryId: "user-1",
+        messageEntryIds: [
+          "user-1",
+          "assistant-call",
+          "tool-1",
+          "assistant-final",
+        ],
+        messages: [
+          { role: "user", content: "old request" },
+          { role: "assistant", content: "", toolCalls: [call] },
+          {
+            role: "tool",
+            toolCallId: call.id,
+            content: "r".repeat(200),
+            isError: false,
+          },
+          { role: "assistant", content: "recent answer", toolCalls: [] },
+        ],
+      }],
+      force: true,
+      toolDefinitions: [],
+    });
+
+    expect(preparation?.firstKeptEntryId).toBe("assistant-final");
+    expect(preparation?.keptTurns[0]?.messages[0]?.role).toBe("assistant");
+  });
+
+  test("never starts a compacted suffix with a tool result", () => {
+    const service = new CompactionService({
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: "done", reason: "stop" };
+      },
+    }, {
+      reserveTokens: 100,
+      keepRecentTokens: 120,
+      charsPerToken: 1,
+      maxSummaryOutputTokens: 100,
+      toolResultMaxChars: 100,
+    });
+    const call = {
+      id: "call-1",
+      name: "read",
+      arguments: { path: "old.txt" },
+    };
+
+    expect(() => service.prepare({
+      model: {
+        id: "fake-model",
+        name: "Fake",
+        provider: "fake",
+        contextWindow: 4_000,
+        maxOutputTokens: 100,
+      },
+      turns: [{
+        firstEntryId: "user-1",
+        messageEntryIds: ["user-1", "assistant-call", "tool-1"],
+        messages: [
+          { role: "user", content: "old request" },
+          {
+            role: "assistant",
+            content: "x".repeat(100),
+            toolCalls: [call],
+          },
+          {
+            role: "tool",
+            toolCallId: call.id,
+            content: "result",
+            isError: false,
+          },
+        ],
+      }],
+      force: true,
+      toolDefinitions: [],
+    })).toThrow("single message is too large");
+  });
+
   test("summarizes oversized evicted history in complete-turn batches", async () => {
     const requests: ModelRequest[] = [];
     const runner: ModelStreamRunner = {
