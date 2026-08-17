@@ -423,10 +423,7 @@ async function safeHttpErrorDetail(response: Response): Promise<string | undefin
   if (!isRecord(parsed)) return undefined;
 
   const nested = parsed.error;
-  const detail = isRecord(nested)
-    ? firstExternalErrorString(nested, ["message", "type", "code", "param"])
-    : firstExternalErrorString(parsed, ["message", "detail"]);
-  return detail === undefined ? undefined : sanitizeExternalError(detail);
+  return isRecord(nested) ? structuredHttpErrorDetail(nested) : undefined;
 }
 
 const MAX_HTTP_ERROR_BODY_BYTES = 4_096;
@@ -483,27 +480,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function firstExternalErrorString(
+function structuredHttpErrorDetail(
   fields: Record<string, unknown>,
-  allowedKeys: readonly string[],
 ): string | undefined {
-  for (const key of allowedKeys) {
+  const parts: string[] = [];
+  for (const key of ["type", "code", "param"] as const) {
     const value = fields[key];
-    if (typeof value === "string" && value.trim().length > 0) return value;
+    if (
+      typeof value === "string" &&
+      /^[A-Za-z][A-Za-z0-9_.-]{0,99}$/u.test(value)
+    ) {
+      parts.push(`${key}=${value}`);
+    }
   }
-  return undefined;
-}
-
-function sanitizeExternalError(value: string): string | undefined {
-  const sanitized = value
-    .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
-    .replace(/\beyJ[A-Za-z0-9._-]+/g, "[REDACTED_JWT]")
-    .replace(/\bsk-[A-Za-z0-9_-]+/g, "[REDACTED_KEY]")
-    .replace(/[\u0000-\u001f\u007f]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 300);
-  return sanitized.length === 0 ? undefined : sanitized;
+  return parts.length === 0 ? undefined : parts.join(", ");
 }
 
 function codexResponsesEndpoint(baseUrl: string): string {

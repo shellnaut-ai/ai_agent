@@ -192,15 +192,50 @@ describe("OpenAICodexProvider", () => {
         name: "ModelHttpError",
         status: 400,
         retryable: false,
-        message: expect.stringContaining("Unsupported parameter"),
+        message: expect.stringContaining("unsupported_parameter"),
       },
     });
     if (terminal?.type !== "error") throw new Error("Expected provider error");
     expect(terminal.error.message).toContain("max_output_tokens");
+    expect(terminal.error.message).not.toContain("Unsupported parameter");
     expect(terminal.error.message).not.toMatch(
       /[\r\n]|secret-value|eyJabc|sk-secret/,
     );
     expect(terminal.error.message.length).toBeLessThanOrEqual(360);
+  });
+
+  test("does not expose arbitrary credentials quoted by an HTTP error", async () => {
+    const provider = new OpenAICodexProvider({
+      model,
+      resolver: { resolve: async () => credential },
+      fetch: async () => Response.json({
+        error: {
+          type: "invalid_request_error",
+          code: "bad_request",
+          param: "input",
+          message:
+            "access_token=opaque-access refresh_token=opaque-refresh " +
+            "Cookie: session=opaque-cookie account_id=private-account",
+        },
+      }, { status: 400 }),
+    });
+
+    const events = await collect(provider.stream(request()));
+    const terminal = events.at(-1);
+
+    expect(terminal).toMatchObject({
+      type: "error",
+      error: {
+        name: "ModelHttpError",
+        status: 400,
+        retryable: false,
+        message: expect.stringContaining("bad_request"),
+      },
+    });
+    if (terminal?.type !== "error") throw new Error("Expected provider error");
+    expect(terminal.error.message).not.toMatch(
+      /opaque-access|opaque-refresh|opaque-cookie|private-account/,
+    );
   });
 
   test("falls back to status only for an oversized HTTP error body", async () => {

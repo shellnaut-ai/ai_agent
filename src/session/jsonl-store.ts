@@ -31,6 +31,7 @@ import type {
   SessionHeaderRecord,
   SessionStore,
 } from "./types.js";
+import { assertValidSessionId } from "./session-id.js";
 import {
   SessionWriterLockCompromisedError,
   withSessionWriterLock,
@@ -613,12 +614,7 @@ export class JsonlSessionStore implements SessionStore {
   private poisonError: Error | undefined;
 
   constructor(options: JsonlSessionStoreOptions) {
-    if (!/^[A-Za-z0-9_-]{1,100}$/.test(options.sessionId)) {
-      throw new Error(
-        "Session ID may contain only letters, numbers, underscores, " +
-          "and hyphens.",
-      );
-    }
+    assertValidSessionId(options.sessionId);
 
     this.sessionId = options.sessionId;
     this.model = options.model;

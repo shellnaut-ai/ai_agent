@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 
 import { AgentLoop } from "../agent/loop.js";
 import { FileOAuthStore } from "../auth/file-oauth-store.js";
@@ -22,6 +24,7 @@ import { OpenAICompatibleProvider } from "../providers/openai-compatible-provide
 import { LlamaProvider } from "../providers/llama/provider.js";
 import { ChatSession } from "../session/chat-session.js";
 import { JsonlSessionStore } from "../session/jsonl-store.js";
+import { assertValidSessionId } from "../session/session-id.js";
 import { Session } from "../session/session.js";
 import { SessionContextCoordinator } from "../session/session-context-coordinator.js";
 import { BashTool } from "../tools/bash.js";
@@ -43,6 +46,7 @@ export interface ChatOptions {
   readonly provider: ChatProvider;
   readonly model: string;
   readonly sessionId?: string;
+  readonly resumeModelFromSession?: boolean;
 }
 
 const defaultModels: Record<ChatProvider, string> = {
@@ -62,11 +66,62 @@ export function parseChatOptions(args: readonly string[]): ChatOptions {
   }
 
   const sessionId = parseSessionId(args);
+  const explicitModel = optionValue(args, "--model");
   return {
     provider: rawProvider,
-    model: optionValue(args, "--model") ?? defaultModels[rawProvider],
+    model: explicitModel ?? defaultModels[rawProvider],
     ...(sessionId === undefined ? {} : { sessionId }),
+    ...(sessionId !== undefined && explicitModel === undefined
+      ? { resumeModelFromSession: true }
+      : {}),
   };
+}
+
+export async function resolveChatModel(
+  options: ChatOptions,
+  rootDir: string,
+): Promise<string> {
+  if (!options.resumeModelFromSession || options.sessionId === undefined) {
+    return options.model;
+  }
+
+  assertValidSessionId(options.sessionId);
+  const filePath = resolve(rootDir, "sessions", `${options.sessionId}.jsonl`);
+  let content: string;
+  try {
+    content = await readFile(filePath, "utf8");
+  } catch (error: unknown) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "ENOENT"
+    ) {
+      return options.model;
+    }
+    throw error;
+  }
+
+  const firstLine = content.split(/\r?\n/u).find((line) => line.trim() !== "");
+  if (firstLine === undefined) return options.model;
+  try {
+    const header = JSON.parse(firstLine) as unknown;
+    if (
+      typeof header === "object" &&
+      header !== null &&
+      "model" in header &&
+      typeof header.model === "object" &&
+      header.model !== null &&
+      "id" in header.model &&
+      typeof header.model.id === "string" &&
+      header.model.id.length > 0
+    ) {
+      return header.model.id;
+    }
+  } catch {
+    // JsonlSessionStore reports the authoritative header error during load.
+  }
+  return options.model;
 }
 
 export async function main(args: readonly string[]): Promise<number> {
@@ -126,7 +181,8 @@ async function runConfiguredChat(
   oauth: OpenAICodexOAuth,
 ): Promise<void> {
   const registry = new ProviderRegistry();
-  const model = createModel(options.provider, options.model);
+  const modelId = await resolveChatModel(options, process.cwd());
+  const model = createModel(options.provider, modelId);
 
   if (options.provider === "llama") {
     registry.register(new LlamaProvider({
@@ -154,10 +210,10 @@ async function runConfiguredChat(
     }));
   }
 
-  const resolved = await registry.resolveModel(options.provider, options.model);
+  const resolved = await registry.resolveModel(options.provider, modelId);
   if (resolved === undefined) {
     throw new Error(
-      `Model "${options.model}" was not found for "${options.provider}".`,
+      `Model "${modelId}" was not found for "${options.provider}".`,
     );
   }
 
@@ -207,7 +263,7 @@ async function runConfiguredChat(
   });
 
   cli.write(`Provider: ${options.provider}\n`);
-  cli.write(`Model: ${options.model}\n`);
+  cli.write(`Model: ${modelId}\n`);
   cli.write(`Session: ${sessionId}\n`);
   cli.write(`Session file: ${sessionStore.filePath}\n`);
   cli.write("Press Esc to cancel the current turn.\n");

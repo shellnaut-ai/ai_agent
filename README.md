@@ -44,12 +44,14 @@ npm run cli -- chat --provider openai-codex --model gpt-5.6-luna
 npm run cli -- chat --provider openai-codex --model gpt-5.5
 ```
 
-`openai-codex`의 기본 모델은 `gpt-5.6-sol`이다. 이전에 `gpt-5.6`으로 만든
-세션은 같은 alias를 `--model gpt-5.6`으로 지정하면 Sol wire 모델로 재개한다.
-지원하지 않는 model ID는 network 호출 전에 지원 목록과 함께 거부한다.
+`openai-codex`의 기본 모델은 `gpt-5.6-sol`이다. `--session <ID>`로 기존
+세션을 다시 열면 세션 헤더에 저장된 모델을 재사용하므로, 이전 기본값인
+`gpt-5.5`와 legacy `gpt-5.6` 세션도 별도 `--model` 없이 재개한다. legacy
+`gpt-5.6`은 wire 경계에서 Sol 모델로 변환한다. 지원하지 않는 model ID는
+network 호출 전에 지원 목록과 함께 거부한다.
 
-세션을 다시 열려면 `--session <ID>`를 추가한다. write/edit/bash는 실행 전에
-승인을 요청하며 session 승인은 JSONL 세션에 기록된다.
+새 세션의 모델을 고르려면 `--model <ID>`를 사용한다. write/edit/bash는 실행
+전에 승인을 요청하며 session 승인은 JSONL 세션에 기록된다.
 
 ### Provider 환경변수
 
