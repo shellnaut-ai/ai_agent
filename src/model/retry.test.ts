@@ -49,6 +49,7 @@ describe("RetryingModelRuntime", () => {
     const events = await collect(runtime.stream(request));
 
     expect(calls).toBe(1);
+    expect(events.some((event) => event.type === "retry")).toBe(false);
     expect(events.at(-1)).toMatchObject({
       type: "error",
       error: { name: "ContextOverflowError" },

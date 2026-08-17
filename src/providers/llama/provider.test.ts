@@ -3,6 +3,9 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ModelRequest, StreamEvent } from "../../model/types.js";
 import { LlamaProvider } from "./provider.js";
 
+const baseUrl = "http://127.0.0.1:8080";
+const inputTokensUrl = `${baseUrl}/v1/chat/completions/input_tokens`;
+
 function sseResponse(events: readonly unknown[]): Response {
   const encoder = new TextEncoder();
 
@@ -49,7 +52,7 @@ const request: ModelRequest = {
 
 function createProvider(): LlamaProvider {
   return new LlamaProvider({
-    serverUrl: "http://127.0.0.1:8080",
+    serverUrl: baseUrl,
     modelId: request.model.id,
     modelName: request.model.name,
     contextWindow: request.model.contextWindow,
@@ -67,7 +70,7 @@ describe("LlamaProvider", () => {
     const fetchFake = async (input: RequestInfo | URL, init?: RequestInit) => {
       const captured = new Request(input, init);
       requests.push(captured);
-      if (captured.url.endsWith("/input_tokens")) {
+      if (captured.url === inputTokensUrl) {
         return Response.json({ input_tokens: 321 });
       }
       return sseResponse([
@@ -82,6 +85,7 @@ describe("LlamaProvider", () => {
     const countBody = await requests[0]!.json() as Record<string, unknown>;
     const streamBody = await requests[1]!.json() as Record<string, unknown>;
 
+    expect(requests[0]?.url).toBe(inputTokensUrl);
     expect(countBody).not.toHaveProperty("stream");
     expect(countBody).toEqual(withoutStream(streamBody));
   });

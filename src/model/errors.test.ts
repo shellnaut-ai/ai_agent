@@ -37,6 +37,8 @@ describe("model request errors", () => {
   test("classifies only known context overflow messages", () => {
     expect(isContextOverflowMessage("context_length_exceeded")).toBe(true);
     expect(isContextOverflowMessage("exceeds the available context size")).toBe(true);
+    expect(isContextOverflowMessage("overflow")).toBe(false);
+    expect(isContextOverflowMessage("context deadline exceeded")).toBe(false);
     expect(isContextOverflowMessage("HTTP 500 connection reset")).toBe(false);
     expect(isContextOverflowError(new ContextOverflowError("overflow"))).toBe(true);
     expect(isContextOverflowError(new Error("overflow"))).toBe(false);
