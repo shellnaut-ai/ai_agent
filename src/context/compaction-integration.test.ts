@@ -202,6 +202,111 @@ describe("CompactionService integration", () => {
     expect(preparation?.keptTurns[0]?.messages[0]?.role).toBe("assistant");
   });
 
+  test("compacts again after an assistant-start compaction without rewriting history", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-recompact-"));
+    cleanup.push(rootDir);
+    const model = {
+      id: "fake-model",
+      name: "Fake",
+      provider: "fake" as const,
+      contextWindow: 4_000,
+      maxOutputTokens: 100,
+    };
+    const store = new JsonlSessionStore({
+      rootDir,
+      sessionId: "assistant-start-recompact",
+      model,
+    });
+    await store.load();
+    const session = new Session(store);
+    const initialEntries = await session.appendMessages([
+      { role: "user", content: "old request" },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "call-1",
+          name: "read",
+          arguments: { path: "old.txt" },
+        }],
+      },
+      {
+        role: "tool",
+        toolCallId: "call-1",
+        content: "r".repeat(200),
+        isError: false,
+      },
+      { role: "assistant", content: "recent answer", toolCalls: [] },
+    ]);
+    const assistantFinalEntry = initialEntries[3];
+    if (assistantFinalEntry === undefined) {
+      throw new Error("Expected a durable final assistant entry.");
+    }
+    let summaryCount = 0;
+    const service = new CompactionService({
+      async *stream(): AsyncIterable<StreamEvent> {
+        summaryCount += 1;
+        yield { type: "text-delta", delta: `summary-${summaryCount}` };
+        yield { type: "done", reason: "stop" };
+      },
+    }, {
+      reserveTokens: 100,
+      keepRecentTokens: 140,
+      charsPerToken: 1,
+      maxSummaryOutputTokens: 100,
+      toolResultMaxChars: 100,
+    });
+    const coordinator = new SessionContextCoordinator(
+      session,
+      service,
+      new ContextBudgetCalculator(new TokenEstimator(1)),
+    );
+
+    const firstEvents = await collect(coordinator.compact({
+      model,
+      messages: [...session.buildActiveMessages()],
+      tools: [],
+    }, "manual"));
+
+    expect(firstEvents.map((event) => event.type)).toEqual([
+      "compaction-start",
+      "compaction-done",
+    ]);
+    expect(session.getPreviousCompaction()?.firstKeptEntryId).toBe(
+      assistantFinalEntry.id,
+    );
+
+    await session.appendMessages([
+      { role: "user", content: "next question" },
+      { role: "assistant", content: "next answer", toolCalls: [] },
+    ]);
+    const journalBeforeSecond = structuredClone(store.getEntries());
+
+    const secondEvents = await collect(coordinator.compact({
+      model,
+      messages: [...session.buildActiveMessages()],
+      tools: [],
+    }, "overflow"));
+
+    expect(secondEvents).toEqual([
+      expect.objectContaining({ type: "compaction-start", reason: "overflow" }),
+      expect.objectContaining({ type: "compaction-done", reason: "overflow" }),
+    ]);
+    expect(store.getEntries().slice(0, journalBeforeSecond.length)).toEqual(
+      journalBeforeSecond,
+    );
+
+    const reloadedStore = new JsonlSessionStore({
+      rootDir,
+      sessionId: "assistant-start-recompact",
+      model,
+    });
+    await reloadedStore.load();
+    expect(
+      reloadedStore.getEntries().slice(0, journalBeforeSecond.length),
+    ).toEqual(journalBeforeSecond);
+  });
+
   test("never starts a compacted suffix with a tool result", () => {
     const service = new CompactionService({
       async *stream(): AsyncIterable<StreamEvent> {

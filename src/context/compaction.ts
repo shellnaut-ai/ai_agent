@@ -180,6 +180,55 @@ function splitOversizedTurn(
   return undefined;
 }
 
+function findActiveTurns(
+  turns: readonly CompactionTurn[],
+  firstKeptEntryId: string,
+): CompactionTurn[] | undefined {
+  for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
+    const turn = turns[turnIndex];
+
+    if (turn.firstEntryId === firstKeptEntryId) {
+      return [...turns.slice(turnIndex)];
+    }
+
+    const entryIds = turn.messageEntryIds;
+    if (entryIds === undefined || entryIds.length !== turn.messages.length) {
+      continue;
+    }
+
+    const messageIndex = entryIds.indexOf(firstKeptEntryId);
+    if (messageIndex < 0) {
+      continue;
+    }
+
+    const summarizedMessages = turn.messages.slice(0, messageIndex);
+    const activeMessages = turn.messages.slice(messageIndex);
+    const firstActiveMessage = activeMessages[0];
+
+    if (
+      firstActiveMessage === undefined ||
+      firstActiveMessage.role === "tool" ||
+      !hasCompleteToolPairs(summarizedMessages) ||
+      !hasCompleteToolPairs(activeMessages)
+    ) {
+      throw new Error(
+        "Previous compaction points to an unsafe message boundary.",
+      );
+    }
+
+    return [
+      {
+        firstEntryId: firstKeptEntryId,
+        messages: activeMessages,
+        messageEntryIds: entryIds.slice(messageIndex),
+      },
+      ...turns.slice(turnIndex + 1),
+    ];
+  }
+
+  return undefined;
+}
+
 export class CompactionService {
   private readonly runner: ModelStreamRunner;
   private readonly settings: CompactionSettings;
@@ -233,22 +282,18 @@ export class CompactionService {
     let activeTurns = [...request.turns];
 
     if (request.previousCompaction) {
-      const activeStartIndex = activeTurns.findIndex(
-        (turn) => {
-          return (
-            turn.firstEntryId ===
-            request.previousCompaction!.firstKeptEntryId
-          );
-        },
+      const previousActiveTurns = findActiveTurns(
+        activeTurns,
+        request.previousCompaction.firstKeptEntryId,
       );
 
-      if (activeStartIndex < 0) {
+      if (previousActiveTurns === undefined) {
         throw new Error(
           "Previous compaction points outside the current session branch.",
         );
       }
 
-      activeTurns = activeTurns.slice(activeStartIndex);
+      activeTurns = previousActiveTurns;
     }
 
     const activeMessages: Message[] = [
