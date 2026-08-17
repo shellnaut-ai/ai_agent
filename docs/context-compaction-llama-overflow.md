@@ -341,5 +341,40 @@ compaction의 판단, 요약, JSONL 저장은 ChatSession -> ContextCoordinator 
 
 ## 검증
 
-테스트는 사용자 요청에 따라 작성하거나 실행하지 않았습니다.
-구현 Task 1, Task 2, Task 3 각각에서 npm.cmd run typecheck를 실행했고 통과했습니다.
+구현은 먼저 아래 계약을 RED로 고정한 뒤 GREEN으로 통합했다. RED 단계에서는
+`ContextOverflowError`, llama 정확한 token counter, overflow compact-and-retry, `/compact`
+라우팅의 부재가 의도적으로 실패했다. provider/runtime RED는 18개 중 5개 실패·13개 통과,
+context/session/CLI RED는 57개 중 9개 실패·48개 통과였다. 정책은 provider 중립이다.
+llama.cpp adapter는 endpoint와 오류 형식만 번역하고, 공통 runtime/session 계층이 fallback과
+복구 횟수를 결정한다.
+
+- exact input token count를 제공하는 provider는 그 값을 우선 사용한다. capability가 없거나
+  비-abort 호출이 실패하면 `TokenEstimator`로 fallback하며, caller abort는 숨기지 않는다.
+- overflow는 일반 retry가 아니다. visible output 또는 durable side effect 전인 경우에만 force
+  compaction 후 최대 한 번 다시 요청하며, 두 번째 overflow는 error로 끝난다.
+- text delta, tool call/result, message checkpoint 중 하나라도 보이면 자동 복구를 시작하지
+  않는다. 따라서 응답이나 tool 실행을 중복 재생하지 않는다.
+
+집중 회귀는 다음 명령으로 실행한다.
+
+```powershell
+npx vitest run src/model/errors.test.ts src/model/retry.test.ts src/providers/llama/provider.test.ts src/context/compaction-integration.test.ts src/session/session-context-coordinator.test.ts src/session/chat-session-journal.test.ts src/session/session-compatibility.test.ts src/cli/chat.test.ts
+```
+
+2026-08-17 GREEN 실행에서는 8개 파일·76개 테스트가 모두 통과했다.
+
+전체 로컬 acceptance에는 Windows helper provenance, typecheck, 전체 Vitest, production build,
+package/CLI EOF smoke, high-severity audit를 포함한다.
+
+```powershell
+npm run verify:windows-helper
+$env:CI = "true"
+npm run check
+npm audit --audit-level=high
+git diff --check
+```
+
+같은 날 `verify:windows-helper`는 검토된 helper와 normalized source manifest의 일치를
+확인했고, `CI=true npm run check`는 42개 파일에서 309개 통과·5개 skip 후 build, package
+smoke, CLI EOF smoke까지 통과했다. `npm audit --audit-level=high`는 high 이상 취약점 0건,
+`git diff --check`는 오류 0건이었다.
