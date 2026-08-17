@@ -37,8 +37,16 @@ npm run cli -- --help
 npm run cli -- chat --provider llama --model gemma-local
 npm run cli -- chat --provider openai-compatible --model gemma3
 npm run cli -- auth login
+npm run cli -- chat --provider openai-codex
+npm run cli -- chat --provider openai-codex --model gpt-5.6-sol
+npm run cli -- chat --provider openai-codex --model gpt-5.6-terra
+npm run cli -- chat --provider openai-codex --model gpt-5.6-luna
 npm run cli -- chat --provider openai-codex --model gpt-5.5
 ```
+
+`openai-codex`의 기본 모델은 `gpt-5.6-sol`이다. 이전에 `gpt-5.6`으로 만든
+세션은 같은 alias를 `--model gpt-5.6`으로 지정하면 Sol wire 모델로 재개한다.
+지원하지 않는 model ID는 network 호출 전에 지원 목록과 함께 거부한다.
 
 세션을 다시 열려면 `--session <ID>`를 추가한다. write/edit/bash는 실행 전에
 승인을 요청하며 session 승인은 JSONL 세션에 기록된다.

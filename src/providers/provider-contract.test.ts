@@ -267,7 +267,11 @@ describe("provider continuation wire contract", () => {
 
     await collect(provider.stream(request));
 
-    const body = await captured?.json() as { input?: unknown[] };
+    const body = await captured?.json() as {
+      input?: unknown[];
+      max_output_tokens?: unknown;
+    };
+    expect(body).not.toHaveProperty("max_output_tokens");
     expect(body.input).toContainEqual(expect.objectContaining({
       type: "reasoning",
       encrypted_content: "encrypted",

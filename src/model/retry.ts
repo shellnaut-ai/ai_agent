@@ -5,6 +5,7 @@ import type {
 } from "./runtime.js";
 import type { ModelRequest } from "./types.js";
 import { cloneModelRequest } from "./request-clone.js";
+import { isRetryableModelError } from "./errors.js";
 
 export interface RetryOptions {
   readonly maxRetries: number;
@@ -107,6 +108,7 @@ export class RetryingModelRuntime implements ModelStreamRunner {
         if (
           event.reason === "aborted" ||
           meaningfulEventSeen ||
+          !isRetryableModelError(event.error) ||
           attemptIndex === this.maxRetries
         ) {
           yield event;

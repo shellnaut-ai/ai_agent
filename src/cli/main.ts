@@ -14,6 +14,10 @@ import { ProviderRegistry } from "../model/registry.js";
 import { RetryingModelRuntime } from "../model/retry.js";
 import { ModelRuntime } from "../model/runtime.js";
 import { OpenAICodexProvider } from "../providers/openai-codex-provider.js";
+import {
+  CODEX_DEFAULT_MODEL_ID,
+  createCodexModel,
+} from "../providers/openai-codex-models.js";
 import { OpenAICompatibleProvider } from "../providers/openai-compatible-provider.js";
 import { LlamaProvider } from "../providers/llama/provider.js";
 import { ChatSession } from "../session/chat-session.js";
@@ -44,7 +48,7 @@ export interface ChatOptions {
 const defaultModels: Record<ChatProvider, string> = {
   llama: "gemma-local",
   "openai-compatible": "gemma3",
-  "openai-codex": "gpt-5.5",
+  "openai-codex": CODEX_DEFAULT_MODEL_ID,
 };
 
 export function parseChatOptions(args: readonly string[]): ChatOptions {
@@ -211,12 +215,14 @@ async function runConfiguredChat(
 }
 
 function createModel(provider: ChatProvider, id: string): Model {
+  if (provider === "openai-codex") return createCodexModel(id);
+
   return {
     id,
     name: id,
     provider: provider satisfies ProviderId,
-    contextWindow: provider === "openai-codex" ? 128_000 : 8192,
-    maxOutputTokens: provider === "openai-codex" ? 4096 : 1024,
+    contextWindow: 8192,
+    maxOutputTokens: 1024,
   };
 }
 

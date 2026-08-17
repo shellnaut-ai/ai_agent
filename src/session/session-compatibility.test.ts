@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
 import type { Message } from "../model/types.js";
+import { createCodexModel } from "../providers/openai-codex-models.js";
 import { JsonlSessionStore } from "./jsonl-store.js";
 import { Session } from "./session.js";
 import type { LoadedSession, SessionEntry, SessionStore } from "./types.js";
@@ -32,6 +33,36 @@ const model = {
 };
 
 describe("session compatibility", () => {
+  test("keeps the legacy GPT-5.6 alias in the session header", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-session-"));
+    cleanup.push(rootDir);
+    const aliasModel = createCodexModel("gpt-5.6");
+    const store = new JsonlSessionStore({
+      rootDir,
+      sessionId: "legacy-gpt-5-6",
+      model: aliasModel,
+    });
+    await store.load();
+    await new Session(store).appendMessage({
+      role: "user",
+      content: "preserve me",
+    });
+
+    const reloaded = new JsonlSessionStore({
+      rootDir,
+      sessionId: "legacy-gpt-5-6",
+      model: aliasModel,
+    });
+    await expect(reloaded.load()).resolves.toBeDefined();
+    const [headerLine] = (await readFile(reloaded.filePath, "utf8")).split("\n");
+
+    expect(JSON.parse(headerLine!)).toMatchObject({
+      type: "session",
+      version: 2,
+      model: { provider: "openai-codex", id: "gpt-5.6" },
+    });
+  });
+
   test("preserves JSON-safe provider state from a version-2 assistant record", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-session-"));
     cleanup.push(rootDir);
