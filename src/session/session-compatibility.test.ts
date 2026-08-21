@@ -463,6 +463,68 @@ describe("session compatibility", () => {
     expect(new Session(freshStore).getMessages()).toHaveLength(2);
   });
 
+  test("reloads an assistant-start compaction as active context", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-session-"));
+    cleanup.push(rootDir);
+    const store = new JsonlSessionStore({
+      rootDir,
+      sessionId: "assistant-start-compaction",
+      model,
+    });
+    await store.load();
+    await appendFile(
+      store.filePath,
+      compactionFixtureRecords("assistant-final")
+        .map((record) => JSON.stringify(record))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const reloaded = new JsonlSessionStore({
+      rootDir,
+      sessionId: "assistant-start-compaction",
+      model,
+    });
+    await reloaded.load();
+    const activeMessages = new Session(reloaded).buildActiveMessages();
+
+    expect(activeMessages).toEqual([
+      expect.objectContaining({
+        role: "user",
+        content: expect.stringContaining("durable summary"),
+      }),
+      {
+        role: "assistant",
+        content: "recent answer",
+        toolCalls: [],
+      },
+    ]);
+  });
+
+  test("still rejects a compaction that starts with a tool result", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-session-"));
+    cleanup.push(rootDir);
+    const store = new JsonlSessionStore({
+      rootDir,
+      sessionId: "tool-start-compaction",
+      model,
+    });
+    await store.load();
+    await appendFile(
+      store.filePath,
+      compactionFixtureRecords("tool-1")
+        .map((record) => JSON.stringify(record))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    await expect(new JsonlSessionStore({
+      rootDir,
+      sessionId: "tool-start-compaction",
+      model,
+    }).load()).rejects.toThrow(/must keep a user(?: or assistant)? message/i);
+  });
+
   test("does not expose messages when persistence fails", async () => {
     const store = new FailingSessionStore();
     const session = new Session(store);
@@ -488,6 +550,70 @@ describe("session compatibility", () => {
     expect(session.getMessages()).toEqual([]);
   });
 });
+
+function compactionFixtureRecords(
+  firstKeptEntryId: "assistant-final" | "tool-1",
+): readonly SessionEntry[] {
+  const timestamp = "2026-08-17T00:00:00.000Z";
+
+  return [
+    {
+      type: "message",
+      id: "user-1",
+      parentId: null,
+      timestamp,
+      message: { role: "user", content: "old request" },
+    },
+    {
+      type: "message",
+      id: "assistant-call",
+      parentId: "user-1",
+      timestamp,
+      message: {
+        role: "assistant",
+        content: "",
+        toolCalls: [{
+          id: "call-1",
+          name: "read",
+          arguments: { path: "old.txt" },
+        }],
+      },
+    },
+    {
+      type: "message",
+      id: "tool-1",
+      parentId: "assistant-call",
+      timestamp,
+      message: {
+        role: "tool",
+        toolCallId: "call-1",
+        content: "result",
+        isError: false,
+      },
+    },
+    {
+      type: "message",
+      id: "assistant-final",
+      parentId: "tool-1",
+      timestamp,
+      message: {
+        role: "assistant",
+        content: "recent answer",
+        toolCalls: [],
+      },
+    },
+    {
+      type: "compaction",
+      id: "compaction-1",
+      parentId: "assistant-final",
+      timestamp,
+      summary: "durable summary",
+      firstKeptEntryId,
+      tokensBefore: 200,
+      details: { readFiles: [], modifiedFiles: [] },
+    },
+  ];
+}
 
 class FailingSessionStore implements SessionStore {
   readonly sessionId = "failing";

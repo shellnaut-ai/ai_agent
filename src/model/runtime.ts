@@ -1,4 +1,7 @@
-import type { StreamOptions } from "./provider.js";
+import {
+  isModelInputTokenCounter,
+  type StreamOptions,
+} from "./provider.js";
 import type { ProviderRegistry } from "./registry.js";
 import type { ModelRequest, StreamEvent } from "./types.js";
 
@@ -19,7 +22,20 @@ export interface ModelStreamRunner {
   ): AsyncIterable<ModelRuntimeEvent>;
 }
 
-export class ModelRuntime implements ModelStreamRunner {
+export interface ModelInputTokenCounter {
+  countInputTokens(
+    request: ModelRequest,
+    options?: StreamOptions,
+  ): Promise<number | undefined>;
+}
+
+export function isModelInputTokenCounterRunner(
+  runner: ModelStreamRunner,
+): runner is ModelStreamRunner & ModelInputTokenCounter {
+  return typeof Reflect.get(runner, "countInputTokens") === "function";
+}
+
+export class ModelRuntime implements ModelStreamRunner, ModelInputTokenCounter {
   private readonly registry: ProviderRegistry;
 
   constructor(registry: ProviderRegistry) {
@@ -45,5 +61,18 @@ export class ModelRuntime implements ModelStreamRunner {
     }
 
     yield* provider.stream(request, options);
+  }
+
+  async countInputTokens(
+    request: ModelRequest,
+    options?: StreamOptions,
+  ): Promise<number | undefined> {
+    const provider = this.registry.getProvider(request.model.provider);
+
+    if (!provider || !isModelInputTokenCounter(provider)) {
+      return undefined;
+    }
+
+    return await provider.countInputTokens(request, options);
   }
 }

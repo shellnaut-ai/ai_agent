@@ -8,6 +8,7 @@ import type {
   ToolResultMessage,
 } from "../model/types.js";
 import type { ToolCall, ToolResult } from "../tools/types.js";
+import type { CompactionReason } from "../context/coordinator.js";
 
 export interface AgentRequest {
   readonly model: Model;
@@ -43,10 +44,12 @@ export type AgentEvent =
     }
   | {
       type: "compaction-start";
+      reason: CompactionReason;
       tokensBefore: number;
     }
   | {
       type: "compaction-done";
+      reason: CompactionReason;
       tokensBefore: number;
       tokensAfter: number;
     }

@@ -53,6 +53,18 @@ network 호출 전에 지원 목록과 함께 거부한다.
 새 세션의 모델을 고르려면 `--model <ID>`를 사용한다. write/edit/bash는 실행
 전에 승인을 요청하며 session 승인은 JSONL 세션에 기록된다.
 
+llama.cpp 대화는 다음과 같이 시작한다.
+
+```powershell
+npm run cli -- chat --provider llama --model gemma-local
+# 대화 중 /compact 입력: 현재 활성 문맥을 수동 압축
+```
+
+llama.cpp의 input-token endpoint가 없거나 호출에 실패하면 공통 `TokenEstimator`를
+사용한다. context overflow는 일반 네트워크 retry와 구분한다. 보이는 text, tool 호출/결과,
+또는 durable checkpoint가 생기기 전에는 compact 후 한 번만 다시 요청할 수 있지만, 그 뒤에는
+자동 복구도 tool 재실행도 하지 않는다.
+
 ### Provider 환경변수
 
 | 변수 | 용도 | 기본값 |

@@ -229,6 +229,7 @@ export class Session {
       | {
           firstEntryId: string;
           messages: Message[];
+          messageEntryIds: string[];
         }
       | undefined;
 
@@ -252,6 +253,7 @@ export class Session {
         current = {
           firstEntryId: entry.id,
           messages: [cloneMessage(entry.message)],
+          messageEntryIds: [entry.id],
         };
         continue;
       }
@@ -263,6 +265,7 @@ export class Session {
       }
 
       current.messages.push(cloneMessage(entry.message));
+      current.messageEntryIds.push(entry.id);
     }
 
     if (current) {
@@ -406,11 +409,11 @@ export class Session {
     if (
       !firstKeptEntry ||
       firstKeptEntry.type !== "message" ||
-      firstKeptEntry.message.role !== "user"
+      firstKeptEntry.message.role === "tool"
     ) {
       throw new Error(
         `Compaction first kept entry "${result.firstKeptEntryId}" ` +
-          "must be a user message on the current path.",
+          "must be a user or assistant message on the current path.",
       );
     }
 

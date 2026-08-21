@@ -246,6 +246,7 @@ async function runConfiguredChat(
     session,
     compaction,
     new ContextBudgetCalculator(new TokenEstimator(2)),
+    runtime,
   );
   const agent = new AgentLoop(
     runtime,

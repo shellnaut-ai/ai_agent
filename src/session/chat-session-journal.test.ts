@@ -7,6 +7,11 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import { AgentLoop } from "../agent/loop.js";
 import { continuationTailHash } from "../agent/output-continuation.js";
+import type {
+  CompactionReason,
+  ContextCoordinator,
+  ContextCoordinatorEvent,
+} from "../context/coordinator.js";
 import type { ModelStreamRunner } from "../model/runtime.js";
 import type {
   Message,
@@ -795,7 +800,234 @@ describe("ChatSession incremental journal", () => {
     });
     expect(providerCalls).toBe(1);
   });
+
+  test("compacts and retries one overflow before visible output", async () => {
+    const fixture = await createOverflowFixture("overflow-recovery", "recover");
+
+    const events = await collect(fixture.chat.streamTurn("hello"));
+    const reloaded = await reloadSession(fixture.rootDir, fixture.sessionId);
+    const [firstRequest, secondRequest] = fixture.requests;
+
+    expect(fixture.getAgentCalls()).toBe(2);
+    expect(fixture.compactReasons).toEqual(["overflow"]);
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "compaction-start",
+        reason: "overflow",
+      }),
+      expect.objectContaining({ type: "done" }),
+    ]));
+    expect(secondRequest?.messages).toEqual(
+      fixture.activeMessagesAtAgentCalls[1],
+    );
+    expect(secondRequest?.messages).toEqual(
+      fixture.getRefreshedMessagesAfterCompaction(),
+    );
+    expect(firstRequest?.messages).toContainEqual({
+      role: "user",
+      content: "old oversized question",
+    });
+    expect(secondRequest?.messages).not.toContainEqual({
+      role: "user",
+      content: "old oversized question",
+    });
+    expect(secondRequest?.messages[0]).toMatchObject({
+      role: "user",
+      content: expect.stringContaining("overflow compact summary"),
+    });
+    expect(reloaded.store.getEntries().map((entry) => entry.id)).toEqual(
+      expect.arrayContaining(fixture.durableEntryIdsBeforeCompaction),
+    );
+    expect(reloaded.session.getMessages()).toEqual(
+      expect.arrayContaining(firstRequest?.messages ?? []),
+    );
+  });
+
+  test.each([
+    ["text", "visible-text"],
+    ["tool call", "visible-tool-call"],
+  ] as const)("does not retry overflow after visible %s", async (
+    _visibleKind,
+    behavior,
+  ) => {
+    const fixture = await createOverflowFixture(
+      `visible-overflow-${behavior}`,
+      behavior,
+    );
+
+    const events = await collect(fixture.chat.streamTurn("hello"));
+
+    expect(fixture.getAgentCalls()).toBe(1);
+    expect(fixture.compactReasons).toEqual([]);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { name: "ContextOverflowError" },
+    });
+  });
+
+  test("stops after one compact-and-retry", async () => {
+    const fixture = await createOverflowFixture(
+      "repeated-overflow",
+      "always-overflow",
+    );
+
+    const events = await collect(fixture.chat.streamTurn("hello"));
+
+    expect(fixture.getAgentCalls()).toBe(2);
+    expect(fixture.compactReasons).toEqual(["overflow"]);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: {
+        message: expect.stringMatching(/one.*compact-and-retry/i),
+      },
+    });
+  });
 });
+
+async function createOverflowFixture(
+  sessionId: string,
+  behavior:
+    | "recover"
+    | "visible-text"
+    | "visible-tool-call"
+    | "always-overflow",
+): Promise<{
+  chat: ChatSession;
+  rootDir: string;
+  sessionId: string;
+  requests: ModelRequest[];
+  activeMessagesAtAgentCalls: Message[][];
+  compactReasons: CompactionReason[];
+  durableEntryIdsBeforeCompaction: string[];
+  getRefreshedMessagesAfterCompaction(): readonly Message[] | undefined;
+  getAgentCalls(): number;
+}> {
+  const { rootDir, store } = await createStore(sessionId);
+  const session = new Session(store);
+  await session.appendMessages([
+    { role: "user", content: "old oversized question" },
+    { role: "assistant", content: "old oversized answer", toolCalls: [] },
+  ]);
+  const recentEntries = await session.appendMessages([
+    { role: "user", content: "recent question" },
+    { role: "assistant", content: "recent answer", toolCalls: [] },
+  ]);
+  const firstKeptEntryId = recentEntries[0]?.id;
+  if (firstKeptEntryId === undefined) {
+    throw new Error("Expected a durable recent user entry.");
+  }
+  let agentCalls = 0;
+  const requests: ModelRequest[] = [];
+  const activeMessagesAtAgentCalls: Message[][] = [];
+  const runner: ModelStreamRunner = {
+    async *stream(request): AsyncIterable<StreamEvent> {
+      agentCalls += 1;
+      requests.push(structuredClone(request));
+      activeMessagesAtAgentCalls.push([
+        ...structuredClone(session.buildActiveMessages()),
+      ]);
+
+      if (behavior === "recover" && agentCalls > 1) {
+        yield { type: "text-delta", delta: "recovered answer" };
+        yield { type: "done", reason: "stop" };
+        return;
+      }
+
+      if (behavior === "visible-text") {
+        yield { type: "text-delta", delta: "visible partial" };
+      }
+      if (behavior === "visible-tool-call") {
+        yield {
+          type: "tool-call",
+          toolCall: {
+            id: "visible-call-1",
+            name: "read",
+            arguments: { path: "visible.txt" },
+          },
+        };
+      }
+
+      yield {
+        type: "error",
+        reason: "error",
+        error: await createContextOverflowError(),
+      };
+    },
+  };
+  const compactReasons: CompactionReason[] = [];
+  const durableEntryIdsBeforeCompaction: string[] = [];
+  let refreshedMessagesAfterCompaction: readonly Message[] | undefined;
+  const coordinator: ContextCoordinator = {
+    async *prepareModelRequest(): AsyncIterable<never> {
+      throw new Error("prepareModelRequest must not run in this fixture");
+    },
+    async *reserveToolResult(): AsyncIterable<never> {
+      throw new Error("reserveToolResult must not run in this fixture");
+    },
+    async *compact(_request, reason): AsyncIterable<ContextCoordinatorEvent> {
+      compactReasons.push(reason);
+      durableEntryIdsBeforeCompaction.push(
+        ...store.getEntries().map((entry) => entry.id),
+      );
+      yield {
+        type: "compaction-start",
+        reason,
+        tokensBefore: 200,
+      };
+      await session.appendCompaction({
+        summary: "overflow compact summary",
+        firstKeptEntryId,
+        tokensBefore: 200,
+        tokensAfter: 80,
+        details: { readFiles: [], modifiedFiles: [] },
+      });
+      refreshedMessagesAfterCompaction = [
+        ...structuredClone(session.buildActiveMessages()),
+      ];
+      yield {
+        type: "compaction-done",
+        reason,
+        tokensBefore: 200,
+        tokensAfter: 80,
+      };
+    },
+  };
+
+  return {
+    chat: new ChatSession(
+      new AgentLoop(runner, new ToolRegistry()),
+      model,
+      {
+        session,
+        contextCoordinator: coordinator,
+      },
+    ),
+    rootDir,
+    sessionId,
+    requests,
+    activeMessagesAtAgentCalls,
+    compactReasons,
+    durableEntryIdsBeforeCompaction,
+    getRefreshedMessagesAfterCompaction: () =>
+      refreshedMessagesAfterCompaction,
+    getAgentCalls: () => agentCalls,
+  };
+}
+
+async function createContextOverflowError(): Promise<Error> {
+  const errorModule = await import("../model/errors.js") as {
+    ContextOverflowError?: new (message: string) => Error;
+  };
+  const ContextOverflowError = errorModule.ContextOverflowError;
+
+  if (ContextOverflowError !== undefined) {
+    return new ContextOverflowError("context_length_exceeded");
+  }
+
+  const fallback = new Error("context_length_exceeded");
+  fallback.name = "ContextOverflowError";
+  return fallback;
+}
 
 class FailingJsonlSessionStore extends JsonlSessionStore {
   private failure:

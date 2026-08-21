@@ -29,7 +29,7 @@ inputBudget = contextWindow - requestedMaxOutputTokens - safetyMarginTokens
 remainingInputTokens = inputBudget - estimatedInputTokens
 ```
 
-추정 입력에는 model/request system prompt, message, tool schema, continuation instruction과 metadata가 모두 포함된다. Provider 기본 지침도 model metadata로 공통 estimator에 노출되며 adapter 내부의 숨은 budget 입력으로 두지 않는다. 입력이 초과하면 `SessionContextCoordinator`가 append-only JSONL의 active projection을 기준으로 오래된 complete turn만 compaction한다. 현재 tool-call/result 묶음은 요약하지 않으며, 한 번에 요약 요청에 들어가지 않는 과거 turn은 complete-turn 경계에서 여러 batch로 나눈다.
+추정 입력에는 model/request system prompt, message, tool schema, continuation instruction과 metadata가 모두 포함된다. Provider 기본 지침도 model metadata로 공통 estimator에 노출되며 adapter 내부의 숨은 budget 입력으로 두지 않는다. llama.cpp처럼 정확한 input-token capability가 있는 provider는 그 값을 먼저 사용한다. capability가 없거나 non-abort 요청이 실패하면 공통 estimator로 fallback하고, caller abort는 fallback으로 숨기지 않는다. 입력이 초과하면 `SessionContextCoordinator`가 append-only JSONL의 active projection을 기준으로 오래된 complete turn을 compaction한다. 가장 최근 turn 하나만 커도 완전한 tool-call/result 쌍 뒤의 안전한 assistant 경계에서 split할 수 있으며, tool result로 시작하거나 불완전한 tool 쌍을 가르는 suffix는 거부한다. 한 번에 요약 요청에 들어가지 않는 과거 turn은 complete-turn 경계에서 여러 batch로 나눈다.
 
 ChatGPT Codex backend는 `max_output_tokens` request field를 거부하므로 Codex adapter는
 이 값을 wire에 보내지 않는다. `Model.maxOutputTokens`와 request override는 삭제하지 않고
@@ -39,6 +39,11 @@ llama.cpp와 OpenAI-compatible adapter는 각각의 기존 output-limit wire fie
 새 user message는 journal에 append하기 전에 같은 coordinator가 pending input으로 preflight한다. summarizer 실패·abort·최종 fit 실패 시 user message는 남지 않는다. coordinator는 caller message와 durable session projection이 정확히 같지 않으면 조용히 덮어쓰지 않고 요청을 거부한다.
 
 `CompactionSettings.reserveTokens`는 이전 호출부 호환성을 위해 남아 있지만 입력 예산 공식에는 사용하지 않는다. `keepRecentTokens`는 최근 turn 선택 정책일 뿐 출력 reserve가 아니다.
+
+서버가 context overflow를 반환하면 이것은 일반 네트워크 retry 대상이 아니다. text delta,
+tool call/result 또는 durable message checkpoint가 생기기 전인 요청만 force compaction 후 최대
+한 번 다시 보낸다. visible output이나 side effect가 있거나 두 번째 overflow이면 error로 끝내며,
+tool을 자동 재실행하지 않는다.
 
 도구 실행 전에는 최소 128 result token을 예약한다. 확보할 수 없으면 도구를 실행하지 않고 해당 call ID에 matched error result를 남긴다. result 상한은 단순 byte 비율이 아니라 실제 estimator로 완성된 `ToolResultMessage` wrapper를 시뮬레이션하며, 잘린 결과를 붙인 다음 모델 요청도 `assertFits`를 만족해야 한다.
 

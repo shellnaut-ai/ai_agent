@@ -1,11 +1,16 @@
 import type { StreamOptions } from "./provider.js";
 import type {
+  ModelInputTokenCounter,
   ModelRuntimeEvent,
   ModelStreamRunner,
 } from "./runtime.js";
+import { isModelInputTokenCounterRunner } from "./runtime.js";
 import type { ModelRequest } from "./types.js";
 import { cloneModelRequest } from "./request-clone.js";
-import { isRetryableModelError } from "./errors.js";
+import {
+  isContextOverflowError,
+  isRetryableModelError,
+} from "./errors.js";
 
 export interface RetryOptions {
   readonly maxRetries: number;
@@ -38,7 +43,8 @@ function waitForRetry(
   });
 }
 
-export class RetryingModelRuntime implements ModelStreamRunner {
+export class RetryingModelRuntime
+  implements ModelStreamRunner, ModelInputTokenCounter {
   private readonly runner: ModelStreamRunner;
   private readonly maxRetries: number;
   private readonly initialDelayMs: number;
@@ -58,6 +64,17 @@ export class RetryingModelRuntime implements ModelStreamRunner {
     this.runner = runner;
     this.maxRetries = options.maxRetries;
     this.initialDelayMs = options.initialDelayMs;
+  }
+
+  async countInputTokens(
+    request: ModelRequest,
+    options?: StreamOptions,
+  ): Promise<number | undefined> {
+    if (!isModelInputTokenCounterRunner(this.runner)) {
+      return undefined;
+    }
+
+    return await this.runner.countInputTokens(request, options);
   }
 
   async *stream(
@@ -107,6 +124,7 @@ export class RetryingModelRuntime implements ModelStreamRunner {
 
         if (
           event.reason === "aborted" ||
+          isContextOverflowError(event.error) ||
           meaningfulEventSeen ||
           !isRetryableModelError(event.error) ||
           attemptIndex === this.maxRetries

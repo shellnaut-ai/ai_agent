@@ -261,4 +261,239 @@ describe("SessionContextCoordinator", () => {
     expect(store.getEntries().some((entry) => entry.type === "compaction"))
       .toBe(true);
   }, 15_000);
+
+  test("uses exact provider input tokens before estimator compaction", async () => {
+    const fixture = await createCountingFixture("coordinator-exact-count");
+    let counterCalls = 0;
+    const counter = {
+      async countInputTokens(): Promise<number | undefined> {
+        counterCalls += 1;
+        return counterCalls === 1 ? 9_000 : undefined;
+      },
+    };
+    const coordinator = new SessionContextCoordinator(
+      fixture.session,
+      fixture.compaction,
+      fixture.calculator,
+      counter,
+    );
+
+    const events = await collect(
+      coordinator.prepareModelRequest(fixture.request),
+    );
+
+    expect(counterCalls).toBe(2);
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "compaction-start",
+        reason: "threshold",
+      }),
+    ]));
+    expect(events.at(-1)).toMatchObject({ type: "model-input-ready" });
+  }, 15_000);
+
+  test("forces manual compaction to summarize the older of two small complete turns", async () => {
+    const fixture = await createCountingFixture(
+      "coordinator-manual-small-turns",
+      10_000,
+    );
+    const entriesBefore = fixture.session.getMessages();
+    const coordinator = new SessionContextCoordinator(
+      fixture.session,
+      fixture.compaction,
+      fixture.calculator,
+    );
+
+    const events = await collect(coordinator.compact(
+      fixture.request,
+      "manual",
+    ));
+
+    expect(events).toEqual([
+      expect.objectContaining({ type: "compaction-start", reason: "manual" }),
+      expect.objectContaining({ type: "compaction-done", reason: "manual" }),
+    ]);
+    expect(fixture.session.getPreviousCompaction()).toMatchObject({
+      summary: "stable summary",
+    });
+    expect(fixture.session.buildActiveMessages()).not.toContainEqual(
+      entriesBefore[0],
+    );
+    expect(fixture.session.buildActiveMessages()).toContainEqual(
+      entriesBefore[2],
+    );
+  });
+
+  test("compacts when exact input tokens exceed budget but the estimator keeps both turns", async () => {
+    const fixture = await createCountingFixture(
+      "coordinator-exact-high-estimate-low",
+      10_000,
+    );
+    let counterCalls = 0;
+    const coordinator = new SessionContextCoordinator(
+      fixture.session,
+      fixture.compaction,
+      fixture.calculator,
+      {
+        async countInputTokens(): Promise<number | undefined> {
+          counterCalls += 1;
+          return counterCalls === 1 ? 9_000 : undefined;
+        },
+      },
+    );
+
+    const events = await collect(
+      coordinator.prepareModelRequest(fixture.request),
+    );
+
+    expect(counterCalls).toBe(2);
+    expect(events.map((event) => event.type)).toEqual([
+      "compaction-start",
+      "compaction-done",
+      "model-input-ready",
+    ]);
+    expect(fixture.session.getPreviousCompaction()).toMatchObject({
+      summary: "stable summary",
+    });
+  });
+
+  test("falls back to estimated tokens when optional counting fails", async () => {
+    const fixture = await createCountingFixture("coordinator-count-fallback");
+    let counterCalls = 0;
+    const counter = {
+      async countInputTokens(): Promise<number> {
+        counterCalls += 1;
+        throw new Error("offline");
+      },
+    };
+    const coordinator = new SessionContextCoordinator(
+      fixture.session,
+      fixture.compaction,
+      fixture.calculator,
+      counter,
+    );
+
+    const events = await collect(
+      coordinator.prepareModelRequest(fixture.request),
+    );
+
+    expect(counterCalls).toBe(1);
+    expect(events).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: "model-input-ready" });
+  });
+
+  test("does not hide an aborted token-count request", async () => {
+    const fixture = await createCountingFixture("coordinator-count-abort");
+    const controller = new AbortController();
+    let counterCalls = 0;
+    let receivedSignal: AbortSignal | undefined;
+    let markCountingStarted: (() => void) | undefined;
+    const countingStarted = new Promise<void>((resolve) => {
+      markCountingStarted = resolve;
+    });
+    const counter = {
+      countInputTokens(
+        _request: ModelRequest,
+        options?: { readonly signal?: AbortSignal },
+      ): Promise<number> {
+        counterCalls += 1;
+        receivedSignal = options?.signal;
+        markCountingStarted?.();
+
+        return new Promise<number>((_resolve, reject) => {
+          if (options?.signal === undefined) {
+            reject(new Error("token count signal missing"));
+            return;
+          }
+          if (options.signal.aborted) {
+            reject(new Error("token count aborted"));
+            return;
+          }
+          options.signal.addEventListener("abort", () => {
+            reject(new Error("token count aborted"));
+          }, { once: true });
+        });
+      },
+    };
+    const coordinator = new SessionContextCoordinator(
+      fixture.session,
+      fixture.compaction,
+      fixture.calculator,
+      counter,
+    );
+
+    const collection = collect(coordinator.prepareModelRequest(fixture.request, {
+      signal: controller.signal,
+    }));
+    const settled = collection.then(
+      (events) => ({ status: "resolved" as const, events }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    );
+    const firstOutcome = await Promise.race([
+      countingStarted.then(() => "counting" as const),
+      settled.then(() => "completed" as const),
+    ]);
+
+    expect(firstOutcome).toBe("counting");
+    expect(receivedSignal).toBe(controller.signal);
+    controller.abort();
+    expect(await settled).toMatchObject({
+      status: "rejected",
+      error: { message: "token count aborted" },
+    });
+    expect(counterCalls).toBe(1);
+  });
 });
+
+async function createCountingFixture(
+  sessionId: string,
+  keepRecentTokens = 450,
+): Promise<{
+  session: Session;
+  compaction: CompactionService;
+  calculator: ContextBudgetCalculator;
+  request: ModelRequest;
+}> {
+  const rootDir = await mkdtemp(join(tmpdir(), "ai-agent-context-count-"));
+  cleanup.push(rootDir);
+  const model = {
+    id: "fake-model",
+    name: "Fake",
+    provider: "fake" as const,
+    contextWindow: 4_000,
+    maxOutputTokens: 100,
+  };
+  const store = new JsonlSessionStore({ rootDir, sessionId, model });
+  await store.load();
+  const session = new Session(store);
+  for (let index = 0; index < 2; index += 1) {
+    await session.appendMessages([
+      { role: "user", content: `${index}:${"q".repeat(150)}` },
+      { role: "assistant", content: "a".repeat(150), toolCalls: [] },
+    ]);
+  }
+  const compaction = new CompactionService({
+    async *stream(): AsyncIterable<StreamEvent> {
+      yield { type: "text-delta", delta: "stable summary" };
+      yield { type: "done", reason: "stop" };
+    },
+  }, {
+    reserveTokens: 100,
+    keepRecentTokens,
+    charsPerToken: 1,
+    maxSummaryOutputTokens: 100,
+    toolResultMaxChars: 1_000,
+  });
+  const calculator = new ContextBudgetCalculator(new TokenEstimator(1));
+
+  return {
+    session,
+    compaction,
+    calculator,
+    request: {
+      model,
+      messages: [...session.buildActiveMessages()],
+      tools: [],
+    },
+  };
+}

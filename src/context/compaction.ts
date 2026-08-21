@@ -116,6 +116,172 @@ function assertCompleteToolPairs(turns: readonly CompactionTurn[]): void {
   }
 }
 
+function hasCompleteToolPairs(messages: readonly Message[]): boolean {
+  const pending = new Set<string>();
+
+  for (const message of messages) {
+    if (message.role === "assistant") {
+      for (const call of message.toolCalls) {
+        if (pending.has(call.id)) return false;
+        pending.add(call.id);
+      }
+      continue;
+    }
+
+    if (message.role === "tool" && !pending.delete(message.toolCallId)) {
+      return false;
+    }
+  }
+
+  return pending.size === 0;
+}
+
+function hasAtomicContinuationBoundary(
+  messages: readonly Message[],
+  keptIndex: number,
+): boolean {
+  const summarizedLogicalIds = new Set(
+    messages
+      .slice(0, keptIndex)
+      .flatMap((message) =>
+        message.role === "assistant" && message.continuation !== undefined
+          ? [message.continuation.logicalMessageId]
+          : []
+      ),
+  );
+  const firstKeptMessage = messages[keptIndex];
+
+  if (
+    firstKeptMessage?.role === "assistant" &&
+    firstKeptMessage.continuation !== undefined &&
+    firstKeptMessage.continuation.segmentIndex > 0
+  ) {
+    return false;
+  }
+
+  return !messages.slice(keptIndex).some((message) =>
+    message.role === "assistant" &&
+    message.continuation !== undefined &&
+    summarizedLogicalIds.has(message.continuation.logicalMessageId)
+  );
+}
+
+function splitOversizedTurn(
+  turn: CompactionTurn,
+  keepRecentTokens: number,
+  estimator: TokenEstimator,
+): {
+  readonly summarized: CompactionTurn;
+  readonly kept: CompactionTurn;
+} | undefined {
+  const entryIds = turn.messageEntryIds;
+
+  if (entryIds === undefined || entryIds.length !== turn.messages.length) {
+    return undefined;
+  }
+
+  for (let index = 1; index < turn.messages.length; index += 1) {
+    const firstKeptMessage = turn.messages[index];
+    const summarizedMessages = turn.messages.slice(0, index);
+    const keptMessages = turn.messages.slice(index);
+    const startsContinuationSequence =
+      firstKeptMessage.role === "assistant" &&
+      firstKeptMessage.continuation?.segmentIndex === 0;
+
+    if (
+      firstKeptMessage.role === "tool" ||
+      !hasCompleteToolPairs(summarizedMessages) ||
+      !hasAtomicContinuationBoundary(turn.messages, index) ||
+      (
+        estimator.estimateMessages(keptMessages) > keepRecentTokens &&
+        !startsContinuationSequence
+      )
+    ) {
+      continue;
+    }
+
+    return {
+      summarized: {
+        firstEntryId: turn.firstEntryId,
+        messages: summarizedMessages,
+        messageEntryIds: entryIds.slice(0, index),
+      },
+      kept: {
+        firstEntryId: entryIds[index],
+        messages: keptMessages,
+        messageEntryIds: entryIds.slice(index),
+      },
+    };
+  }
+
+  return undefined;
+}
+
+function findActiveTurns(
+  turns: readonly CompactionTurn[],
+  firstKeptEntryId: string,
+): CompactionTurn[] | undefined {
+  for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
+    const turn = turns[turnIndex];
+
+    if (turn.firstEntryId === firstKeptEntryId) {
+      if (!hasAtomicContinuationBoundary(turn.messages, 0)) {
+        throw new Error(
+          "Previous compaction points to an unsafe continuation boundary.",
+        );
+      }
+
+      return [...turns.slice(turnIndex)];
+    }
+
+    const entryIds = turn.messageEntryIds;
+    if (entryIds === undefined || entryIds.length !== turn.messages.length) {
+      continue;
+    }
+
+    const messageIndex = entryIds.indexOf(firstKeptEntryId);
+    if (messageIndex < 0) {
+      continue;
+    }
+
+    const summarizedMessages = turn.messages.slice(0, messageIndex);
+    const activeMessages = turn.messages.slice(messageIndex);
+    const firstActiveMessage = activeMessages[0];
+
+    if (
+      firstActiveMessage === undefined ||
+      firstActiveMessage.role === "tool" ||
+      !hasAtomicContinuationBoundary(turn.messages, messageIndex) ||
+      !hasCompleteToolPairs(summarizedMessages) ||
+      !hasCompleteToolPairs(activeMessages)
+    ) {
+      if (
+        firstActiveMessage !== undefined &&
+        !hasAtomicContinuationBoundary(turn.messages, messageIndex)
+      ) {
+        throw new Error(
+          "Previous compaction points to an unsafe continuation boundary.",
+        );
+      }
+
+      throw new Error(
+        "Previous compaction points to an unsafe message boundary.",
+      );
+    }
+
+    return [
+      {
+        firstEntryId: firstKeptEntryId,
+        messages: activeMessages,
+        messageEntryIds: entryIds.slice(messageIndex),
+      },
+      ...turns.slice(turnIndex + 1),
+    ];
+  }
+
+  return undefined;
+}
+
 export class CompactionService {
   private readonly runner: ModelStreamRunner;
   private readonly settings: CompactionSettings;
@@ -169,22 +335,18 @@ export class CompactionService {
     let activeTurns = [...request.turns];
 
     if (request.previousCompaction) {
-      const activeStartIndex = activeTurns.findIndex(
-        (turn) => {
-          return (
-            turn.firstEntryId ===
-            request.previousCompaction!.firstKeptEntryId
-          );
-        },
+      const previousActiveTurns = findActiveTurns(
+        activeTurns,
+        request.previousCompaction.firstKeptEntryId,
       );
 
-      if (activeStartIndex < 0) {
+      if (previousActiveTurns === undefined) {
         throw new Error(
           "Previous compaction points outside the current session branch.",
         );
       }
 
-      activeTurns = activeTurns.slice(activeStartIndex);
+      activeTurns = previousActiveTurns;
     }
 
     const activeMessages: Message[] = [
@@ -217,23 +379,41 @@ export class CompactionService {
     const tokensBefore = budget.estimatedInputTokens;
     const inputBudget = budget.inputBudget;
 
-    if (tokensBefore <= inputBudget) {
+    if (tokensBefore <= inputBudget && request.force !== true) {
       return undefined;
     }
 
-    if (activeTurns.length < 2) {
+    if (activeTurns.length === 0) {
       throw new Error(
-        "The active context is too large and has no complete old turn " +
-          "that can be compacted.",
+        "The active context is too large and has no messages to compact.",
       );
     }
 
     const keptTurns: CompactionTurn[] = [];
     let keptTokens = 0;
+    let turnsToSummarize: CompactionTurn[] | undefined;
 
     for (let index = activeTurns.length - 1; index >= 0; index -= 1) {
       const turn = activeTurns[index];
       const turnTokens = this.estimator.estimateMessages(turn.messages);
+
+      if (keptTurns.length === 0 && turnTokens > this.settings.keepRecentTokens) {
+        const split = splitOversizedTurn(
+          turn,
+          this.settings.keepRecentTokens,
+          this.estimator,
+        );
+
+        if (split === undefined) {
+          throw new Error(
+            "A single message is too large to fit in the model context.",
+          );
+        }
+
+        keptTurns.unshift(split.kept);
+        turnsToSummarize = [...activeTurns.slice(0, index), split.summarized];
+        break;
+      }
 
       if (
         keptTurns.length > 0 &&
@@ -246,18 +426,42 @@ export class CompactionService {
       keptTokens += turnTokens;
     }
 
-    const firstKeptTurn = keptTurns[0];
+    let firstKeptTurn = keptTurns[0];
 
     if (!firstKeptTurn) {
       throw new Error("Compaction could not select a recent turn to keep.");
     }
 
-    const firstKeptPosition = activeTurns.findIndex(
-      (turn) => turn.firstEntryId === firstKeptTurn.firstEntryId,
+    turnsToSummarize ??= activeTurns.slice(
+      0,
+      activeTurns.findIndex(
+        (turn) => turn.firstEntryId === firstKeptTurn.firstEntryId,
+      ),
     );
-    const turnsToSummarize = activeTurns.slice(0, firstKeptPosition);
+
+    if (
+      turnsToSummarize.length === 0 &&
+      request.force === true &&
+      keptTurns.length > 1
+    ) {
+      const oldestKeptTurn = keptTurns.shift();
+      firstKeptTurn = keptTurns[0];
+
+      if (oldestKeptTurn === undefined || firstKeptTurn === undefined) {
+        throw new Error("Compaction could not preserve a recent turn.");
+      }
+
+      turnsToSummarize = [oldestKeptTurn];
+    }
 
     if (turnsToSummarize.length === 0) {
+      if (request.force === true) {
+        throw new Error(
+          "Compaction cannot summarize the only active turn without a " +
+            "safe message boundary.",
+        );
+      }
+
       throw new Error(
         "A single recent turn is too large to fit in the model context.",
       );

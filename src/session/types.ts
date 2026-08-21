@@ -76,15 +76,6 @@ export type SessionRecord =
 export type ChatEvent =
   | AgentEvent
   | {
-      readonly type: "compaction-start";
-      readonly tokensBefore: number;
-    }
-  | {
-      readonly type: "compaction-done";
-      readonly tokensBefore: number;
-      readonly tokensAfter: number;
-    }
-  | {
       readonly type: "session-recovery";
       readonly recoveredToolCallIds: readonly string[];
     }
