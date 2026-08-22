@@ -161,3 +161,19 @@ flowchart LR
 - [Main 기능 보존 통합 설계](./docs/superpowers/specs/2026-08-02-main-feature-integration-design.md)
 - [Main 기능 통합 실행 계획](./docs/superpowers/plans/2026-08-02-main-feature-integration.md)
 - [기능 보존표](./docs/superpowers/plans/2026-08-02-main-feature-preservation-matrix.md)
+
+
+## 참고 및 영감
+
+이 프로젝트는 [Pi](https://github.com/earendil-works/pi)의 에이전트 구조와
+동작 방식을 학습하고 참고하여 개발했습니다.
+
+`ai_agent`는 Pi의 소스 코드나 패키지를 직접 포함하지 않으며,
+Provider, Agent Loop, 도구 실행, 승인, 세션 관리 등의 기능을
+프로젝트 목적에 맞게 독립적으로 설계하고 구현했습니다.
+
+Pi는 MIT License로 배포됩니다.
+
+- Project: [earendil-works/pi](https://github.com/earendil-works/pi)
+- License: MIT
+- Original author: Mario Zechner
