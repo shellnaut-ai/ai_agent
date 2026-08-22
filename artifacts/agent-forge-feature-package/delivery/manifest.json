@@ -1,0 +1,22 @@
+{
+  "title": "Agent Forge 기능 시연",
+  "deck": "agent-forge-demo.pptx",
+  "video": "agent-forge-feature-demo.mp4",
+  "thumbnail": "agent-forge-thumbnail.png",
+  "duration_seconds": 165,
+  "resolution": "1920x1080",
+  "fps": 30,
+  "audio": false,
+  "model_connection": "OpenAI Codex OAuth",
+  "mocked_sse": false,
+  "features": ["login", "read", "write", "edit", "bash", "agent-loop", "jsonl-session", "composite-task"],
+  "clips": [
+    "clips/00-auth-request.mp4",
+    "clips/00-auth-status.mp4",
+    "clips/01-read.mp4",
+    "clips/02-write.mp4",
+    "clips/03-edit.mp4",
+    "clips/04-bash.mp4",
+    "clips/05-composite.mp4"
+  ]
+}
